@@ -13,8 +13,11 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgConnection, PgPool};
 
 use crate::config::TimescaleDbPluginConfig;
+use crate::infra::storage::rollup_maintenance::apply_rollup_policies;
 
 /// Embedded schema migrations (`migrations/` at crate root).
+// @cpt-algo:cpt-cf-uc-plugin-algo-schema-migration:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-idempotent-schema-provisioning:p1
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Parse the DSN into connection options with TLS enforced by default.
@@ -65,22 +68,118 @@ fn is_plaintext(mode: PgSslMode) -> bool {
     matches!(mode, PgSslMode::Disable)
 }
 
-/// Fixed upper bound on how long a request-path statement waits to acquire a row
-/// lock (e.g. the deactivate `SELECT ... FOR UPDATE`). A contended lock then fails
-/// fast (`55P03 lock_not_available`) instead of blocking on — and pinning — a
-/// pooled connection.
+/// Fixed upper bound on how long a request-path statement waits on a contended
+/// lock. The wait it is *sized* for is the speculative tuple an
+/// `INSERT ... ON CONFLICT ... DO NOTHING` meets when a not-yet-committed
+/// duplicate of the same dedup 6-tuple is in flight. The wait then fails fast
+/// (`55P03 lock_not_available`) instead of blocking on — and pinning — a pooled
+/// connection.
+///
+/// **The per-scope counter is gone.** This plugin took a second lock
+/// on every write until the per-scope counter row it claimed from was retired, so
+/// a write contended with unrelated traffic on a busy tenant or meter. It no
+/// longer does: on the dedup tuple a write contends only with another writer of
+/// the very same entry.
+///
+/// The bound is not sized for it, but it applies to every other **lock** wait
+/// an ingest statement can meet - it bounds lock acquisition and nothing else,
+/// so an I/O or commit wait is `statement_timeout`'s and `transaction_timeout`'s
+/// to bound. Two such locks are worth naming, because neither is contention
+/// with another writer of the same entry, which is what the sizing is about:
+///
+/// * [`super::type_key::TypeKeyCache::resolve`] assigns a type's partition
+///   key with its own `INSERT ... ON CONFLICT`, in autocommit before the write
+///   transaction opens, so two first writes of one *type* meet on that tuple. It
+///   is once per type per process rather than once per write, and it is held for
+///   the statement rather than to a commit.
+/// * An insert routed to a chunk the retention sweep is dropping waits behind
+///   that sweep's `ACCESS EXCLUSIVE` chunk lock, which is held to the sweep's
+///   own commit under a `lock_timeout` of its own (this plugin's DESIGN §3.6
+///   `cpt-cf-uc-plugin-seq-retention-sweep`). The sweep reasons about this
+///   contention from its side, where a timed-out wait keeps the chunk; from
+///   ingest's side it arrives as the same `55P03` as any other lock wait.
+///
+/// `55P03` is classified transient ([`super::error`]) precisely because a wait
+/// that times out here is an ordinary contention outcome rather than a defect,
+/// whichever lock it was on, so a timed-out batch is retried rather
+/// than returned as a non-retryable failure. That classification is what makes
+/// the list above a reading aid rather than a premise: nothing depends on it
+/// being complete.
 const LOCK_TIMEOUT: &str = "5s";
 
-/// Session GUCs applied to every request-path pool connection at connect time,
-/// bounding how long a statement may run (`statement_timeout`, config-driven) and
-/// how long it waits on a row lock (`lock_timeout`, fixed [`LOCK_TIMEOUT`]) so a
-/// wedged backend cannot pin pool connections indefinitely and exhaust the pool.
-/// Applied as `-c name=value` startup parameters so the bound holds from the
-/// connection's first query, with no extra round-trip.
-fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
+/// The isolation level every request-path connection runs at, forced rather
+/// than inherited from the server.
+///
+/// **This is a correctness dependency, not a bound.** The write path's conflict
+/// arm ([`super::record_store::PgRecordStore`]) resolves a lost dedup slot by
+/// reading the winning row back *inside the write transaction that lost*. Under `READ COMMITTED` that read takes a fresh snapshot and sees
+/// the winner, which committed moments earlier; under a deployer-set
+/// `default_transaction_isolation = repeatable read` it keeps the transaction's
+/// original snapshot, the winner is invisible, and the loser answers a
+/// `Transient` where `docs/DESIGN.md` §3.3's `dedup-concurrent` row requires it
+/// to resolve absorb-vs-conflict.
+///
+/// Unlike `fsync` and `full_page_writes` ([`REQUIRED_DURABILITY_SETTINGS`]),
+/// which are server-wide and can only be checked, this one is per-connection
+/// and can simply be forced — so it is, in [`connection_gucs`], at the cost of
+/// one more startup parameter and no round-trip. Forcing beats checking here:
+/// a check would refuse to start a deployment the plugin is perfectly able to
+/// serve correctly.
+///
+/// The feed's page transaction opens with an explicit
+/// `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, which overrides this
+/// default per transaction and is unaffected.
+///
+/// `inst-pool-isolation` in `docs/features/registration-schema-provisioning.md`
+/// is the instruction; `tests/connection_isolation_pg.rs` is where it is pinned
+/// against a server that defaults the other way.
+const DEFAULT_TRANSACTION_ISOLATION: &str = "read committed";
+
+/// Session GUCs applied to every request-path pool connection at connect time:
+/// `statement_timeout` (config-driven) bounds how long a statement may run,
+/// `transaction_timeout` (config-driven) how long a whole transaction may stay
+/// open, and `lock_timeout` (fixed at [`LOCK_TIMEOUT`]) how long a statement
+/// waits on a contended lock, so a wedged backend cannot pin pool connections
+/// indefinitely and exhaust the pool. Applied as `-c name=value` startup
+/// parameters so the bounds hold from the connection's first query, with no
+/// extra round-trip.
+///
+/// The fourth is not a bound. `default_transaction_isolation`
+/// ([`DEFAULT_TRANSACTION_ISOLATION`]) is forced because the write path's
+/// conflict read-back is only correct at `READ COMMITTED`, and a deployer, a
+/// role default, or a managed-Postgres provider can set the server otherwise;
+/// its own doc carries the argument. It rides here rather than in a `SET` of
+/// its own for the reason the sentence above gives: no extra round-trip, and
+/// it holds from the connection's first query.
+///
+/// `transaction_timeout` bounds the plugin's own request-path and retention-drop
+/// transactions, so neither can hold the feed's settled horizon back
+/// indefinitely (`docs/DESIGN.md` §4.1 item 2). It does not bound the horizon
+/// itself: the horizon is cluster-wide, bounded by the longest-running write
+/// transaction in the `PostgreSQL` instance, and item 2's table leaves the
+/// rollup refresh "not bounded by configuration" and anything else in the
+/// instance "not bounded by the plugin". A statement bound alone would not give
+/// even this much: a transaction that opened and then stalled between statements
+/// holds the horizon back with every one of its statements inside the bound. The
+/// retention sweep's detached connection is `pool.acquire().await?.detach()`
+/// ([`super::retention_sweep`]) — the same physical connection with the same
+/// startup parameters — so it carries this bound already and needs no `SET` of
+/// its own.
+fn connection_gucs(
+    statement_timeout_secs: u64,
+    transaction_timeout_secs: u64,
+) -> [(&'static str, String); 4] {
     [
         ("statement_timeout", format!("{statement_timeout_secs}s")),
+        (
+            "transaction_timeout",
+            format!("{transaction_timeout_secs}s"),
+        ),
         ("lock_timeout", LOCK_TIMEOUT.to_owned()),
+        (
+            "default_transaction_isolation",
+            DEFAULT_TRANSACTION_ISOLATION.to_owned(),
+        ),
     ]
 }
 
@@ -92,31 +191,91 @@ fn connection_gucs(statement_timeout_secs: u64) -> [(&'static str, String); 2] {
 fn pool_connect_options(
     database_url: &str,
     statement_timeout_secs: u64,
+    transaction_timeout_secs: u64,
 ) -> Result<PgConnectOptions, sqlx::Error> {
-    Ok(connect_options(database_url)?.options(connection_gucs(statement_timeout_secs)))
+    Ok(connect_options(database_url)?.options(connection_gucs(
+        statement_timeout_secs,
+        transaction_timeout_secs,
+    )))
+}
+
+/// Server-wide settings the plugin refuses to start without.
+///
+/// `docs/DESIGN.md` §3.5 states both the rule and the reason it cannot be met
+/// per transaction: "Unlike `synchronous_commit`, `fsync` and
+/// `full_page_writes` are server-wide and cannot be forced per transaction, and
+/// either one off can lose a committed write on a crash."
+///
+/// The `TimescaleDB` extension check that the same provisioning steps call for
+/// (`inst-pool-extension` in `docs/features/registration-schema-provisioning.md`,
+/// alongside `inst-pool-fsync` and `inst-pool-full-page-writes`) is met by the
+/// migration's `CREATE EXTENSION IF NOT EXISTS timescaledb`, which fails when
+/// the extension is unavailable. No second check is added for it.
+const REQUIRED_DURABILITY_SETTINGS: [&str; 2] = ["fsync", "full_page_writes"];
+
+/// Verify every setting in [`REQUIRED_DURABILITY_SETTINGS`] reads `on`.
+///
+/// Called from [`build_pool`] before it returns, so a failure leaves the plugin
+/// unregistered rather than running against a server that can lose an
+/// acknowledged write (`inst-pool-return`).
+///
+/// # Errors
+/// Returns `sqlx::Error` if a setting cannot be read, or
+/// `sqlx::Error::Configuration` naming the setting and its value if it is not
+/// `on`.
+async fn verify_durability_settings(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    for setting in REQUIRED_DURABILITY_SETTINGS {
+        let value: String = sqlx::query_scalar("SELECT current_setting($1)")
+            .bind(setting)
+            .fetch_one(&mut *conn)
+            .await?;
+        if value != "on" {
+            return Err(sqlx::Error::Configuration(
+                format!(
+                    "TimescaleDB server reports {setting} = {value}; this plugin refuses to start \
+                     against a server that can lose an acknowledged write. The setting is \
+                     server-wide and cannot be forced per transaction, so it is the operator's to \
+                     fix on the server"
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the connection pool with TLS enforced (`sslmode >= require`, see
-/// [`connect_options`]) and every request-path connection bounded by
-/// `statement_timeout` + `lock_timeout` (see [`connection_gucs`]).
+/// `connect_options`) and every request-path connection bounded by
+/// `statement_timeout` + `transaction_timeout` + `lock_timeout` (see
+/// `connection_gucs`), then refuse the server outright unless every setting
+/// in `REQUIRED_DURABILITY_SETTINGS` reads `on`.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if the DSN is malformed or the pool cannot connect
-/// within the timeout.
+/// Returns `sqlx::Error` if the DSN is malformed, the pool cannot connect
+/// within the timeout, or a durability setting is not `on`.
+// @cpt-algo:cpt-cf-uc-plugin-algo-pool-build-durability-check:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-connection-pool-durability-gate:p1
 pub async fn build_pool(cfg: &TimescaleDbPluginConfig) -> Result<PgPool, sqlx::Error> {
     // Unwrap the secret DSN only here, at the connection boundary: keep it behind
     // `secrecy`'s opaque-debug/zeroize guarantees and expose the bytes just long
     // enough for sqlx to parse them into `PgConnectOptions`.
     let dsn = cfg.database_url.clone_into_secret_string();
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .min_connections(cfg.pool_size_min)
         .max_connections(cfg.pool_size_max)
         .acquire_timeout(Duration::from_secs(cfg.connection_timeout_secs))
         .connect_with(pool_connect_options(
             dsn.expose_secret(),
             cfg.statement_timeout_secs,
+            cfg.transaction_timeout_secs,
         )?)
-        .await
+        .await?;
+    // On one acquired connection, and before the pool is handed out: the caller
+    // never sees a pool built against a server that fails the check.
+    let mut conn = pool.acquire().await?;
+    verify_durability_settings(&mut conn).await?;
+    drop(conn);
+    Ok(pool)
 }
 
 /// Fixed advisory-lock key namespacing the plugin's post-migration setup.
@@ -154,44 +313,43 @@ async fn acquire_init_lock(lock_conn: &mut PgConnection) -> Result<(), sqlx::Err
     Ok(())
 }
 
-/// Run the post-migration policy registration under a database advisory lock so
-/// concurrently-initializing replicas serialize here.
+/// Run the post-migration partitioning and rollup-policy setup under a
+/// database advisory lock so concurrently-initializing replicas serialize
+/// here.
 ///
-/// [`apply_retention_policy`]'s remove-then-add sequence is non-atomic, and
-/// `add_retention_policy` (no `if_not_exists`) *errors* if a policy already
-/// exists — so two pods racing this section could leave a half-applied state or
-/// fail outright. A session-level `pg_advisory_lock` held on a dedicated
-/// connection for the whole section lets only one replica apply at a time; the
-/// rest block until it releases. (Schema migrations themselves are already
-/// serialized by sqlx's own migration lock; this covers the registration that
-/// sqlx does not.)
+/// A session-level `pg_advisory_lock` held on a dedicated connection for the
+/// whole section lets only one replica apply at a time; the rest block until it
+/// releases. (Schema migrations themselves are already serialized by sqlx's own
+/// migration lock; this covers the setup that sqlx does not.)
 ///
-/// The policy/job functions keep running in autocommit on the pool, exactly as
-/// before — deliberately *not* wrapped in an explicit transaction, since
-/// `TimescaleDB` policy functions are happiest in autocommit. The lock is
-/// released on every return path; if the holding process dies, Postgres releases
-/// it when the session ends.
+/// The setup statements keep running in autocommit on the pool — deliberately
+/// *not* wrapped in an explicit transaction, since `TimescaleDB` policy
+/// functions are happiest in autocommit. The lock is released on every return
+/// path; if the holding process dies, Postgres releases it when the session
+/// ends.
 ///
 /// The wait to *acquire* the lock is bounded by the connection-level
-/// `statement_timeout` (see [`acquire_init_lock`]) so a wedged peer cannot stall
+/// `statement_timeout` (see `acquire_init_lock`, named in plain backticks
+/// because it is private and this item is public) so a wedged peer cannot stall
 /// init forever.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if the lock cannot be acquired or either registration
-/// step fails.
+/// Returns `sqlx::Error` if the lock cannot be acquired or a setup statement
+/// fails.
+// @cpt-algo:cpt-cf-uc-plugin-algo-post-migration-setup:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-partitioning-setup:p1
 pub async fn apply_post_migration_setup(
     pool: &PgPool,
-    retention_secs: u64,
+    cfg: &TimescaleDbPluginConfig,
 ) -> Result<(), sqlx::Error> {
-    // Hold a session-level advisory lock on a dedicated connection for the whole
-    // critical section. Concurrent replicas block on this `pg_advisory_lock`
-    // until the holder releases it below, so only one applies at a time. The wait
-    // is bounded by the connection-level `statement_timeout` (see
-    // `acquire_init_lock`) so a wedged peer cannot stall init forever.
     let mut lock_conn = pool.acquire().await?;
     acquire_init_lock(&mut lock_conn).await?;
 
-    let result = apply_retention_policy(pool, retention_secs).await;
+    let result = async {
+        apply_partitioning(pool, cfg.chunk_time_interval_secs, cfg.type_key_slice_width).await?;
+        apply_rollup_policies(pool, cfg).await
+    }
+    .await;
 
     // Release on every path (including the error path) so a failing replica
     // never wedges the others. If the unlock itself fails the session is likely
@@ -210,27 +368,41 @@ pub async fn apply_post_migration_setup(
     result
 }
 
-/// Idempotently register the config-driven retention policy, **updating** it if
-/// it already exists so a changed `retention_secs` takes effect on restart.
-/// Runs after migrations.
+/// Remove any table-wide retention policy and apply the configured chunk
+/// intervals. Idempotent: a restart with changed values applies them.
 ///
-/// `add_retention_policy(if_not_exists => TRUE)` would *skip* an existing
-/// policy and silently keep the old window; remove-then-add applies the new
-/// one. The sub-second gap with no policy is harmless — retention is a slow
-/// background job.
+/// The policy removal matters for a database an earlier build initialized: a
+/// table-wide `policy_retention` drops every type at one horizon, underneath the
+/// per-type retention sweep.
+///
+/// Both intervals apply to chunks created afterwards; existing chunks keep their
+/// ranges. `dimension_name` is required on both calls — with two dimensions,
+/// `TimescaleDB` refuses an unnamed interval change as ambiguous.
 ///
 /// # Errors
-/// Returns `sqlx::Error` if either statement fails.
-pub async fn apply_retention_policy(pool: &PgPool, retention_secs: u64) -> Result<(), sqlx::Error> {
-    let secs = i64::try_from(retention_secs).unwrap_or(i64::MAX);
+/// Returns `sqlx::Error` if any statement fails.
+// @cpt-dod:cpt-cf-uc-plugin-dod-disposal-is-chunk-drop-only:p1
+pub async fn apply_partitioning(
+    pool: &PgPool,
+    chunk_time_interval_secs: u64,
+    type_key_slice_width: u32,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT remove_retention_policy('usage_records', if_exists => TRUE)")
         .execute(pool)
         .await?;
+    let secs = i64::try_from(chunk_time_interval_secs).unwrap_or(i64::MAX);
     sqlx::query(
-        "SELECT add_retention_policy('usage_records', \
-         drop_after => make_interval(secs => $1::double precision))",
+        "SELECT set_chunk_time_interval('usage_records', \
+         make_interval(secs => $1::double precision), dimension_name => 'window_end')",
     )
     .bind(secs)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "SELECT set_chunk_time_interval('usage_records', $1::bigint, \
+         dimension_name => 'type_key')",
+    )
+    .bind(i64::from(type_key_slice_width))
     .execute(pool)
     .await?;
     Ok(())

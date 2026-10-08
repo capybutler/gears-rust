@@ -1,0 +1,1363 @@
+#![cfg(feature = "postgres")]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+//! The retention sweep against a live `TimescaleDB`, over a stub retention
+//! source whose values a test can amend between sweeps. Requires Docker.
+//!
+//! Fixtures are written through the real ingest path with a covered period
+//! that ended a given number of days ago; the default 7-day chunk interval puts
+//! entries of one type and one age into one chunk.
+
+mod common;
+use common::StoreFixtures;
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
+
+use async_trait::async_trait;
+use rust_decimal::Decimal;
+use time::{Duration, OffsetDateTime};
+use toolkit::client_hub::ClientHub;
+use types_registry_sdk::testing::MockTypesRegistryClient;
+use types_registry_sdk::{GtsTypeId, GtsTypeSchema, TypesRegistryClient};
+use uuid::Uuid;
+
+use usage_collector_sdk::StoredUsageRecord;
+use usage_collector_sdk::contract::retention::ContractRetention;
+
+use timescaledb_usage_collector_plugin::domain::ports::{RetentionError, RetentionSource};
+use timescaledb_usage_collector_plugin::infra::metrics::Metrics;
+use timescaledb_usage_collector_plugin::infra::registry_retention::TypesRegistryRetentionSource;
+use timescaledb_usage_collector_plugin::infra::storage::pool::apply_post_migration_setup;
+use timescaledb_usage_collector_plugin::infra::storage::retention_sweep::{
+    CHUNK_HIGHEST_POSITIONS_SQL, PgRetentionSweeper, SWEEP_ADVISORY_LOCK_KEY, list_chunks,
+};
+use timescaledb_usage_collector_plugin::infra::storage::rollup_maintenance::materialization_table;
+
+const DAY: u64 = 86_400;
+
+/// [`common::meter_reference`] for the `&str` spelling this suite's helpers
+/// take, so they keep naming meters the way every other assertion here does.
+fn reference(meter: &str) -> Uuid {
+    common::meter_reference(&common::meter(meter))
+}
+
+/// The abstract base every meter in this suite derives from.
+///
+/// `GtsTypeSchema::try_new` refuses a derived id whose parent is absent, so a
+/// stand-in registry cannot hold a meter schema without also holding this one.
+const USAGE_RECORD_BASE: &str = "gts.cf.core.uc.usage_record.v1~";
+
+/// A `types-registry` type-schema for `meter`, declaring `retention`, and
+/// **issued under the reference this harness minted for that meter**.
+///
+/// The `type_uuid` override is the whole point: `types-registry` derives a
+/// type's reference itself and the ledger stores whatever it was issued, while
+/// this harness mints its own under [`common::meter_ref`]'s fixture namespace,
+/// so nothing here looks like it re-derived the registry's. Handing the
+/// stand-in registry the harness's reference is what makes the two agree about
+/// one meter — the state a deployment is in, and the state the sweep's
+/// by-reference lookup has to work in.
+///
+/// The traits are carried on the derived schema and read back through
+/// `effective_traits`, the path `retention_from_traits` takes in production.
+fn registry_schema(meter: &str, retention: &str) -> GtsTypeSchema {
+    let base = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(USAGE_RECORD_BASE).expect("the base type id is valid"),
+        serde_json::json!({ "type": "object", "x-gts-abstract": true }),
+        None,
+        None,
+    )
+    .expect("the base schema is valid");
+    let derived = GtsTypeSchema::try_new(
+        GtsTypeId::try_new(meter).expect("the meter type id is valid"),
+        serde_json::json!({
+            "allOf": [ { "$ref": format!("gts://{USAGE_RECORD_BASE}") } ],
+            "x-gts-traits": {
+                "aggregation_fold": "SUM",
+                "canonical_unit": "count",
+                "retention": retention,
+            }
+        }),
+        None,
+        Some(Arc::new(base)),
+    )
+    .expect("the meter schema is valid");
+    GtsTypeSchema {
+        type_uuid: reference(meter),
+        ..derived
+    }
+}
+
+/// Retention per type reference, amendable mid-test. A type with no entry is
+/// not found.
+#[derive(Default)]
+struct StubRetention {
+    by_type: Mutex<HashMap<Uuid, Result<StdDuration, RetentionError>>>,
+}
+
+impl StubRetention {
+    fn set(&self, meter: &str, retention: Result<StdDuration, RetentionError>) {
+        self.by_type
+            .lock()
+            .unwrap()
+            .insert(reference(meter), retention);
+    }
+}
+
+#[async_trait]
+impl RetentionSource for StubRetention {
+    async fn retention(&self, gts_type_uuid: Uuid) -> Result<StdDuration, RetentionError> {
+        self.by_type
+            .lock()
+            .unwrap()
+            .get(&gts_type_uuid)
+            .cloned()
+            .unwrap_or(Err(RetentionError::NotFound))
+    }
+}
+
+// Never `Err` here, but it must match `StubRetention::set`'s
+// `Result<StdDuration, RetentionError>` parameter so a call site can read
+// `days(n)` beside the `Err(...)` fixtures without a second wrapping.
+#[allow(clippy::unnecessary_wraps)]
+fn days(n: u64) -> Result<StdDuration, RetentionError> {
+    Ok(StdDuration::from_secs(n * DAY))
+}
+
+/// An entry of `meter` whose covered period ended `days_ago` days ago.
+fn aged(meter: &str, tenant: Uuid, idem: &str, days_ago: i64) -> StoredUsageRecord {
+    let end = OffsetDateTime::now_utc() - Duration::days(days_ago);
+    common::entry_over(
+        &common::meter(meter),
+        tenant,
+        idem,
+        Decimal::ONE,
+        end - Duration::hours(1),
+        end,
+    )
+}
+
+async fn stored(pool: &sqlx::PgPool, id: Uuid) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_records WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count by id");
+    n == 1
+}
+
+fn sweeper(pool: &sqlx::PgPool, stub: &Arc<StubRetention>) -> PgRetentionSweeper {
+    PgRetentionSweeper::new(
+        pool.clone(),
+        Arc::clone(stub) as Arc<dyn RetentionSource>,
+        Arc::new(Metrics::new(pool.clone())),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_type_expires_at_its_own_retention() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E01);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(400));
+
+    let old_vcpu = aged(common::VCPU_METER, tenant, "old-vcpu", 100);
+    let old_gb = aged(common::GB_METER, tenant, "old-gb", 100);
+    let new_vcpu = aged(common::VCPU_METER, tenant, "new-vcpu", 0);
+    let (old_vcpu_id, old_gb_id, new_vcpu_id) = (old_vcpu.id, old_gb.id, new_vcpu.id);
+    for entry in [old_vcpu, old_gb, new_vcpu] {
+        store.create_fixture(entry).await.expect("create fixture");
+    }
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(report.dropped, 1, "{report:?}");
+    assert!(
+        !stored(&h.pool, old_vcpu_id).await,
+        "vcpu past 30 days is dropped"
+    );
+    assert!(
+        stored(&h.pool, old_gb_id).await,
+        "gb inside 400 days survives beside it"
+    );
+    assert!(
+        stored(&h.pool, new_vcpu_id).await,
+        "a current vcpu period survives"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_amended_retention_applies_to_entries_already_stored() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E02), "amended", 100);
+    let id = entry.id;
+    store.create_fixture(entry).await.expect("create fixture");
+    let sweeper = sweeper(&h.pool, &stub);
+
+    stub.set(common::VCPU_METER, days(400));
+    let raised = sweeper.sweep_once().await.expect("sweep after raise");
+    assert_eq!(raised.dropped, 0, "{raised:?}");
+    assert!(
+        stored(&h.pool, id).await,
+        "a raised retention keeps an entry already stored"
+    );
+
+    stub.set(common::VCPU_METER, days(30));
+    let lowered = sweeper.sweep_once().await.expect("sweep after lower");
+    assert_eq!(lowered.dropped, 1, "{lowered:?}");
+    assert!(
+        !stored(&h.pool, id).await,
+        "a lowered retention drops an entry already stored"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unresolvable_type_keeps_its_chunks_while_others_still_drop() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E03);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(
+        common::VCPU_METER,
+        Err(RetentionError::Unavailable("registry down".to_owned())),
+    );
+    stub.set(common::GB_METER, days(30));
+
+    let vcpu = aged(common::VCPU_METER, tenant, "vcpu", 100);
+    let gb = aged(common::GB_METER, tenant, "gb", 100);
+    let (vcpu_id, gb_id) = (vcpu.id, gb.id);
+    store.create_fixture(vcpu).await.expect("create vcpu");
+    store.create_fixture(gb).await.expect("create gb");
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.kept_unresolved),
+        (1, 1),
+        "{report:?}"
+    );
+    assert!(
+        stored(&h.pool, vcpu_id).await,
+        "no definite retention, no drop"
+    );
+    assert!(
+        !stored(&h.pool, gb_id).await,
+        "a resolvable expired type still drops"
+    );
+}
+
+/// The sweep must resolve a type's retention through the registry's
+/// **by-uuid** lookup, and this asserts it over the production
+/// [`TypesRegistryRetentionSource`] rather than over this suite's stub.
+///
+/// Every other test here hands the sweeper a [`StubRetention`] keyed on the
+/// reference, pinning what the sweeper *passes* and saying nothing about what
+/// the registry source does with it. This runs the real chain: `usage_type_key`
+/// holds a `uuid` and nothing else — the ADR bars deriving an identifier from
+/// the reference — so the source must reach `get_type_schema_by_uuid`, where
+/// one reaching `get_type_schema` has only a rendered uuid to pass and is
+/// refused before any lookup. `classify` turns that into
+/// `RetentionError::Unavailable`, `drop_decision` returns `Keep` on the first
+/// `Err` in a chunk's list, and every chunk is then kept for ever with a
+/// rising `uc_timescaledb_retention_chunks_kept_unresolved_total` the only
+/// symptom.
+///
+/// The report is asserted as a whole triple rather than on `dropped` alone,
+/// because "nothing was dropped" is also what an empty ledger looks like:
+/// `chunks_seen` separates the two and `kept_unresolved` is the positive
+/// signal the broken path leaves behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_resolves_retention_through_the_by_uuid_lookup() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let entry = aged(
+        common::VCPU_METER,
+        Uuid::from_u128(0x5E0B),
+        "by-uuid-lookup",
+        100,
+    );
+    let id = entry.id;
+    store.create_fixture(entry).await.expect("create fixture");
+
+    let hub = Arc::new(ClientHub::default());
+    hub.register::<dyn TypesRegistryClient>(Arc::new(
+        MockTypesRegistryClient::new()
+            .with_type_schemas([registry_schema(common::VCPU_METER, "P30D")]),
+    ));
+    let source: Arc<dyn RetentionSource> = Arc::new(TypesRegistryRetentionSource::new(hub));
+
+    let report = PgRetentionSweeper::new(
+        h.pool.clone(),
+        source,
+        Arc::new(Metrics::new(h.pool.clone())),
+    )
+    .sweep_once()
+    .await
+    .expect("sweep");
+
+    assert_eq!(
+        (report.chunks_seen, report.dropped, report.kept_unresolved),
+        (1, 1, 0),
+        "the one chunk's retention must resolve through the registry's by-uuid lookup and \
+         expire it; a kept_unresolved chunk means the reference reached a lookup that cannot \
+         take one: {report:?}"
+    );
+    assert!(
+        !stored(&h.pool, id).await,
+        "the entry past its declared 30-day retention is gone"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_slice_is_held_to_its_longest_retention() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    // Before any write, so the first chunks are created at width 4: keys 1 and
+    // 2 share the slice [0, 4).
+    let widened = timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig {
+        type_key_slice_width: 4,
+        ..h.cfg.clone()
+    };
+    apply_post_migration_setup(&h.pool, &widened)
+        .await
+        .expect("widen the type-key slice");
+    // apply_post_migration_setup re-creates the refresh policies; remove them
+    // again so a background refresh cannot race this test's own sweeps.
+    common::settle_and_remove_rollup_policies(&h.pool)
+        .await
+        .expect("settle and remove the re-created policies");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E04);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(400));
+
+    let vcpu = aged(common::VCPU_METER, tenant, "vcpu", 100);
+    let gb = aged(common::GB_METER, tenant, "gb", 100);
+    let (vcpu_id, gb_id) = (vcpu.id, gb.id);
+    store.create_fixture(vcpu).await.expect("create vcpu");
+    store.create_fixture(gb).await.expect("create gb");
+    let chunks: i64 = sqlx::query_scalar("SELECT count(*) FROM show_chunks('usage_records')")
+        .fetch_one(&h.pool)
+        .await
+        .expect("show_chunks");
+    assert_eq!(chunks, 1, "both types share one chunk at width 4");
+    let sweeper = sweeper(&h.pool, &stub);
+
+    let held = sweeper.sweep_once().await.expect("first sweep");
+    assert_eq!(held.dropped, 0, "{held:?}");
+    assert!(
+        stored(&h.pool, vcpu_id).await,
+        "held to gb's 400 days, not vcpu's 30"
+    );
+
+    stub.set(common::GB_METER, days(30));
+    let released = sweeper.sweep_once().await.expect("second sweep");
+    assert_eq!(released.dropped, 1, "{released:?}");
+    assert!(!stored(&h.pool, vcpu_id).await && !stored(&h.pool, gb_id).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalidation_and_its_target_drop_together() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let target = aged(common::VCPU_METER, Uuid::from_u128(0x5E05), "target", 100);
+    let withdrawal = common::withdrawal_of(&target);
+    let (target_id, withdrawal_id) = (target.id, withdrawal.id);
+    store.create_fixture(target).await.expect("create target");
+    store
+        .create_fixture(withdrawal)
+        .await
+        .expect("create withdrawal");
+
+    sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert!(!stored(&h.pool, target_id).await, "the target is dropped");
+    assert!(
+        !stored(&h.pool, withdrawal_id).await,
+        "its invalidation goes with it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_into_a_dropped_range_is_collected_by_the_next_sweep() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E06);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let sweeper = sweeper(&h.pool, &stub);
+
+    store
+        .create_fixture(aged(common::VCPU_METER, tenant, "first", 100))
+        .await
+        .expect("create first");
+    assert_eq!(sweeper.sweep_once().await.expect("sweep 1").dropped, 1);
+
+    let late = aged(common::VCPU_METER, tenant, "late", 100);
+    let late_id = late.id;
+    store
+        .create_fixture(late)
+        .await
+        .expect("a write into a dropped range recreates its chunk");
+    assert!(stored(&h.pool, late_id).await);
+
+    assert_eq!(sweeper.sweep_once().await.expect("sweep 2").dropped, 1);
+    assert!(
+        !stored(&h.pool, late_id).await,
+        "the recreated chunk is collected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sweep_skips_while_another_session_holds_the_lock() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E07), "locked", 100);
+    let id = entry.id;
+    store.create_fixture(entry).await.expect("create fixture");
+    let sweeper = sweeper(&h.pool, &stub);
+
+    // A different session: the advisory lock is re-entrant within one.
+    let mut holder = h.pool.acquire().await.expect("acquire lock holder");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SWEEP_ADVISORY_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("take the sweep lock");
+
+    let skipped = sweeper.sweep_once().await.expect("sweep while locked");
+    assert!(skipped.skipped_locked, "{skipped:?}");
+    assert!(stored(&h.pool, id).await, "a skipped sweep drops nothing");
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SWEEP_ADVISORY_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .expect("release the sweep lock");
+    let ran = sweeper.sweep_once().await.expect("sweep after release");
+    assert!(!ran.skipped_locked && ran.dropped == 1, "{ran:?}");
+}
+
+/// Whether `usage_rollup_1h` holds a row for `meter` at exactly `bucket`.
+async fn bucket_exists(pool: &sqlx::PgPool, meter: &str, bucket: OffsetDateTime) -> bool {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_rollup_1h WHERE gts_type_uuid = $1 AND bucket = $2",
+    )
+    .bind(reference(meter))
+    .bind(bucket)
+    .fetch_one(pool)
+    .await
+    .expect("count rollup bucket");
+    n > 0
+}
+
+async fn rollup_rows(pool: &sqlx::PgPool, meter: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM usage_rollup_1h WHERE gts_type_uuid = $1")
+        .bind(reference(meter))
+        .fetch_one(pool)
+        .await
+        .expect("count rollup rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_takes_its_types_rollup_rows_and_leaves_the_others() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E10);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(400));
+    store
+        .create_fixture(aged(common::VCPU_METER, tenant, "vcpu", 100))
+        .await
+        .expect("vcpu");
+    store
+        .create_fixture(aged(common::GB_METER, tenant, "gb", 100))
+        .await
+        .expect("gb");
+    common::refresh_rollup(&h.pool).await;
+    assert_eq!(
+        (
+            rollup_rows(&h.pool, common::VCPU_METER).await,
+            rollup_rows(&h.pool, common::GB_METER).await
+        ),
+        (1, 1)
+    );
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 1),
+        "{report:?}"
+    );
+    assert_eq!(
+        rollup_rows(&h.pool, common::VCPU_METER).await,
+        0,
+        "the expired type's rollup rows go with its chunk"
+    );
+    assert_eq!(
+        rollup_rows(&h.pool, common::GB_METER).await,
+        1,
+        "the other type's rollup rows stay"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_slice_drop_cuts_every_type_in_its_key_range() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let widened = timescaledb_usage_collector_plugin::config::TimescaleDbPluginConfig {
+        type_key_slice_width: 4,
+        ..h.cfg.clone()
+    };
+    apply_post_migration_setup(&h.pool, &widened)
+        .await
+        .expect("widen");
+    // apply_post_migration_setup re-creates the refresh policies; remove them
+    // again so a background refresh cannot race this test's own sweep.
+    common::settle_and_remove_rollup_policies(&h.pool)
+        .await
+        .expect("settle and remove the re-created policies");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E11);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    stub.set(common::GB_METER, days(30));
+    store
+        .create_fixture(aged(common::VCPU_METER, tenant, "vcpu", 100))
+        .await
+        .expect("vcpu");
+    store
+        .create_fixture(aged(common::GB_METER, tenant, "gb", 100))
+        .await
+        .expect("gb");
+    common::refresh_rollup(&h.pool).await;
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 2),
+        "{report:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_rollup_nothing_is_dropped() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E12), "kept", 100);
+    let id = entry.id;
+    store.create_fixture(entry).await.expect("create");
+    sqlx::query("DROP MATERIALIZED VIEW usage_rollup_1h")
+        .execute(&h.pool)
+        .await
+        .expect("drop the rollup");
+
+    assert!(sweeper(&h.pool, &stub).sweep_once().await.is_err());
+    assert!(
+        stored(&h.pool, id).await,
+        "no rollup to cut, so no chunk is dropped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_write_into_a_dropped_range_is_the_only_thing_the_next_refresh_rolls_up() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E13);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    let first = aged(common::VCPU_METER, tenant, "first", 100);
+    let (start, end) = (first.window_start, first.window_end);
+    store.create_fixture(first).await.expect("first");
+    common::refresh_rollup(&h.pool).await;
+    assert_eq!(
+        sweeper(&h.pool, &stub)
+            .sweep_once()
+            .await
+            .expect("sweep")
+            .dropped,
+        1
+    );
+
+    let late = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "late",
+        Decimal::from(3),
+        start,
+        end,
+    );
+    store
+        .create_fixture(late)
+        .await
+        .expect("late write recreates the chunk");
+    common::refresh_rollup(&h.pool).await;
+
+    let total: Option<rust_decimal::Decimal> =
+        sqlx::query_scalar("SELECT sum(sum_value) FROM usage_rollup_1h WHERE gts_type_uuid = $1")
+            .bind(reference(common::VCPU_METER))
+            .fetch_one(&h.pool)
+            .await
+            .expect("rollup total");
+    assert_eq!(
+        total,
+        Some(Decimal::from(3)),
+        "only the surviving late row is rolled up"
+    );
+}
+
+/// The rollup cut is bounded to the dropped chunk's own bucket range: an
+/// expired chunk's rollup row is deleted, and the very next hour's row, which
+/// belongs to a chunk that has not expired, survives untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollup_drop_cuts_only_the_dropped_chunks_bucket_range() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E20);
+    let stub = Arc::new(StubRetention::default());
+
+    // Discover the boundary between two adjacent chunks without assuming how
+    // TimescaleDB anchors it: write a throw-away entry far in the past, read
+    // its chunk's [time_start, time_end) back via list_chunks, and take
+    // time_end. The row is then removed out of band so it does not add a
+    // second rollup bucket to the expired chunk below.
+    let probe = aged(common::VCPU_METER, tenant, "probe", 100);
+    let probe_id = probe.id;
+    let probe_end = probe.window_end;
+    store.create_fixture(probe).await.expect("create probe");
+    let probe_chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .find(|c| c.time_start <= probe_end && probe_end < c.time_end)
+        .expect("the probe landed in a chunk");
+    let boundary = probe_chunk.time_end;
+    sqlx::query("DELETE FROM usage_records WHERE id = $1")
+        .bind(probe_id)
+        .execute(&h.pool)
+        .await
+        .expect("remove the probe");
+
+    // Two adjacent chunks at the discovered boundary: the expired chunk gets
+    // an entry in its LAST hour, the fresh chunk directly after it one in its
+    // FIRST. `chunk_time_interval_secs` is validated as a multiple of 3600 so
+    // every hourly bucket lies inside exactly one chunk (spec §5.4), which
+    // makes `boundary` hour-aligned and each entry's
+    // `time_bucket('1 hour', window_end)` land wholly inside its own chunk.
+    let expired_end = boundary - Duration::minutes(30);
+    let fresh_end = boundary + Duration::minutes(30);
+    let expired = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "expired",
+        Decimal::ONE,
+        expired_end - Duration::hours(1),
+        expired_end,
+    );
+    let fresh = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "fresh",
+        Decimal::ONE,
+        fresh_end - Duration::hours(1),
+        fresh_end,
+    );
+    store
+        .create_fixture(expired)
+        .await
+        .expect("create expired entry");
+    store
+        .create_fixture(fresh)
+        .await
+        .expect("create fresh entry");
+
+    // Retention arithmetic. `drop_decision` drops a chunk when
+    // `chunk.time_end + retention < now`. Anchoring retention off
+    // `now - boundary` rather than a fixed day count makes it hold wherever
+    // inside the chunk window the probe landed:
+    //   expired: boundary + retention < now        =>  retention < now - boundary
+    //   fresh:   boundary + 7d + retention >= now   =>  retention >= now - boundary - 7d
+    // `(now - boundary) - 1 day` satisfies both, with a day of margin on the
+    // expired side and six on the fresh side.
+    let now = OffsetDateTime::now_utc();
+    let secs_since_boundary = (now - boundary).whole_seconds();
+    assert!(
+        secs_since_boundary > i64::try_from(DAY).expect("DAY fits i64"),
+        "the discovered boundary must be more than a day in the past: {secs_since_boundary}s"
+    );
+    let retention_secs = u64::try_from(secs_since_boundary).expect("positive, checked above") - DAY;
+    stub.set(
+        common::VCPU_METER,
+        Ok(StdDuration::from_secs(retention_secs)),
+    );
+
+    common::refresh_rollup(&h.pool).await;
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!(
+        (report.dropped, report.rollup_rows_deleted),
+        (1, 1),
+        "{report:?}"
+    );
+
+    let expired_bucket = boundary - Duration::hours(1);
+    let fresh_bucket = boundary;
+    assert!(
+        !bucket_exists(&h.pool, common::VCPU_METER, expired_bucket).await,
+        "the expired chunk's rollup bucket is cut with its chunk"
+    );
+    assert!(
+        bucket_exists(&h.pool, common::VCPU_METER, fresh_bucket).await,
+        "the fresh chunk's rollup bucket survives untouched"
+    );
+}
+
+/// A failed rollup-row delete rolls back the whole drop: the chunk stays, the
+/// ledger entry stays, and the failure is counted rather than the sweep
+/// silently dropping a chunk whose rollup rows it could not also delete.
+///
+/// Mechanism: a `BEFORE DELETE` trigger on the materialisation hypertable
+/// (`rollup_maintenance::materialization_table`) that always raises.
+/// `TimescaleDB` accepts an ordinary trigger there — it is a plain heap table
+/// under `_timescaledb_internal`, owned by the role the test pool connects as
+/// — so no `REVOKE DELETE` fallback is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rollup_row_delete_rolls_back_the_chunk_drop() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = aged(common::VCPU_METER, Uuid::from_u128(0x5E21), "rollback", 100);
+    let id = entry.id;
+    store.create_fixture(entry).await.expect("create fixture");
+    common::refresh_rollup(&h.pool).await;
+
+    let table = materialization_table(&h.pool)
+        .await
+        .expect("materialisation table query")
+        .expect("the rollup has a materialisation table");
+    sqlx::query(
+        "CREATE FUNCTION uc_test_raise_on_rollup_delete() RETURNS trigger AS \
+         $$ BEGIN RAISE EXCEPTION 'delete refused for rollback test'; END; $$ \
+         LANGUAGE plpgsql",
+    )
+    .execute(&h.pool)
+    .await
+    .expect("create the raising trigger function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER uc_test_refuse_delete BEFORE DELETE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION uc_test_raise_on_rollup_delete()"
+    )))
+    .execute(&h.pool)
+    .await
+    .expect("install the raising trigger");
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+
+    assert_eq!((report.drop_failures, report.dropped), (1, 0), "{report:?}");
+    assert!(
+        stored(&h.pool, id).await,
+        "the chunk drop rolled back along with the failed rollup-row delete"
+    );
+}
+
+/// The mark a sweep leaves for the type it dropped, or `None`.
+async fn mark_of(pool: &sqlx::PgPool, meter: &str) -> Option<(u64, Uuid)> {
+    let row: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT xact_id::text, id FROM usage_feed_retention_marks WHERE gts_type_uuid = $1",
+    )
+    .bind(reference(meter))
+    .fetch_optional(pool)
+    .await
+    .expect("read the mark");
+    row.map(|(xact_id, id)| (xact_id.parse().expect("xid8 digits"), id))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drop_raises_the_marks_of_every_type_in_the_chunk() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E11);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = aged(common::VCPU_METER, tenant, "interlock-1", 400);
+    let stored_entry = store.create_fixture(entry).await.expect("the entry stores");
+    let position = common::xact_id_of(&h.pool, stored_entry.id).await;
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 1, "one expired chunk: {report:?}");
+    assert!(!stored(&h.pool, stored_entry.id).await, "the entry is gone");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((position, stored_entry.id)),
+        "the mark names the highest position the chunk held, which is this \
+         entry's: the sweep reads it under the chunk's ACCESS EXCLUSIVE lock \
+         and commits the mark in the transaction that drops the rows \
+         (DESIGN section 3.6 cpt-cf-uc-plugin-seq-retention-sweep)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_sweep_of_an_older_chunk_does_not_lower_the_mark() {
+    // Chunks are swept in catalog order, not time order, so this is a shape a
+    // real deployment reaches: the mark must hold at the highest position
+    // retention has ever removed for the type. A lowered mark makes a feed
+    // page serve a truncated range instead of refusing it, and nothing else
+    // in the suite can see that.
+    //
+    // A chunk's relid is assigned at creation, which happens on its first
+    // write, so with one write per chunk the first-written chunk gets both the
+    // lower relid (visited first) and the lower position — structurally
+    // coupled, so no two-chunk one-write-each fixture can present a lower
+    // position to a later-visited chunk. Breaking the coupling needs a
+    // *third* write, back into the first chunk after the second exists: the
+    // first chunk is still visited first but now holds the highest position,
+    // so the second chunk's read presents a lower one.
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E12);
+    let stub = Arc::new(StubRetention::default());
+
+    let first = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "interlock-first", 400))
+        .await
+        .expect("the first entry stores");
+    let second = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "interlock-second", 800))
+        .await
+        .expect("the second entry stores");
+    // Back into the first chunk (same covered-period age as `first`), so the
+    // chunk visited first by the sweep ends up holding the highest position
+    // of the three.
+    let third = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "interlock-third", 400))
+        .await
+        .expect("the third entry stores");
+
+    let first_pos = common::xact_id_of(&h.pool, first.id).await;
+    let second_pos = common::xact_id_of(&h.pool, second.id).await;
+    let third_pos = common::xact_id_of(&h.pool, third.id).await;
+    assert!(
+        first_pos < second_pos && second_pos < third_pos,
+        "the fixture needs strictly increasing positions in write order: \
+         first={first_pos}, second={second_pos}, third={third_pos}"
+    );
+
+    stub.set(common::VCPU_METER, days(30));
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 2, "both chunks expired: {report:?}");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((third_pos, third.id)),
+        "the mark holds at the greatest position any chunk held, the third \
+         write's, back in the first-visited chunk, not the lower position \
+         the second-visited chunk presents afterward"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_chunk_lock_makes_the_drop_time_out_and_keep_the_chunk() {
+    // The `lock_timeout` bounds the wait; without it the sweep blocks for as
+    // long as the competing transaction runs, holding every feed page queued
+    // behind its lock request. The competing lock is taken in a separate
+    // transaction never committed inside the timeout.
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E13);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    let entry = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "interlock-locked", 400))
+        .await
+        .expect("the entry stores");
+
+    let chunk =
+        timescaledb_usage_collector_plugin::infra::storage::retention_sweep::list_chunks(&h.pool)
+            .await
+            .expect("list chunks")
+            .into_iter()
+            .next()
+            .expect("one chunk");
+
+    let mut blocker = h.pool.acquire().await.expect("a blocking connection");
+    sqlx::query("BEGIN")
+        .execute(&mut *blocker)
+        .await
+        .expect("begin");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        chunk.chunk
+    )))
+    .execute(&mut *blocker)
+    .await
+    .expect("the blocker takes the chunk lock");
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep completes even though the drop could not");
+    assert_eq!(report.dropped, 0, "nothing dropped: {report:?}");
+    assert_eq!(report.drop_failures, 1, "one counted failure: {report:?}");
+
+    // The blocker's ACCESS EXCLUSIVE lock is released before the checks
+    // below. `id` is not the hypertable's partitioning key, so `stored`'s
+    // query cannot prune the still-locked chunk at plan time: it would need an
+    // `AccessShareLock` on it and block behind this test's own lock, timing
+    // out on the pool's session-level `lock_timeout` instead of exercising the
+    // assertion. The report above is already captured, so releasing early
+    // changes nothing the test proves.
+    sqlx::query("ROLLBACK")
+        .execute(&mut *blocker)
+        .await
+        .expect("rollback");
+
+    assert!(
+        stored(&h.pool, entry.id).await,
+        "the chunk is kept for the next sweep"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        None,
+        "a rolled-back drop leaves no mark: the mark and the drop commit \
+         together or not at all, which is what lets a page treat a mark as \
+         naming entries that are already gone"
+    );
+}
+
+/// A chunk whose two maxima cross: the entry with the greatest `xact_id` does
+/// not carry the greatest `id`, and vice versa. `id` is derived client-side
+/// before either write reaches the database, so which of two candidate
+/// entries carries the greater `id` is known before either is stored; writing
+/// the greater-`id` candidate first forces the second write — which always
+/// takes the greater `xact_id` — to carry the *lesser* `id`, guaranteeing a
+/// cross without any retry or search.
+///
+/// This is what distinguishes `CHUNK_HIGHEST_POSITIONS_SQL`'s `DISTINCT ON`
+/// from a grouped `max(xact_id)` beside `max(id)`: independent maxima would
+/// name a pair no entry in the chunk carries, where `DISTINCT ON`'s
+/// `ORDER BY` picks the row greatest as a *pair*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crossing_of_the_chunks_two_maxima_still_names_a_real_entry() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E14);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+
+    // Both candidates share one window, so both land in the same chunk.
+    let end = OffsetDateTime::now_utc() - Duration::days(400);
+    let candidate_a = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "cross-a",
+        Decimal::ONE,
+        end - Duration::hours(1),
+        end,
+    );
+    let candidate_b = common::entry_over(
+        &common::meter(common::VCPU_METER),
+        tenant,
+        "cross-b",
+        Decimal::ONE,
+        end - Duration::hours(1),
+        end,
+    );
+    // Whichever candidate carries the greater `id` is written first, so the
+    // second write — which always takes the greater `xact_id` — is forced to
+    // carry the lesser `id`.
+    let (first, second) = if candidate_a.id > candidate_b.id {
+        (candidate_a, candidate_b)
+    } else {
+        (candidate_b, candidate_a)
+    };
+    let (first_id, second_id) = (first.id, second.id);
+    store
+        .create_fixture(first)
+        .await
+        .expect("the first candidate stores");
+    store
+        .create_fixture(second)
+        .await
+        .expect("the second candidate stores");
+    let first_pos = common::xact_id_of(&h.pool, first_id).await;
+    let second_pos = common::xact_id_of(&h.pool, second_id).await;
+    assert!(
+        second_pos > first_pos,
+        "the second write must carry the greater xact_id: first={first_pos}, \
+         second={second_pos}"
+    );
+    assert!(
+        second_id < first_id,
+        "the construction must give the second write the lesser id, so the \
+         two maxima cross: first={first_id}, second={second_id}"
+    );
+
+    let report = sweeper(&h.pool, &stub)
+        .sweep_once()
+        .await
+        .expect("the sweep runs");
+    assert_eq!(report.dropped, 1, "one expired chunk: {report:?}");
+
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((second_pos, second_id)),
+        "the mark must name the greatest (xact_id, id) PAIR an entry actually \
+         carried, the second write's, not the pointwise maxima of xact_id \
+         and id taken separately, which would name (second_pos, first_id), a \
+         position no entry in the chunk carries"
+    );
+}
+
+/// `CHUNK_HIGHEST_POSITIONS_SQL` must order `xact_id` numerically, not as
+/// rendered digit text. `PostgreSQL` resolves a bare `ORDER BY` name that
+/// matches both an output column and an input column to the *output*
+/// column, so aliasing the `::text` cast back to `xact_id` — its own source
+/// column's name — would make the `ORDER BY` bind to the text column and
+/// sort lexicographically, ranking `"9"` above `"10"`.
+///
+/// Two back-to-back inserts through the ingest path cannot reach this, since
+/// consecutive `xact_id`s share a decimal digit count, so this test pins
+/// explicit `xid8` values in its own SQL. The rule that the Record Store
+/// never binds `xact_id` binds production code, not a test pinning ordering
+/// semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_position_read_orders_xact_id_numerically_not_lexicographically() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5EA1);
+
+    let low = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "digit-low", 400))
+        .await
+        .expect("the low entry stores");
+    let high = store
+        .create_fixture(aged(common::VCPU_METER, tenant, "digit-high", 400))
+        .await
+        .expect("the high entry stores");
+
+    // Pin xid8 values that straddle a digit-length boundary: under a
+    // lexicographic (text) comparison "9" sorts above "10".
+    sqlx::query("UPDATE usage_records SET xact_id = '9'::xid8 WHERE id = $1")
+        .bind(low.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the low entry's xact_id");
+    sqlx::query("UPDATE usage_records SET xact_id = '10'::xid8 WHERE id = $1")
+        .bind(high.id)
+        .execute(&h.pool)
+        .await
+        .expect("pin the high entry's xact_id");
+
+    let chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .next()
+        .expect("one chunk");
+    let sql = CHUNK_HIGHEST_POSITIONS_SQL.replace("{chunk}", &chunk.chunk);
+    // `(gts_type_uuid, xact_id_text, id)` — the sweep's own fold decodes the
+    // first column as a `Uuid` too, since the marks table is keyed on it.
+    let positions: Vec<(Uuid, String, Uuid)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&h.pool)
+        .await
+        .expect("read positions");
+
+    assert_eq!(
+        positions,
+        vec![(reference(common::VCPU_METER), "10".to_owned(), high.id)],
+        "the numerically greater xact_id (10) must win over the \
+         lexicographically greater digit string (\"9\"); a bug here makes \
+         the sweep raise a mark below the chunk's true highest deleted \
+         position: {positions:?}"
+    );
+}
+
+/// §5.1's arithmetic, asserted rather than argued. It is what makes the drive
+/// trustworthy: without it a `drop_before` that removed nothing would leave
+/// every driven assertion passing over an unswept ledger.
+///
+/// **What `delta` is for, measured.** Mutating `SweepDrive::drop_before` to
+/// the naive `now - floor` still passes this test, because `sweep_under_lock`
+/// takes its own `now_utc()` strictly after the drive takes its, so the naive
+/// threshold is `floor` plus whatever positive sub-millisecond drift separates
+/// the two reads — and any positive drift pushes a chunk whose `time_end` sits
+/// exactly at the floor to `Drop`. `delta` removes the dependence on that
+/// drift being positive, which an NTP step moving the clock backward between
+/// the reads would break. The exactness pinned here — below drops, at stays —
+/// is `drop_before`'s contract and holds under both formulations.
+///
+/// **What this test does catch, measured the same way**: a `DriveRetention`
+/// answering every type's retention rather than only the one it was asked
+/// about. [`common::GB_METER`] is on its own chunk below the same floor and is
+/// not named in the [`ContractRetention::drop_before`] call below, so a drive
+/// resolving it anyway would sweep it too.
+///
+/// The two swept covered periods end on whole hours past the Unix epoch, an
+/// hour apart, so under `common::CONTRACT_CHUNK_INTERVAL_SECS` each lands in
+/// its own chunk and the earlier entry's chunk `time_end` coincides exactly
+/// with the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_driven_purge_takes_the_entry_below_the_floor_and_leaves_the_one_at_it() {
+    const BELOW_FLOOR_WINDOW_END_UNIX: i64 = 1_699_999_200;
+    const AT_FLOOR_WINDOW_END_UNIX: i64 = BELOW_FLOOR_WINDOW_END_UNIX + 3_600;
+
+    let (h, _backend, drive) = common::start_backend_with_retention_drive().await;
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x5E30);
+    let meter = common::meter(common::VCPU_METER);
+
+    let below = common::entry_over(
+        &meter,
+        tenant,
+        "exactness-below",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    let at = common::entry_over(
+        &meter,
+        tenant,
+        "exactness-at",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    // Named in no `drop_before` call below: proves the drive resolves only
+    // the type it was asked about, per ruling D3 (`DriveRetention` answers
+    // `Err(NotFound)` for anything else).
+    let other_type = common::entry_over(
+        &common::meter(common::GB_METER),
+        tenant,
+        "exactness-other-type",
+        Decimal::ONE,
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX - 3_600).expect("valid ts"),
+        OffsetDateTime::from_unix_timestamp(BELOW_FLOOR_WINDOW_END_UNIX).expect("valid ts"),
+    );
+    let below_stored = store
+        .create_fixture(below)
+        .await
+        .expect("the earlier entry stores");
+    let at_stored = store
+        .create_fixture(at)
+        .await
+        .expect("the later entry stores");
+    let other_type_stored = store
+        .create_fixture(other_type)
+        .await
+        .expect("the other-type entry stores");
+    let below_position = common::xact_id_of(&h.pool, below_stored.id).await;
+
+    let floor = OffsetDateTime::from_unix_timestamp(AT_FLOOR_WINDOW_END_UNIX).expect("valid ts");
+    drive
+        .drop_before(&common::meter_ref(meter.clone()), floor)
+        .await
+        .expect("the drive purges");
+
+    assert!(
+        !stored(&h.pool, below_stored.id).await,
+        "the entry an hour below the floor is dropped"
+    );
+    assert!(
+        stored(&h.pool, at_stored.id).await,
+        "the entry exactly at the floor stays: drop_before's bound is exclusive"
+    );
+    assert!(
+        stored(&h.pool, other_type_stored.id).await,
+        "a type the drive was never asked about is untouched, even though its \
+         chunk sits below the same floor: the drive is keyed on one GTS type"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::VCPU_METER).await,
+        Some((below_position, below_stored.id)),
+        "the mark names the dropped entry's own position"
+    );
+    assert_eq!(
+        mark_of(&h.pool, common::GB_METER).await,
+        None,
+        "no mark is raised for a type the drive never resolved"
+    );
+}
+
+/// The drop transaction's six statements run in DESIGN §3.6's prescribed
+/// order — lock, then read positions, then raise marks, then drop the chunk,
+/// then cut the rollup rows — asserted by turning on cluster-wide statement
+/// logging and reading it back off the container.
+///
+/// **Why the order matters.** The lock freezes the chunk before anything
+/// reads it, so the position read that follows sees exactly the rows the drop
+/// is about to remove and the marks cover all of them. Read the positions
+/// first instead, and a row a concurrent writer commits into the gap is
+/// removed without ever being covered by a mark: the feed cannot know it is
+/// gone, and a later page silently serves a hole instead of refusing a
+/// truncated range.
+///
+/// **A statement-order oracle, not a semantic one** (ruling D9). The semantic
+/// property has no executable oracle here: the two orderings produce different
+/// *data* only when a writer commits in the exact gap between two adjacent
+/// statements, and forcing that gap open would need a test-only pause inside
+/// production's own transaction. This asserts the text of the statements
+/// `PostgreSQL` logged, in the order it logged them — so it cannot catch a
+/// reordering producing the same log text, and it says nothing about a
+/// production deployment, where `log_statement` is off.
+///
+/// **Brittleness, named rather than hidden.** `log_statement = 'all'` is set
+/// cluster-wide via `ALTER SYSTEM` + `pg_reload_conf()`: a session-scoped
+/// `SET` does not work, because the sweep's drop transaction, its advisory
+/// lock and its catalog reads each run on a different pooled or detached
+/// connection. Cluster-wide logging is tolerable only because
+/// [`common::bring_up`] starts a fresh container per test. It also depends on
+/// the image's default `log_destination = stderr`, where
+/// [`testcontainers::ContainerAsync::stderr_to_vec`] reads from.
+///
+/// **Matching, precisely.** Every assertion matches on the SQL text alone,
+/// never on the `execute sqlx_s_<N>:` prefix `sqlx` logs a parameterized
+/// statement under, which drifts between runs and versions; a bare
+/// `BEGIN`/`COMMIT` logs under `statement: ` instead, which is a second
+/// reason the match cannot be on the prefix.
+/// `_timescaledb_functions.drop_chunk` also raises an internal `NOTICE`,
+/// making `PostgreSQL` echo a bonus `STATEMENT:` line after it, so the
+/// sequential-offset search tolerates an extra line rather than assuming one
+/// log line per statement.
+///
+/// **One chunk, one drop.** Chunks drop sequentially and do not interleave,
+/// but asserting order across more than one simultaneous drop would need
+/// PID-scoped matching rather than substring search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drop_transactions_statements_run_in_design_order() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+
+    // Cluster-wide, not session-scoped -- see the doc comment above for why
+    // a session-scoped `SET` does not reach the sweep's own connections.
+    sqlx::query("ALTER SYSTEM SET log_statement = 'all'")
+        .execute(&h.pool)
+        .await
+        .expect("ALTER SYSTEM");
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(&h.pool)
+        .await
+        .expect("reload");
+    common::await_setting(&h.pool, "log_statement", "all").await;
+
+    let store = common::record_store(&h);
+    let stub = Arc::new(StubRetention::default());
+    stub.set(common::VCPU_METER, days(30));
+    store
+        .create_fixture(aged(
+            common::VCPU_METER,
+            Uuid::from_u128(0x5E40),
+            "statement-order",
+            100,
+        ))
+        .await
+        .expect("create fixture");
+
+    // Read off the report and the catalog before the drop, so the two
+    // substrings that name identifiers rather than fixed SQL -- the chunk and
+    // the rollup's materialisation table -- are exact rather than guessed.
+    let chunk = list_chunks(&h.pool)
+        .await
+        .expect("list chunks")
+        .into_iter()
+        .next()
+        .expect("one chunk");
+    let rollup_table = materialization_table(&h.pool)
+        .await
+        .expect("materialisation table query")
+        .expect("the rollup has a materialisation table");
+
+    let report = sweeper(&h.pool, &stub).sweep_once().await.expect("sweep");
+    assert_eq!(report.dropped, 1, "one chunk drops: {report:?}");
+
+    let log = String::from_utf8(
+        h.container()
+            .stderr_to_vec()
+            .await
+            .expect("read the container's stderr log"),
+    )
+    .expect("the container's log is valid utf8");
+
+    let needles = [
+        "SET LOCAL lock_timeout".to_owned(),
+        format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", chunk.chunk),
+        "DISTINCT ON (gts_type_uuid)".to_owned(),
+        "INSERT INTO usage_feed_retention_marks".to_owned(),
+        "_timescaledb_functions.drop_chunk(".to_owned(),
+        format!("DELETE FROM {rollup_table} WHERE type_key"),
+        "COMMIT".to_owned(),
+    ];
+    let mut cursor = 0;
+    for needle in &needles {
+        let found = log[cursor..].find(needle.as_str()).unwrap_or_else(|| {
+            panic!(
+                "expected to find {needle:?} at or after byte {cursor} of the drop \
+                 transaction's logged statements, in DESIGN's prescribed order; full log:\n{log}"
+            )
+        });
+        cursor += found + needle.len();
+    }
+}

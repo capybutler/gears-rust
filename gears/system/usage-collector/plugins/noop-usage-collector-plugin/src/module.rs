@@ -26,7 +26,7 @@ pub struct NoopUsageCollectorPlugin;
 
 #[async_trait]
 impl Gear for NoopUsageCollectorPlugin {
-    // @cpt-flow:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1
+    // @cpt-flow:cpt-cf-usage-collector-flow-plugin-registration:p1
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         // Load configuration (vendor + priority; persists nothing else).
         let cfg: NoopUsageCollectorPluginConfig = ctx.config_expanded_or_default()?;
@@ -42,7 +42,7 @@ impl Gear for NoopUsageCollectorPlugin {
             "Loaded no-op usage-collector plugin configuration"
         );
 
-        // @cpt-begin:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-binding-clienthub-register
+        // @cpt-begin:cpt-cf-usage-collector-flow-plugin-registration:p1:inst-reg-publish-instance
         // Build registration payload and instance id for this plugin.
         let (instance_id, instance_json) =
             PluginV1::<UsageCollectorPluginSpecV1>::build_registration(
@@ -55,7 +55,9 @@ impl Gear for NoopUsageCollectorPlugin {
         let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
         let results = registry.register(vec![instance_json]).await?;
         RegisterResult::ensure_all_ok(&results)?;
+        // @cpt-end:cpt-cf-usage-collector-flow-plugin-registration:p1:inst-reg-publish-instance
 
+        // @cpt-begin:cpt-cf-usage-collector-flow-plugin-registration:p1:inst-reg-register-client
         // Register the scoped no-op backend client in ClientHub under the GTS
         // instance scope so the plugin host resolves it on first dispatch.
         ctx.client_hub()
@@ -63,7 +65,7 @@ impl Gear for NoopUsageCollectorPlugin {
                 ClientScope::gts_id(&instance_id),
                 Arc::new(NoopBackend::new()) as Arc<dyn UsageCollectorPluginV1>,
             );
-        // @cpt-end:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-binding-clienthub-register
+        // @cpt-end:cpt-cf-usage-collector-flow-plugin-registration:p1:inst-reg-register-client
 
         info!(
             instance_id = %instance_id,

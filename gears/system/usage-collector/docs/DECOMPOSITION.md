@@ -1,623 +1,1370 @@
 # Decomposition: Usage Collector
 
-**Overall implementation status:**
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-status-overall`
+Splits the Usage Collector gear's PRD and DESIGN scope into fourteen
+independently implementable and testable features, spanning the ingestion,
+query, feed, typing, and pluggable-storage components plus the cross-cutting
+attribution, backfill, operator, and NFR concerns that bind them.
 
 <!-- toc -->
 
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
-  - [2.1 Gear Foundation & Pluggable Storage — HIGH](#21-gear-foundation--pluggable-storage--high)
-  - [2.2 Usage Type Catalog & Lifecycle — HIGH](#22-usage-type-catalog--lifecycle--high)
-  - [2.3 Usage Emission — HIGH](#23-usage-emission--high)
-  - [2.4 Usage Query — MEDIUM](#24-usage-query--medium)
-  - [2.5 Event Deactivation — MEDIUM](#25-event-deactivation--medium)
-  - [2.6 Compensation — MEDIUM](#26-compensation--medium)
-  - [2.7 Deliberate Omissions](#27-deliberate-omissions)
+  - [2.1 Attribution, Authorization & Tenant Isolation - HIGH](#21-attribution-authorization--tenant-isolation---high)
+  - [2.2 GTS Usage Type Resolution & Declaration Binding - HIGH](#22-gts-usage-type-resolution--declaration-binding---high)
+  - [2.3 Pluggable Storage & Plugin Hosting - HIGH](#23-pluggable-storage--plugin-hosting---high)
+  - [2.4 Usage Record Ingestion & Identity - HIGH](#24-usage-record-ingestion--identity---high)
+  - [2.5 Record Invalidation & Corrections - HIGH](#25-record-invalidation--corrections---high)
+  - [2.6 Usage Query — Raw & Aggregated - HIGH](#26-usage-query--raw--aggregated---high)
+  - [2.7 Usage Feed for Downstream Consumers - HIGH](#27-usage-feed-for-downstream-consumers---high)
+  - [2.8 Backfill Import & Retention Governance - MEDIUM](#28-backfill-import--retention-governance---medium)
+  - [2.9 Ingestion Rate Limiting & Reconciliation Metadata - MEDIUM](#29-ingestion-rate-limiting--reconciliation-metadata---medium)
+  - [2.10 Data Classification & Privacy Boundary - LOW](#210-data-classification--privacy-boundary---low)
+  - [2.11 Read-Path Consistency & Freshness Contract - HIGH](#211-read-path-consistency--freshness-contract---high)
+  - [2.12 Throughput, Latency & Availability SLOs - HIGH](#212-throughput-latency--availability-slos---high)
+  - [2.13 Public Surface Contract Stability & Versioning - MEDIUM](#213-public-surface-contract-stability--versioning---medium)
+  - [2.14 Operational Visibility & Telemetry - MEDIUM](#214-operational-visibility--telemetry---medium)
 - [3. Feature Dependencies](#3-feature-dependencies)
-- [4. Crate Layout & Platform Dependencies](#4-crate-layout--platform-dependencies)
-  - [4.1 Two-crate layout](#41-two-crate-layout)
-  - [4.2 Direct platform dependencies](#42-direct-platform-dependencies)
-  - [4.3 Plugin discovery and dispatch](#43-plugin-discovery-and-dispatch)
-- [5. Document Changelog](#5-document-changelog)
 
 <!-- /toc -->
 
+**Overall implementation status:**
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-status-usage-collector`
+
 ## 1. Overview
 
-The Usage Collector DESIGN is decomposed into six capability features that mirror the gear's distinct user-visible responsibilities rather than its internal layering:
+This decomposition splits the Usage Collector gear into fourteen features. The
+split follows two axes at once, because neither one alone produces
+independently testable units.
 
-- **Foundation** — Plugin SPI surface, plugin host and binding lifecycle, the shared PDP authorization helper (no centralized adapter), deployment topology, and declared tech stack.
-- **Usage Type Catalog & Lifecycle** — operator-driven registration, deletion, and lookup of UsageType definitions.
-- **Usage Emission** — the contract-first, kind-enforced, idempotent ingestion path that writes to the active storage backend.
-- **Usage Query** — PDP-constrained aggregated and raw cursor-paginated reads through the Query Gateway.
-- **Event Deactivation** — the one-way `active → inactive` status flip for previously emitted records; applies uniformly to both usage rows (`corrects_id IS NULL`) and compensation rows (`corrects_id IS NOT NULL`), and on a usage row cascades depth-1 to active referencing compensation rows in the same atomic transition.
-- **Compensation** — counter value-reversal via the unified ingestion path: an append-only signed-negative compensation row, recognised structurally by `corrects_id IS NOT NULL`, recorded under PDP attribution and mandatory idempotency, netted into `SUM` aggregations without modifying the original row.
+The first axis is the DESIGN §3.2 component model. Four of the fourteen
+features map directly onto a domain component that owns a distinct
+responsibility on the request path: the Ingestion Gateway (usage record
+ingestion, and — because invalidation rides the same choke point — record
+invalidation), the Query Gateway (raw and aggregated usage query), the Feed
+Gateway (the downstream usage feed), and the Type Resolver (GTS type
+resolution). A fifth component, the Plugin Host, becomes its own feature
+because pluggable storage is a first-class product requirement (PRD §5.4),
+not merely an implementation seam.
 
-Splitting by capability rather than by REST/SDK/Plugin layer keeps each feature mutually exclusive and lines the decomposition up with the PRD's functional-requirement clusters (Ingestion, Pluggable Storage, Query & Aggregation, Event Deactivation, Compensation). Foundation owns the cross-cutting plugin plumbing and the shared PDP helper once; capability features reference rather than duplicate them.
+The second axis is cross-cutting concerns that no single component owns
+outright: PDP-anchored attribution and tenant isolation gate every component;
+backfill and retention governance span the Ingestion Gateway and the storage
+plugin; rate limiting is an ingestion-side operator surface, while
+reconciliation metadata is read through the Query Gateway as its fourth read
+path; data classification is a data-handling boundary rather than a code
+path; and the NFR envelope (throughput, latency, availability, consistency
+freshness, contract stability, and operational visibility) binds every
+component simultaneously rather than any one of them. Each of these becomes
+its own feature so that its acceptance criteria, and the tests that verify
+them, are not buried inside a single component's feature.
 
-Dependencies flow outward from Foundation. Every capability feature builds on the foundation's Plugin SPI and shared PDP authorization helper. Usage Emission, Usage Query, and Compensation additionally depend on Usage Type Catalog & Lifecycle (kind/existence enforcement on the write path; mandatory single-UsageType filter on the aggregated read path; counter-only semantics for compensation). Compensation depends on Usage Emission (which writes the rows it references). Usage Query depends on Compensation for the SUM-nets aggregation contract. Event Deactivation depends on Usage Emission (records must exist before they can be deactivated) and is coupled to Compensation via the depth-1 cascade.
+**Two feature shapes.** Entries 2.1 through 2.9 are component-owning
+capability features: each anchors to at least one DESIGN component, and most
+expose an API endpoint or a named sequence a test can drive end to end.
+Entries 2.10 through 2.14 are cross-cutting contract and quality-attribute
+features: each states a rule, a boundary, or a numeric envelope that binds
+every component at once rather than living inside one of them. A
+contract-shaped entry is verified differently: its acceptance criteria are
+checked as assertions embedded in the sequences and endpoints owned by the
+capability features it constrains, and it is owned, for review and change
+control, by whichever team maintains the ADR or DESIGN section that states
+the rule.
 
-This shape preserves the DESIGN's tri-surface architecture and fail-closed metering posture while keeping the read and write planes implementable and reviewable in parallel.
+**Why `Data: None` recurs.** The Usage Collector owns exactly one durable,
+gear-side table — a temporary declaration mirror described in DESIGN §3.7 —
+and no `db` or `dbtable` component IDs are defined anywhere in DESIGN,
+because the entry ledger itself is wholly plugin-owned and reached only
+through the Plugin SPI (`cpt-cf-usage-collector-principle-pluggable-storage`,
+ADR `cpt-cf-usage-collector-adr-pluggable-storage`). Every feature below
+therefore carries `Data: None` for its gear-owned schema; this is stated once
+here rather than repeated as a caveat in every entry.
 
-**Decomposition Strategy**:
-
-- Cohesion by capability: each feature groups the DESIGN components, sequences, and data entities that collaborate to deliver one externally-observable capability (e.g., Usage Emission owns the Ingestion Gateway component, the Emit Usage Record sequence, and the `usage_records` table together).
-- Loose coupling via explicit `Depends On`: every feature declares its upstream features by ID, with no implicit ordering — Foundation has no dependencies, and downstream features list only the minimum upstream features they need.
-- 100% DESIGN/PRD element coverage: every `cpt-cf-usage-collector-*` ID introduced by DESIGN.md and PRD.md is assigned to at least one feature, or recorded as a deliberate omission with justification in [§2.7](#27-deliberate-omissions).
-- Mutual exclusivity at the capability layer: each DESIGN component and sequence is assigned to exactly one feature, and each `dbtable` has a single writer-owner (the writing feature) with reader and status-only-update features explicitly noting shared usage; cross-cutting concerns (shared PDP authorization helper, Plugin SPI, deployment topology, contract surfaces) are owned by Foundation and referenced — not duplicated — by dependent features. Domain entities may appear under multiple features' "Domain Model Entities" lists because they cross feature boundaries by value (e.g., `SecurityContext` flows through every gateway, `UsageRecord` is written by ingestion and status-flipped by deactivation); this is reference, not duplicated ownership.
-- Emission vs. query plane separation: write-side (Usage Emission) and read-side (Usage Query) capabilities are split into distinct features so the ingestion-throughput and analytical-query-latency NFRs can be sequenced and validated independently.
-- Event-driven deactivation isolation: the monotonic `active → inactive` status transition is carried by its own feature so that reactivation, bulk operations, and field edits remain explicitly out of scope.
+Features are ordered so that foundational, dependency-free features
+(attribution and authorization, GTS type resolution, and pluggable storage)
+precede the features that consume them (ingestion, invalidation, query, and
+backfill), which in turn precede the ingestion-adjacent operator features
+(rate limiting, reconciliation, data classification) and the cross-cutting
+NFR features (consistency and freshness, throughput and latency, contract
+stability, and operational visibility). The usage feed (2.7) is the one
+exception to this order: it is numbered and depends ahead of backfill and
+retention governance (2.8) even though 2.8 is later in the list, because the
+feed's cursor-refusal behavior must conform to the retention floor, whose
+backfill-window term is a value backfill and retention governance
+configures, even though the storage plugin enforces the refusal itself.
 
 ## 2. Entries
 
-### 2.1 Gear Foundation & Pluggable Storage — HIGH
+### 2.1 [Attribution, Authorization & Tenant Isolation](feature-attribution-authorization/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-foundation`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-attribution-authorization`
 
-- **Purpose**: Establish the Usage Collector's stateless gear runtime substrate and its three public contract surfaces — the in-process SDK trait, the REST API, and the storage Plugin SPI — so that every later capability can plug into a single, identical execution shape. Every read and write entry point receives an already-resolved caller `SecurityContext` (populated upstream by the ToolKit gateway on REST via `OperationBuilder::authenticated()` or supplied directly to the SDK; the gear NEVER consumes `authn-resolver`) and is fronted by inline PDP authorization through the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver` with no anonymous bypass, no cached decisions, and no synthesized identities, so safety-critical behavior is realized once at the substrate layer rather than re-implemented per feature. The foundation also owns the Plugin SPI's contract-stability guarantee so storage vendors can ship and migrate backends independently of the core release train.
+- **Purpose**: Establishes the PDP-anchored security boundary that every
+  write and read operation must pass before it touches domain logic: caller-
+  supplied tenant, resource, and subject attribution, verified against the
+  platform PDP, with tenant isolation enforced independently per tenant scope
+  and no implicit cross-tenant access. This is the architectural decision
+  recorded in `cpt-cf-usage-collector-adr-pdp-centric-authorization` and
+  `cpt-cf-usage-collector-adr-caller-supplied-attribution`: the gear never
+  derives identity from the caller's own `SecurityContext`, and it never
+  caches a PDP decision or relaxes a denial.
 
 - **Depends On**: None
 
 - **Scope**:
-  - Plugin SPI surface declaration (`cpt-cf-usage-collector-interface-plugin`) and the storage-plugin contract it exposes to backend implementors.
-  - Plugin host lifecycle: at `Gear::init` the host reads `[usage_collector].vendor` once via `ctx.config_or_default()?` and constructs the `Service` with an embedded `GtsPluginSelector` (no `types-registry` query yet); each `usage-collector-plugin-<backend>` `init()` independently registers its scoped `dyn UsageCollectorPluginV1` in `ClientHub` under `ClientScope::gts_id(&instance_id)`; on the first dispatch after the `types-registry` is consistent the host lazily resolves the bound instance via `GtsPluginSelector::get_or_init` (single-flight, cached for the `Service`'s lifetime) and looks the client up via `ClientHub::try_get_scoped`. There is no separate "Gear Orchestrator" component — binding is decentralised across the host gear's `Service` constructor and each plugin gear's own `init()`. Binding changes require a gear restart; there is no runtime configuration-change channel.
-  - PDP authorization wiring per domain component: every ingestion-gateway, query-gateway, deactivation-handler, and usage-type-catalog call dispatches through `authz-resolver` via the `access_scope_with` helper for a permit/deny `PdpDecision` plus any `PdpConstraint` filters, fail-closed on PDP unavailability with no cached decisions.
-  - Audit-trail correlation propagation: every domain component propagates the request-level correlation identifier carried on the inbound `SecurityContext` through `cpt-cf-usage-collector-contract-authz-resolver` on every ingestion, query, deactivation, and UsageType-lifecycle operation, so the platform gateway access log and PDP decision logs can be reconciled with gear-level activity per DESIGN §5.3.
-  - Tenant isolation enforcement: every domain component realizes tenant isolation across read and write paths via the `access_scope_with` helper (per DESIGN §3.5 component description and §5.3 traceability) by issuing PDP decisions and PDP constraints per operation; no implicit per-tenant trust and no cross-tenant access absent an explicit PDP authorization. [§2.3](#23-usage-emission-high) ingestion and [§2.4](#24-usage-query-medium) query consume this enforcement through the per-component PDP helper.
-  - REST API contract surface (`cpt-cf-usage-collector-interface-rest-api`) registration behind the platform API gateway and SDK trait surface (`cpt-cf-usage-collector-interface-sdk-client`) registration in ClientHub for in-process consumers. Operational telemetry is pushed via OTLP from ToolKit's global meter provider; no gear-local Prometheus-scrape endpoint and no gear-local health endpoints are exposed (platform liveness and readiness are handled by the ToolKit host).
-  - Deployment topology (`cpt-cf-usage-collector-topology-gear-runtime`): stateless, horizontally scaled instances behind the platform API gateway with durable state reached exclusively through the ClientHub-bound plugin.
-  - Declared tech stack (`cpt-cf-usage-collector-tech-stack`) across the Presentation, Application, Domain, and Infrastructure layers.
+  - Structural validation and PDP authorization of the caller-supplied
+    attribution tuple (tenant, resource, optional subject) on every
+    ingestion, query, and feed operation.
+  - Independent per-tenant PDP scope evaluation, including parent-to-subtenant
+    and platform-administrative cross-tenant scenarios.
+  - Fail-closed behavior on PDP unavailability or denial across every
+    surface.
+  - Applying PDP-returned constraints as query filters before any
+    user-supplied filter narrows the result further.
 
 - **Out of scope**:
-  - UsageType registration, deletion, and catalog lookup semantics — owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle.
-  - Usage record emission, idempotency dedup and conflict rejection (exact-equality retries silently absorbed; canonical-field mismatches rejected as `idempotency_conflict`), semantics enforcement, and ingestion-path attribution — owned by [§2.3](#23-usage-emission-high) Usage Emission.
-  - Aggregated and raw read-path query execution and PDP-constraint composition — owned by [§2.4](#24-usage-query-medium) Usage Query.
-  - Event-driven `active → inactive` deactivation transitions — owned by [§2.5](#25-event-deactivation-medium) Event Deactivation.
-  - Concrete backend implementations (ClickHouse, TimescaleDB, etc.), infrastructure-as-code, autoscaling thresholds, and storage-tier HA posture — owned by the active storage plugin and platform operations docs.
+  - The domain validation that runs after attribution is authorized
+    (covered by usage record ingestion, query, and invalidation features).
+  - Ingestion quota enforcement, which is a separate, quota-keyed control
+    (covered by rate limiting and reconciliation).
 
 - **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-pluggable-storage`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-tenant-isolation`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-data-classification`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-availability`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-plugin-contract-stability`
-  - [x] `p2` - `cpt-cf-usage-collector-nfr-operational-visibility`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-tenant-attribution`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-resource-attribution`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-subject-attribution`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-tenant-isolation`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-ingestion-authorization`
 
 - **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-fail-closed`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-pluggable-storage`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-contract-stability`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-pdp-centric-authorization`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-plugin-resolution-via-client-hub`
-  - [x] `p2` - `cpt-cf-usage-collector-principle-otlp-push-emission`
-  - [x] `p2` - `cpt-cf-usage-collector-principle-gateway-http-server-instrument-reuse`
 
-- **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-plugin-contract-stability`
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-vendor-pluggable`
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-nfr-thresholds`
-  - `p2` - `cpt-cf-usage-collector-adr-contract-stability`
-  - `p2` - `cpt-cf-usage-collector-adr-pdp-centric-authorization`
-  - `p2` - `cpt-cf-usage-collector-adr-pluggable-storage`
+  - [x] `p1` - `cpt-cf-usage-collector-principle-pdp-centric-authorization`
+  - [x] `p1` - `cpt-cf-usage-collector-principle-fail-closed`
+
+- **Design Constraints Covered**: None — the PII-identity-layer constraint is
+  owned by data classification and privacy boundary, which states the
+  identifier-versus-PII distinction directly; attribution and authorization
+  only consumes opaque identifiers that constraint defines.
 
 - **Domain Model Entities**:
-  - `PluginBinding`
-  - `SecurityContext`
-  - `PdpDecision`
-  - `PdpConstraint`
+  - SecurityContext
+  - ResourceRef
+  - SubjectRef
 
 - **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-plugin-host`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-ingestion-gateway`
+  - [ ] `p1` - `cpt-cf-usage-collector-component-query-gateway`
+    (§2.1/§2.6/§2.9 shared box — reasoning in §2.9's own `component-query-gateway` note, not restated here)
+  - [ ] `p1` - `cpt-cf-usage-collector-component-feed-gateway`
 
 - **API**:
-  - Plugin SPI surface (`cpt-cf-usage-collector-interface-plugin`) — storage backend contract; reference specification in `plugin-spi.md` (sibling to DESIGN.md); the exact Rust signature lives in `usage-collector-sdk/src/plugin_api.rs`.
-  - SDK trait surface (`cpt-cf-usage-collector-interface-sdk-client`) — in-process Rust trait registered in ClientHub; reference specification in `sdk-trait.md` (sibling to DESIGN.md); the exact Rust signature lives in `usage-collector-sdk/src/api.rs`.
-  - REST API surface (`cpt-cf-usage-collector-interface-rest-api`) — versioned HTTP surface served behind the platform API gateway; `usage-collector-v1.yaml` is the reference contract (the production OpenAPI document is emitted at runtime by `OpenApiRegistryImpl` and CI drift-checked against the YAML).
+  - POST /usage-collector/v1/records (authorization gate)
+  - GET /usage-collector/v1/records (authorization gate)
+  - POST /usage-collector/v1/records/aggregate (authorization gate)
+  - GET /usage-collector/v1/feed (authorization gate)
 
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
+- **Sequences**: None — PDP authorization is a cross-cutting step embedded in
+  every sequence listed under the ingestion, query, invalidation, and feed
+  features rather than a sequence of its own.
 
-- **Contracts**:
-  - [ ] `p1` - `cpt-cf-usage-collector-contract-storage-plugin`
-  - [ ] `p1` - `cpt-cf-usage-collector-contract-authz-resolver`
-  - [ ] `p1` - `cpt-cf-usage-collector-contract-gts-registry`
+- **Data**: None (see §1 Overview).
 
-### 2.2 Usage Type Catalog & Lifecycle — HIGH
+### 2.2 [GTS Usage Type Resolution & Declaration Binding](feature-usage-type-resolution/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-type-lifecycle`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-type-resolution`
 
-- **Purpose**: Provide the operator-driven lifecycle for UsageType definitions — register, list, get, and delete — so the platform-global usage-type catalog (keyed by `gts_id`) plus the UsageType's closed declared-metadata-key list exists as a single authoritative surface that the ingestion path can consult for declared-key membership validation and the query path can consult for dimension-aware filter / group-by resolution. Catalog rows are durably owned by the storage plugin alongside `usage_records`; the gateway owns the REST/SDK API surface and PDP authorization, and dispatches catalog reads directly to the plugin SPI per call. Per the ADR-0012 2026-06-02 amendment as further amended 2026-06-08, `kind ∈ {counter, gauge}` is carried by the closed `UsageKind` enum stored as the catalog row's `kind` column — independent of the `gts_id`, which derives from the reserved abstract base `gts.cf.core.uc.usage_record.v1~` — and the per-UsageType closed list of allowed metadata keys travels in the catalog row as `metadata_fields: Vec<String>` (all values typed as String end-to-end). Registration and deletion are gated through the per-component PDP authorization helper (against `cpt-cf-usage-collector-contract-authz-resolver`) so only authorized platform operators can mutate the catalog.
+**Ruling G21's blocker is closed. Slice 8b built the mirror and the restore**
+(`usage-collector/implementation-change`, six tasks over the thirteen commits
+`62f9ffd54` to `c559a1d61` inclusive). The gear owns
+`usage_collector__declaration_mirror`, declares the `db` capability and
+acquires it with `ctx.db_required()`, mirrors each declaration it resolves,
+and restores a forgotten one on a definite not-found — per
+`cpt-cf-usage-collector-adr-declaration-rehydration`, whose statements 1-6 are
+implemented and whose statement 7 is the deletion condition — the mirror and
+the restore are *temporary*, deleted when persistent storage reaches this
+gear's resolution path, and that deletion is a **precondition** on the
+promotion rather than a follow-up, so it is an obligation on a future change
+and not something this slice could discharge. Statement 6 (the plugin reading
+declared retention from `types-registry` itself) was already shipped by slice
+3 and is the one part the ADR marks **permanent**: it outlives the bridge.
+`uc_declaration_mirror_write_failures_total` is emitted. Of the two mechanisms
+G21 named as unbuilt, **neither is unbuilt now**: the earlier version of this
+block also quoted `domain/ports/metrics.rs` as describing the restore path as
+one "this gear does not implement yet", which that file no longer says — it
+records all six `result` values as emitted.
 
-- **Depends On**: `cpt-cf-usage-collector-feature-foundation`
+**Five of G21's eight identifiers are ticked** by slice 8b's Task 7:
+`flow-survive-registry-loss`, `algo-mirror-and-restore`,
+`state-cached-declaration` (whose `inst-state-restore-to-fresh` transition now
+occurs), `dod-declaration-mirror-restore` and `dod-resolution-telemetry`.
+`docs/features/usage-type-resolution.md` stands at **13 of 18**.
+
+**Three stay unticked, and for reasons that have nothing to do with the
+mirror.** Each was judged against its own clauses rather than against the
+mirror's arrival, and each fails exactly one clause textually while meeting
+that clause's purpose — the shape where a tick is
+judged against a clause's words and not its intent:
+
+- **`flow-resolve-on-first-reference`** — step 4.1
+  (`inst-resolve-first-reject-base`) requires an inadmissible identifier to
+  **RETURN `NotFound`** before any registry call. The gear rejects it, names
+  it, and makes no registry call, but answers `InvalidArgument` with
+  `ValidationReason::InvalidBaseGtsId` (`usage-collector-sdk`'s
+  `invalid_meter_type_id`) — a 400 rather than a 404.
+- **`algo-resolve-declaration`** — step 7 (`inst-resolve-return-reject`)
+  requires the fail-closed rejection to **name the identifier**. Two of its
+  three populations do; the restore-failure population does not —
+  `DomainError::TypesRegistryUnavailable(_)` lifts to
+  `types_registry_unavailable(None)`, discarding the detail, so the identifier
+  reaches only the server-side `warn!`.
+- **`algo-maintain-declaration-cache`** — step 6.1
+  (`inst-cache-evict-lru`) requires the **least recently resolved**
+  declaration to be dropped. `TypeResolver::store` drops the oldest *fetch*
+  (`min_by_key(|(_, e)| e.fetched_at)`), and nothing updates `fetched_at` on a
+  cache hit, so no recency-of-use is tracked at all. Its other eight steps and
+  both halves of its Output — including the published cache age slice 8's Task
+  2 built — are satisfied.
+
+**Owner: slice 8b for the mechanism, closed here. The three residual
+identifiers are routed to usage-collector slice 9**, whose roadmap remit is
+closeout residue (`roadmap.md` §3), alongside entries 38 and 39 — each is a
+one-clause document-or-code decision, not a mechanism to build. The rollup
+above and the feature-status ID
+(`…featstatus-usage-type-resolution-implemented`) stay unticked with them, and
+remain **unmarkable by construction**: no `@cpt-featstatus:` or
+`@cpt-feature:` marker kind is declared by any `.rs` source in this
+repository. (Checkable as
+`grep -rnE '@cpt-(featstatus|feature):' --include='*.rs' .` from the
+repository root → no match. The six kinds that are declared are `algo`,
+`begin`, `dod`, `end`, `flow` and `state` — the same ground §2.9's `fr-*`
+paragraph below states for that box family, and the same reason the rollup
+and feature-status pair here cannot be marker-backed.)
+
+- **Purpose**: Resolves every `gts_type_id` reference to its `types-registry`-
+  owned declaration (aggregation fold, canonical metering unit, metadata
+  surface, retention policy, optional nominal sampling interval), serves the
+  steady state from a local cache, and recovers a declaration the registry has
+  lost. The Usage Collector mints no type of its own and maintains no second
+  catalog, per `cpt-cf-usage-collector-adr-registry-owned-typing` and
+  `cpt-cf-usage-collector-adr-declared-fold`; declaration mirroring and
+  restore behavior follow `cpt-cf-usage-collector-adr-declaration-rehydration`.
+
+- **Depends On**: None
 
 - **Scope**:
-  - Register a UsageType via the SDK trait method `UsageCollectorClient::create_usage_type` or the REST endpoint `POST /usage-collector/v1/usage-types` with the UsageType's GTS `gts_id` (which MUST derive from the reserved abstract base `gts.cf.core.uc.usage_record.v1~` with at least one further `~`-separated segment), `kind: UsageKind` (closed enum, counter / gauge), and `metadata_fields: Vec<String>` (the closed list of declared metadata keys). Invalid-base `gts_id` violations are rejected at the `UsageTypeGtsId::new` boundary as `UsageCollectorError::InvalidArgument` carrying `ValidationReason::InvalidBaseGtsId` (REST lifts this to a `400` `Problem` with `field_violations[0].reason="INVALID_BASE_GTS_ID"`); unknown `kind` values are rejected at the `UsageKind::from_str` parse (REST) or by the typed `UsageKind` argument (SDK) as `InvalidArgument` carrying `ValidationReason::Validation`. The gateway PDP-authorizes the call and validates the well-formedness of `metadata_fields` (non-empty unique key names), then dispatches the catalog write through the Plugin SPI's `create_usage_type` method per ADR 0012. Errors raised by the SPI surface as the canonical taxonomy variant `UsageTypeAlreadyExists { gts_id }`. The plugin persists the row durably into the plugin-owned `usage_type_catalog` table alongside `usage_records`.
-  - Delete a UsageType via the SDK trait method `UsageCollectorClient::delete_usage_type` or the REST endpoint `DELETE /usage-collector/v1/usage-types/{gts_id}`. Deletion dispatches through the Plugin SPI's `delete_usage_type` method; the plugin enforces referential integrity via the in-database `ON DELETE RESTRICT` foreign key `usage_records.gts_id → usage_type_catalog(gts_id)` and returns the canonical `UsageTypeReferenced { gts_id, sample_ref_count }` error if any usage row still references the target type. A delete targeting a missing row raises `UsageTypeNotFound { gts_id }`. The gateway surfaces these as deterministic REST/SDK errors.
-  - List the catalog (`UsageCollectorClient::list_usage_types` / `GET /usage-collector/v1/usage-types`) and get a single catalog entry (`UsageCollectorClient::get_usage_type` / `GET /usage-collector/v1/usage-types/{gts_id}`) for usage-type discovery, declared-field retrieval, and dimension resolution by the Ingestion Gateway and the Query Gateway. List and get dispatch through the Plugin SPI's `list_usage_types` / `get_usage_type` methods directly. A `get_usage_type` for an unknown `gts_id` raises `UsageTypeNotFound { gts_id }`.
-  - PDP-gated operator authority: every UsageType register and UsageType delete call receives an already-resolved caller `SecurityContext` (populated upstream by the ToolKit gateway on REST or supplied directly to the SDK) and authorizes the mutation inline through the per-component PDP authorization helper against `cpt-cf-usage-collector-contract-authz-resolver` before any Plugin SPI call is dispatched.
-  - **Catalog ownership work-package (plugin-side)** —: the storage plugin owns the durable usage-type catalog colocated with the usage records store; the FK `usage_records.gts_id → usage_type_catalog(gts_id) ON DELETE RESTRICT` enforces referential integrity natively at the storage engine, atomically inside the delete transaction, with no cross-replica protocol and no distributed coordination. Catalog payload shape (`gts_id`, `kind: UsageKind`, `metadata_fields`) and the gateway↔plugin SPI contract live in `plugin-spi.md`; concrete column types, indexes, and physical layout are plugin-internal. `gts_id` and `kind` are independent fields — there is no "wrong kind for this gts_id" failure mode because `gts_id` no longer encodes kind. No tenant scoping (UsageTypes are platform-global). The CRUD endpoints are surfaced through the Plugin SPI canonical methods `create_usage_type`, `get_usage_type`, `list_usage_types`, and `delete_usage_type` per ADR 0012 §3; the gateway's SDK and REST surfaces converge on a single domain service that dispatches into the SPI. Referential integrity does NOT require a separate `catalog-reference-check` SPI method: the FK `ON DELETE RESTRICT` is enforced inside the `delete_usage_type` transaction and surfaces as `UsageTypeReferenced { gts_id, sample_ref_count }`.
-  - **Dimension-aware query path work-package** — (consumed by [§2.4](#24-usage-query--medium) Usage Query): `RawQuery.gts_id` is **REQUIRED** (no longer optional) so the declared-key set can be resolved per request; `AggregationQuery.group_by` is **fixed-fields plus per-UsageType declared metadata fields** (fixed fields: `tenant`, `resource_ref`, `subject_ref`, `created_at`, `status`); `$filter` accepts the queried usage-type's declared metadata keys on top of fixed fields. Declared keys are resolved per request from the queried UsageType's `metadata_fields` list via a `get_usage_type` SPI dispatch against the storage plugin; there are no undeclared "extras" — undeclared keys are rejected at ingest. Cross-UsageType aggregation is out of scope (single-UsageType aggregation is required for declared-key resolution).
+  - Resolution of a GTS type reference to its declaration on the ingestion
+    and query paths, fail-closed on an unresolvable reference.
+  - The declared aggregation fold as a closed, immutable, per-type property.
+  - The declared canonical metering unit, bound at registration and refused
+    if absent or non-canonical.
+  - Caching, refresh, and best-effort mirror/restore of resolved
+    declarations to keep ingestion available through a registry outage.
 
 - **Out of scope**:
-  - Source-gear-to-UsageType emit authorization — owned by the PDP as operator-managed policy, not stored inside the Usage Collector.
-  - Per-UsageType business-rule validation, accounting / billing semantics, or pricing — owned by caller gears and downstream consumers, never by the catalog. (Note: the catalog DOES carry typed declared-dimension validation per ADR 0012, which is a metadata shape constraint, not business logic.)
-  - Usage record emission, idempotency dedup and conflict rejection (exact-equality retries silently absorbed; canonical-field mismatches rejected as `idempotency_conflict`), counter / gauge value enforcement on the ingestion path, and ingest-time metadata shape validation against the declared `metadata_fields` — owned by [§2.3](#23-usage-emission--high) Usage Emission (which dispatches `get_usage_type` against the storage plugin per record).
-  - Aggregated and raw read-path query execution and dimension-aware filter / group-by composition — owned by [§2.4](#24-usage-query--medium) Usage Query (which resolves dimensions per request via a `get_usage_type` SPI dispatch against the storage plugin).
-  - Event-driven `active → inactive` record deactivation — owned by [§2.5](#25-event-deactivation--medium) Event Deactivation.
-  - Durable UsageType persistence, replication posture, and physical storage of the `usage_type_catalog` table — owned by the storage plugin behind the Plugin SPI; the gateway holds no catalog state and dispatches catalog reads directly to the Plugin SPI per call.
-  - Cross-service UsageType discovery (e.g., registration of `usage-collector` usage-types in a global `types-registry`) — explicitly OPTIONAL / DEFERRED; not in this rework.
+  - Minting, amending, or withdrawing a GTS type declaration — that is a
+    `types-registry` operation this gear never exposes.
+  - Applying the resolved fold to a query result (covered by usage query).
+  - Validating a record's metadata content against the resolved schema
+    (covered by usage record ingestion).
 
 - **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-type-registration`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-type-deletion`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-counter-semantics`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-gauge-semantics`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-availability`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-type-declaration`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-type-resolution`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-aggregation-fold`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-metering-unit-binding`
 
 - **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-semantics-enforcement`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-registry-owned-typing`
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-declared-fold`
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-no-business-logic`
-  - `p2` - `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` (single plugin-DB catalog managed via SDK/REST; in-database `ON DELETE RESTRICT` FK; usage records reference UsageTypes via `gts_id` directly; per the 2026-06-05 amendment as further amended 2026-06-08 the catalog row is flat — `gts_id` + `kind` (closed `UsageKind` enum) + `metadata_fields TEXT[]`; the `kind` column carries the counter / gauge classification (it is no longer derived from the `gts_id` prefix); no JSON-Schema surface, and no `created_at` column; catalog reads dispatch directly to the storage plugin SPI per call)
+
+  - [ ] `p1` - `cpt-cf-usage-collector-constraint-no-type-catalog`
 
 - **Domain Model Entities**:
-  - UsageType — a GTS Type Schema; durably owned by the plugin per ADR 0012. Counter / gauge semantics are carried by the closed `UsageKind` enum on the catalog row (`UsageType.kind`) and read via `UsageType::is_counter()` / `UsageType::is_gauge()`; `gts_id` derives from the reserved abstract base `gts.cf.core.uc.usage_record.v1~` and is independent of kind.
+  - AggregationFold
+  - MeterTypeId
 
 - **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-usage-type-catalog`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-type-resolver`
+
+- **API**: None — GTS type declarations have no endpoint, read or write, on
+  any Usage Collector surface (PRD §7.1); resolution is internal to the
+  ingestion and query paths.
+
+- **Sequences**: None — resolution is a step embedded in the emit, invalidate,
+  and query sequences owned by other features, not a sequence of its own.
+
+- **Data**: None (see §1 Overview).
+
+### 2.3 [Pluggable Storage & Plugin Hosting](feature-pluggable-storage/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Purpose**: Provides the single seam through which every domain component
+  reaches durable state: a Plugin Host that lazily resolves the operator-
+  selected storage backend through `types-registry` and `ClientHub`, and
+  dispatches persistence, query, and feed calls to it. The core carries no
+  compile-time dependency on any plugin crate and no backend-specific SQL,
+  schema, or client library, per `cpt-cf-usage-collector-adr-pluggable-storage`.
+
+- **Depends On**: None
+
+- **Scope**:
+  - Lazy resolution and caching of the bound storage plugin instance for the
+    service's lifetime.
+  - Dispatch of persistence, raw query, aggregated query, and feed calls to
+    the active plugin, and classification of plugin errors into the gear's
+    error taxonomy.
+  - Operator selection of the active backend via configuration, without a
+    change to Usage Collector product behavior.
+  - Fail-closed unavailability handling when no plugin is bound.
+
+- **Out of scope**:
+  - The plugin's own storage schema, retention mechanism, and materialized
+    views, which are plugin-internal per `DATA-DESIGN-NO-001`.
+  - Domain validation of a record before it reaches the plugin (covered by
+    usage record ingestion).
+  - The consistency and freshness bounds a plugin must publish (covered by
+    the consistency and freshness contract feature).
+
+- **Requirements Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-fr-pluggable-storage`
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-pluggable-storage`
+    (the gear core depends directly on `sea-orm`/`toolkit-db` and owns a DDL
+    migration for its declaration mirror, reaching durable state outside the
+    Plugin SPI — open, blocked on the repository owner. Fair counter-reading:
+    "backend-specific" may distribute over all four `DESIGN.md` §2.2 nouns,
+    and the mirror's own DDL is engine-portable; the same pass is not extended
+    to ADR-0002's identical claim only because that ADR states the exception
+    in terms, where §2.2 states none.)
+  - [x] `p1` - `cpt-cf-usage-collector-principle-plugin-resolution-via-client-hub`
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-constraint-vendor-pluggable`
+    (same blocker as `principle-pluggable-storage` above — the gear core's
+    direct `sea-orm`/`toolkit-db` dependency and its own DDL migration are a
+    second, non-SPI seam to durable state — open, blocked on the repository
+    owner)
+
+- **Domain Model Entities**:
+  - Keyset
+  - FeedPosition
+
+- **Design Components**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-component-plugin-host`
+
+- **API**: None — the Plugin SPI is an internal Rust trait contract
+  (`cpt-cf-usage-collector-interface-plugin`) implemented by storage
+  extensions, not a REST or CLI surface.
+
+- **Sequences**: None — plugin dispatch is a step embedded in every sequence
+  owned by the ingestion, invalidation, query, feed, and backfill features.
+
+- **Data**: None (see §1 Overview).
+
+### 2.4 [Usage Record Ingestion & Identity](feature-usage-record-ingestion/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-record-ingestion`
+
+- **Purpose**: Accepts a **Usage Record** on the live ingestion path,
+  validates its covered period, quantity, and per-type metadata, derives its
+  server-assigned identity, and deduplicates it against prior submissions
+  under the same dedup identity. This is the ledger's write path decided by
+  `cpt-cf-usage-collector-adr-mandatory-idempotency`,
+  `cpt-cf-usage-collector-adr-record-identity-derivation`, and
+  `cpt-cf-usage-collector-adr-quantity-precision`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - Structural validation of the covered period (half-open, UTC, live-path
+    future and past tolerance), the signed quantity (finite decimal, within
+    the published range and precision), and the closed per-type metadata
+    surface.
+  - Client-provided idempotency key handling: silent absorption of an
+    exact-equality retry, fail-closed conflict on a divergent field, and
+    resolution of a race by the plugin's declared dedup level.
+  - Server-derived, offline-reproducible entry identity (UUIDv5 over the
+    six-part dedup identity) and acceptance-instant stamping.
+  - Enforcement of the canonical metering unit and the fold-relative meaning
+    of a quantity under the entry's covered period.
+
+- **Out of scope**:
+  - PDP authorization of the attribution tuple (covered by attribution and
+    authorization).
+  - GTS type resolution itself (covered by usage type resolution).
+  - Invalidation-specific validation — faithful-copy checking, target
+    resolution, and reason-code enforcement (covered by record invalidation).
+  - The dedicated backfill route and its window bound (covered by backfill
+    and retention governance).
+
+- **Requirements Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-fr-ingestion`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-idempotency`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-record-metadata`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-record-identity`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-windows`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-live-future-time-bound`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-canonical-units`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-record-quantity`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-quantity-semantics`
+
+- **Design Principles Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-principle-idempotency-by-key`
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-canonical-errors`
+
+- **Design Constraints Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-constraint-no-business-logic`
+
+- **Domain Model Entities** (`cpt-cf-usage-collector-entity-model`):
+  - UsageRecord
+  - CreateUsageRecord
+  - EntryType
+  - RecordOrigin
+  - IdempotencyKey
+  - RecordMetadata
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-ingestion-gateway`
 
 - **API**:
-  - POST /usage-collector/v1/usage-types (request body carries the GTS Type Schema with declared dimensions and `kind` trait; PDP-authorized; dispatches through the Plugin SPI catalog-write method per ADR 0012)
-  - DELETE /usage-collector/v1/usage-types/{gts_id} (PDP-authorized; dispatches through the Plugin SPI catalog-delete method; the plugin's in-database `ON DELETE RESTRICT` FK rejects the delete atomically if any usage row references the target UsageType — surfaced as a structured "usage-type referenced" error)
-  - GET /usage-collector/v1/usage-types (dispatched through Plugin SPI catalog-list)
-  - GET /usage-collector/v1/usage-types/{gts_id} (dispatched through Plugin SPI catalog-read)
+  - POST /usage-collector/v1/records (usage_collector.create_usage_records)
+  - SDK trait: in-process **Usage Record** submission
+    (`cpt-cf-usage-collector-interface-sdk-client`)
 
 - **Sequences**:
-  - `p1` - `cpt-cf-usage-collector-seq-register-usage-type`
-  - `p1` - `cpt-cf-usage-collector-seq-delete-usage-type`
 
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
+  - [ ] `p1` - `cpt-cf-usage-collector-seq-emit-usage`
+    (step order diverges from `DESIGN.md` §3.6's own diagram — validation and
+    identity derivation run before PDP authorization in `project_and_admit`,
+    not after it)
 
-### 2.3 Usage Emission — HIGH
+- **Data**: None (see §1 Overview).
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-emission`
+### 2.5 [Record Invalidation & Corrections](feature-record-invalidation/) - HIGH
 
-- **Purpose**: Provide the single, contract-first write path for at-least-once ingestion of usage records from authenticated caller gears. Every emit — single or batched, REST or SDK — flows through the Ingestion Gateway, which receives an already-resolved caller `SecurityContext` (populated upstream by the ToolKit gateway on REST via `OperationBuilder::authenticated()` or supplied directly to the SDK; the gear NEVER consumes `authn-resolver`), the PDP authorizes the full attribution tuple (tenant, resource, optional subject, UsageType `gts_id`) against the caller's SecurityContext-derived gear identity fail-closed inline through the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`, UsageType existence and `metadata_fields` are resolved per record via a `get_usage_type` SPI dispatch against the storage plugin (`kind` read from the catalog row's `kind` field), semantics-dependent invariants are enforced (counter records reject negative deltas, gauges accept point-in-time values as-is), closed-key membership validation is applied to caller-supplied `metadata` (every caller-supplied metadata key MUST be a member of the UsageType's declared `metadata_fields` set; undeclared keys raise `unknown_metadata_key`; all values are typed as String end-to-end), the configurable `RecordMetadata` size cap is enforced, and the validated record is dispatched through the Plugin SPI for durable persistence under the dedup composite `(tenant_id, gts_id, idempotency_key, created_at)` — with the `gts_id` FK column enforcing referential integrity against the plugin-owned `usage_type_catalog` per ADR 0012. On a key collision the plugin compares the caller-supplied canonical fields (value, resource_ref, subject_ref, and metadata; the match key and the server-managed `status` are excluded — the server-owned `id`, a deterministic projection of the dedup key (ADR-0013/0014), is equal by construction and MAY be defensively verified): an exact-equality retry — every compared field equal, including metadata — is silently absorbed (no error, no double-count), whereas a same-key submission whose canonical fields differ in ANY field (including a metadata-only difference) is a deterministic `idempotency_conflict` rejection and is NEVER silently dropped. A same-key submission with a different `created_at` is a distinct record (ADR-0014), not a `Conflict` — `created_at` is part of the dedup key, not a canonical comparison field. Caller-supplied idempotency keys make at-least-once delivery safe end-to-end for genuine retries, uniformly across counter and gauge kinds, so retries never inflate counter totals or poison gauge point-in-time signals. This is the only write path into `usage_records` — aggregation, query, deactivation, and audit ledger semantics are owned elsewhere.
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-record-invalidation`
 
-- **Depends On**: `cpt-cf-usage-collector-feature-foundation`, `cpt-cf-usage-collector-feature-usage-type-lifecycle`
+- **Purpose**: Implements the sole correction mechanism the ledger offers: an
+  appended invalidation entry that faithfully copies its target's
+  caller-supplied fields, carries a reason code, and withdraws the target from
+  every fold while both entries remain persisted and readable. This keeps the
+  ledger append-only in the strict sense, per
+  `cpt-cf-usage-collector-adr-append-only-invalidation`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
 
 - **Scope**:
-  - Ingestion Gateway endpoint — a single REST entry point (`POST /usage-collector/v1/records`) accepts 1..N records per call (batched submissions capped at 100 records), serving both the REST API surface and the in-process SDK trait through the same gateway.
-  - Per-call authentication is owned by the ToolKit gateway upstream of the collector (the gear NEVER consumes `authn-resolver`); per-call PDP authorization runs inline through the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`, fail-closed on PDP unavailability with no synthesized identity and no cached PDP decision.
-  - UsageType existence, `kind` read from the catalog row's `kind` field, and declared `metadata_fields` lookup via a `get_usage_type` SPI dispatch against `cpt-cf-usage-collector-contract-storage-plugin` on every accepted record before plugin dispatch.
-  - **Closed-key metadata validation at ingest**: every key in the caller-supplied `metadata` map MUST be a member of the UsageType's declared `metadata_fields` set resolved via the `get_usage_type` SPI dispatch; declared keys are queryable by [§2.4](#24-usage-query--medium) Usage Query; there is NO free-form extras surface and NO `additionalProperties: true` escape hatch — undeclared keys are validation errors. All values are typed as String end-to-end. Undeclared keys are rejected at the gateway before plugin dispatch as `InvalidArgument` (`field_violations[0].field="metadata"`, `.reason="UNKNOWN_METADATA_KEY"`).
-  - Four-cell `(MetricSemantics × corrects_id presence)` value matrix enforcement at the gateway, before any plugin call — counter with `corrects_id IS NULL` requires `value >= 0` (rejects negative deltas); counter with `corrects_id` set requires `value < 0` (strictly negative; signed-negative reversal recorded against the `corrects_id` pointer); gauge with `corrects_id IS NULL` accepts any signed value as a point-in-time replacement; gauge with `corrects_id` set is REJECTED before persistence with `gauge_compensation_rejected` (gauges have no `SUM` semantics, so the only correction for a gauge is deactivation). The compensation-row cells and the L1 `corrects_id` referential checks are introduced by [§2.6](#26-compensation--medium) Compensation; the compensation flow is inlined inside `features/usage-emission.md` per the locked `feature_doc_shape = inline-in-emission`.
-  - Mandatory caller-supplied idempotency-key dedup via the storage-plugin composite `(tenant_id, gts_id, idempotency_key, created_at)`; exact-equality retries (all caller-supplied canonical fields equal — value, resource_ref, subject_ref, and metadata) are silently absorbed without error and without double-counting, while a same-key submission with ANY differing canonical field (including a metadata-only difference) is a deterministic `idempotency_conflict` Conflict that is rejected deterministically and is NEVER silently dropped; a same-key submission with a different `created_at` is a distinct record (ADR-0014), not a Conflict.
-  - Configurable `RecordMetadata` size-cap enforcement (default 8 KiB per record) with actionable rejection on oversize.
-  - Mandatory caller-supplied tenant attribution (carried via `SecurityContext`), mandatory resource attribution (`ResourceRef`), and optional subject attribution (`SubjectRef`); the PDP authorizes the supplied tenant/resource/subject/UsageType tuple against the caller's SecurityContext-derived gear identity.
-  - Persistence through the Plugin Host into `usage_records` as the sole writer of that table; the persisted row carries `gts_id` (the GTS UsageType id string), used as the FK column to the plugin-owned `usage_type_catalog`; per-record acceptance acknowledgements are surfaced deterministically to the caller.
+  - Explicit `entry_type` discrimination between a **Usage Record** and an
+    invalidation entry, with no default and no inference from quantity.
+  - Target resolution from the invalidation entry's own tenant, GTS type,
+    idempotency key, and covered period, converged-only.
+  - Faithful-copy validation of resource, subject, quantity, and metadata
+    against the resolved target.
+  - Mandatory, non-empty reason code on every invalidation entry, and its
+    rejection on an ordinary **Usage Record**.
+  - At-most-one-invalidation-per-record enforcement via the shared dedup
+    identity, and the impossibility of invalidating an invalidation.
 
 - **Out of scope**:
-  - Aggregated or raw read-path query execution and PDP-constraint composition — owned by [§2.4](#24-usage-query-medium) Usage Query.
-  - Event-driven `active → inactive` deactivation transitions — owned by [§2.5](#25-event-deactivation-medium) Event Deactivation.
-  - UsageType registration, deletion, and catalog mutation — owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle; the gateway only reads the catalog.
-  - Plugin host lifecycle, shared PDP authorization helper definition, REST/SDK/Plugin SPI surface declaration, and deployment topology — owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Gear Foundation & Pluggable Storage.
-  - Business logic / billing / pricing / quota enforcement — explicitly out of the metering substrate.
-  - Gear-local audit-ledger emission for accepted records — authoritative audit is delegated to the platform gateway access log and PDP decision logs; a dedicated in-gear audit-emission capability is deferred per DESIGN §3.9.5 and [§4](#4-crate-layout-platform-dependencies).
-  - Concrete plugin implementations, partitioning, retention, and physical layout of `usage_records` — owned by the active storage plugin; however, retention remains constrained by a strict key-preservation obligation: the plugin MUST preserve the `(tenant_id, gts_id, idempotency_key, created_at)` dedup key tuple permanently — retention may reclaim, archive, or purge record bodies, but MUST NOT free a dedup key (the unbounded idempotency window never lets a key be reused).
+  - The withdrawal exclusion rule applied inside a fold (covered by usage
+    query) and inside the feed (covered by the usage feed feature).
+  - Path-owned period bounds for a backfilled invalidation (covered by
+    backfill and retention governance).
 
 - **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-ingestion`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-idempotency`
-  - [ ] `p2` - `cpt-cf-usage-collector-fr-record-metadata`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-counter-semantics`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-gauge-semantics`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-tenant-attribution`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-resource-attribution`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-subject-attribution`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-ingestion-authorization`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-record-invalidation`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-invalidation-reason-code`
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-append-only-ledger`
+
+- **Design Constraints Covered**: None — this feature is bound entirely by
+  the requirements and the principle above; no §2.2 constraint constrains it
+  beyond what usage record ingestion already carries.
+
+- **Domain Model Entities**:
+  - UsageRecord (invalidation entry)
+  - RecordOrigin
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-ingestion-gateway`
+
+- **API**:
+  - POST /usage-collector/v1/records (entry_type=invalidation)
+  - POST /usage-collector/v1/records/backfill (entry_type=invalidation)
+
+- **Sequences**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-seq-invalidate-record`
+
+- **Data**: None (see §1 Overview).
+
+### 2.6 [Usage Query — Raw & Aggregated](feature-usage-query/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-query`
+
+- **Purpose**: Serves the two read-side query surfaces over accepted
+  entries: a raw, cursor-paginated ledger read returning persisted fact, and
+  an aggregated read serving the queried GTS type's declared fold as a
+  derived view. Both are bounded to exactly one GTS type and a mandatory time
+  range, and both apply PDP-returned constraints ahead of any user filter, per
+  `cpt-cf-usage-collector-adr-window-end-selection` and
+  `cpt-cf-usage-collector-adr-feed-aggregate-split`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-record-invalidation`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - Aggregated query: mandatory time range and single GTS type, grouping and
+    equality filtering on fixed dimensions and declared metadata properties,
+    serving the declared fold and excluding withdrawn pairs.
+  - Raw query: mandatory time range and single GTS type, cursor-paginated
+    keyset scan over `(window_end, id)`, returning withdrawn pairs as
+    persisted with unstripped billing fields.
+  - Point lookup of a single entry by its identifier.
+  - Period-end range selection (`from <= window_end < to`) as the sole
+    admissible comparison of period against range on every read path.
+
+- **Out of scope**:
+  - The usage feed's replay-safe, snapshot-consistent read path (covered by
+    the usage feed feature).
+  - Operator-only reconciliation counters (covered by rate limiting and
+    reconciliation).
+
+- **Requirements Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-fr-query-aggregation`
+  - [x] `p1` - `cpt-cf-usage-collector-fr-query-raw`
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-billing-fields-on-read`
+
+- **Design Principles Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-aggregate-asymmetry`
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-canonical-page`
+  - [ ] `p1` - `cpt-cf-usage-collector-principle-cursor-gateway-ownership`
+
+- **Design Constraints Covered**: None — this feature inherits its
+  constraints from the features it depends on; no §2.2 constraint applies
+  uniquely to query.
+
+- **Domain Model Entities**:
+  - UsageRecordFilterField
+  - AggregationDimension
+  - AggregationResult
+  - Keyset
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-query-gateway`
+    (§2.1/§2.6/§2.9 shared box — reasoning in §2.9's own `component-query-gateway` note, not restated here)
+
+- **API**:
+  - GET /usage-collector/v1/records (usage_collector.list_usage_records)
+  - GET /usage-collector/v1/records/{id} (usage_collector.get_usage_record)
+  - POST /usage-collector/v1/records/aggregate
+    (usage_collector.query_aggregated_usage_records)
+
+- **Sequences**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-seq-query-aggregated`
+  - [ ] `p1` - `cpt-cf-usage-collector-seq-query-raw`
+
+- **Data**: None (see §1 Overview).
+
+### 2.7 [Usage Feed for Downstream Consumers](feature-usage-feed/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-feed`
+
+- **Purpose**: Provides the pull-based, deterministic, replay-safe read path
+  a charging consumer depends on: per-GTS-type subscription, opaque bounded
+  cursors, snapshot-consistent pages, and corrections delivered as ordinary
+  entries at their own feed position after the entry they withdraw. This is
+  the split decided by `cpt-cf-usage-collector-adr-feed-aggregate-split` and
+  the recovery objective bound by `cpt-cf-usage-collector-nfr-replay-throughput`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-record-invalidation`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`,
+  `cpt-cf-usage-collector-feature-backfill-retention` (a later-numbered
+  entry: the retention floor's backfill-window term is a value backfill and
+  retention governance configures, so the feed's conformance to that floor
+  depends forward on it, even though the storage plugin enforces the
+  cursor refusal itself)
+
+- **Scope**:
+  - Subscription to a caller-declared set of GTS types, excluded from
+    everything else including the cursor.
+  - Deterministic feed order with corrections following their target, and a
+    defined start position (`Oldest`) with no head-start option.
+  - Snapshot-consistent, cursor-paginated pages bounded in size regardless of
+    subscription breadth. A cursor whose continuation is intact is served,
+    but a cursor after which retention has removed an entry of a subscribed
+    GTS type is refused rather than served as a short page.
+  - Scope-change handling: a narrowed authorization scope skips silently as
+    the cursor advances; a widened scope requires consumer-side bootstrap.
+
+- **Out of scope**:
+  - The retention floor formula and the backfill window it composes with
+    (covered by backfill and retention governance).
+  - Reconciliation-based detection of an unintended scope narrowing (covered
+    by rate limiting and reconciliation).
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-fr-billing-usage-feed`
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-billing-feed-freshness`
+  - [ ] `p2` - `cpt-cf-usage-collector-nfr-replay-throughput`
+
+- **Design Principles Covered**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-principle-cursor-gateway-ownership`
+
+- **Design Constraints Covered**: None — the feed's constraints are the ones
+  already carried by pluggable storage and contract stability; no §2.2
+  constraint applies uniquely to it.
+
+- **Domain Model Entities**:
+  - FeedSubscription
+  - FeedPage
+  - FeedPosition
+  - FeedStart
+
+- **Design Components**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-component-feed-gateway`
+
+- **API**:
+  - GET /usage-collector/v1/feed (usage_collector.read_usage_feed)
+
+- **Sequences**:
+
+  - [x] `p1` - `cpt-cf-usage-collector-seq-read-feed`
+
+- **Data**: None (see §1 Overview).
+
+### 2.8 [Backfill Import & Retention Governance](feature-backfill-retention/) - MEDIUM
+
+- [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-backfill-retention`
+
+- **Purpose**: Provides the dedicated, permission-gated bulk-import path for
+  historical entries, isolated from live ingestion workload, and ties it to
+  the retention floor every GTS type's declaration must meet so that no
+  admitted entry ever outlives its own idempotency and replay horizon. This is
+  the isolation decision in `cpt-cf-usage-collector-adr-backfill-isolation`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - Dedicated backfill route that admits **Usage Records** and invalidation
+    entries alike, with a configurable, hard window bound, an origin marker
+    on every entry it admits, and validation identical to the live path
+    except for the past tolerance it replaces. The invalidation rules
+    applied to an imported invalidation entry are owned by
+    `record-invalidation`, not by this feature.
+  - A permission distinct from live ingestion, required for every entry the
+    route admits, whatever the entry kind.
+  - Workload isolation from live ingestion so backfill load never breaches
+    live-path SLOs.
+  - The retention floor formula (`backfill window + operational replay
+    horizon`) and its revalidation obligation whenever either term widens.
+
+- **Out of scope**:
+  - The live ingestion path's own validation rules (covered by usage record
+    ingestion).
+  - The feed's servable-cursor behavior at the retention boundary (covered by
+    the usage feed feature, which depends on this one).
+
+- **Requirements Covered**:
+
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-backfill`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-billing-retention-floor`
+
+- **Design Principles Covered**: None — this feature is governed by the
+  principles already carried by usage record ingestion and pluggable
+  storage; it introduces no principle of its own.
+
+- **Design Constraints Covered**: None — retention and backfill are bound by
+  the requirements above rather than by a distinct §2.2 constraint.
+
+- **Domain Model Entities**:
+  - RecordOrigin
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-ingestion-gateway`
+
+- **API**:
+  - POST /usage-collector/v1/records/backfill
+    (usage_collector.backfill_usage_records)
+  - SDK trait: in-process backfill import
+    (`cpt-cf-usage-collector-interface-sdk-client`)
+
+- **Sequences**:
+
+  - [ ] `p2` - `cpt-cf-usage-collector-seq-backfill-import`
+
+- **Data**: None (see §1 Overview).
+
+### 2.9 [Ingestion Rate Limiting & Reconciliation Metadata](feature-rate-limiting-reconciliation/) - MEDIUM
+
+- [x] `p2` - **ID**: `cpt-cf-usage-collector-feature-rate-limiting-reconciliation`
+
+**Closed by slice 6 (ruling G5).** Both halves this feature bundles are now
+done: reconciliation metadata (closed by slice 5) and rate limiting — the
+quota bucket (`domain/quota.rs`), its config block, the charge on both
+service paths, the two instruments, and the `Retry-After` header — closed by
+slice 6. Every backing algorithm, flow, state model and definition-of-done
+item in `docs/features/rate-limiting-reconciliation.md` is ticked, each tick
+backed by a `@cpt-` marker in the code that realizes it. The rollup ID above
+and the feature-status ID
+(`…featstatus-rate-limiting-reconciliation-implemented`) tick with them under
+G5 — a bundled feature's rollup ticks once both halves close — and are outside
+"backed by a marker": no `@cpt-` kind in this corpus takes a rollup or
+feature-status identifier, which is the same ground the `fr-*` note below
+stands on. One divergence is recorded rather than hidden: `algo-quota-charge`
+and `algo-quota-throttle-outcome` tick under **ruling G27**, which found the
+code's fused one-stage charge behaviourally equivalent to the document's
+two-stage decomposition and the document's "with the bucket unchanged" clause
+wrong as a design; the divergence is stated at the marker site in
+`domain/quota.rs`.
+
+`component-ingestion-gateway` does **not** tick even though this feature's own
+half is done: the box is shared with §2.1, §2.4, §2.5 and §2.8, and **four of
+its five claimants are independently blocked** (ruling G24). Naming the
+mechanisms rather than the tick ratios, which the next commit to any of those
+documents would falsify:
+
+- **§2.1** — ruling G22's action-selection conflict (`ingestion_action` picks
+  the PEP action from the entry's own covered period;
+  `dod-write-scope-admission` requires it to follow the route the caller used),
+  plus the `algo`/`dod` structural attribution validation pair. The feature
+  document's §3 preamble requires all four of those checks to run inside the
+  owning component's domain trait implementation, "never in a REST handler", so
+  that in-process and REST callers reach identical behaviour; the only site
+  that performs them is a REST handler, and the in-process entry point forwards
+  a caller-built batch straight past it. Step 1's tenant check
+  (`inst-attrval-tenant`) has no code anywhere in the gear or the SDK.
+- **§2.4** — the same G23 window-bound gap below, which makes
+  `state-dedup-identity`'s `inst-state-unreachable` transition unreachable for
+  the stated reason (it rests on "the window bound refuses an over-aged period
+  first", and no such bound exists); and `dod-ingestion-telemetry`'s required
+  `duplicate` outcome label, which the gear reserves but never emits for want
+  of a Plugin SPI dedup signal.
+- **§2.5** — a whitespace-only `reason_code` is accepted; `TargetNotConverged`
+  carries no retry delay on any surface; and G22 and G23 both reach this
+  feature through its import-route identifiers.
+- **§2.8** — ruling G23's unbuilt window bound (nothing rejects an over-window
+  covered period; only the PDP-action-routing half exists), G22 again on the
+  backfill permission, and `nfr-workload-isolation`, which is an explicit
+  in-tree `TODO`.
+
+`component-query-gateway` still does not tick, and the reasoning for all
+**three** of its claimant sites — its row under **Design Components** in
+§2.1, §2.6 and §2.9 — lives here rather than being restated at each: a sweep
+(`command grep -n 'component-query-gateway'` over this file) is the only
+way to know all three are found, and duplicated prose is exactly the
+failure mode that has let the three drift apart before. Cited by section
+rather than by line because the line numbers themselves drifted: this
+sentence was written with `:156`, `:535`, `:838`, and `884b4ff20` shifted
+the third to `:840` two commits later — fix-N / break-N+k, inside the one
+sentence whose stated purpose is that a sweep finds all three. As of Task 11 (slice 7), §2.6 (Usage Query) is
+**closed**: each of its document's 28 identifiers was verified individually
+against the shipped code, 20 tick behind a real `@cpt-` marker, and the 8
+that stay open are not gaps this feature owes — two are rollups, three are
+the storage plugin's own SPI-contract obligations
+(`algo-withdrawn-pair-exclusion-pushdown`, `dod-aggregate-withdrawn-pair-exclusion`,
+`dod-empty-selection-answer`), one is feature 2.11's (not scheduled in this
+programme), one is a client-side composition pattern with no gear code of
+its own (`flow-reconcile-aggregate-against-raw`), and one
+(`dod-scope-precedes-user-filter`) is Task 11's own G17 aggregate-read
+measurement — a route-level closure of an already-documented gate-level
+limitation (`domain/authz.rs`'s own "four actions, but five REST surfaces"
+passage predicted it; `DESIGN.md:2024` is the sentence that does not yet
+name the aggregate route), surfaced for that limitation's owner rather than
+a functional gap slice 7 left unbuilt. §2.9
+closed earlier. **§2.1 is now the sole remaining blocker, and it is blocked
+by two independent mechanisms, not one**: ruling G22's action-selection
+conflict (`ingestion_action` picks the PEP action from the entry's own
+covered period; `dod-write-scope-admission` requires it to follow the route
+the caller used) and the `algo`/`dod` structural attribution validation pair
+(the four PEP-gate checks DESIGN requires inside the owning component's
+domain trait implementation exist only in a REST handler, not on the
+in-process entry point) — see §2.1's own entry above for the full citation
+trail. Closing §2.6 does not close the shared box, because one blocked
+claimant blocks it as completely as two.
+
+- **Purpose**: Bounds what one calling subject can submit across every
+  ingestion path with a per-replica quota, and exposes per-(tenant, GTS type)
+  accepted counts, quantity summaries, and watermarks so an external
+  reconciliation job can compare gear-side totals against a consumer's
+  processed totals without a full raw scan.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-usage-query`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - Per-subject, per-replica ingestion quota charged on submitted entry
+    count, rejecting an over-quota submission whole with an actionable
+    throttle error carrying retry guidance.
+  - Per-(tenant, GTS type) reconciliation metadata: accepted entry counts,
+    a fold-appropriate quantity summary, and the acceptance-instant and
+    covered-period-end watermarks.
+  - The deferred (calling gear) and (calling gear, tenant) reconciliation
+    granularities, blocked on a platform identity plane that does not yet
+    carry both gear name and tenant.
+
+- **Out of scope**:
+  - Stall detection and threshold evaluation, which are consumer-side
+    responsibilities the gear does not perform.
+  - Any per-tenant quota tier, which the security context does not carry
+    attribution to support.
+
+- **Requirements Covered**:
+
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-rate-limiting`
+  - [ ] `p2` - `cpt-cf-usage-collector-fr-reconciliation-metadata`
+  - [ ] `p3` - `cpt-cf-usage-collector-fr-reconciliation-caller-scopes`
+
+  All three `fr-*` boxes above are deliberately left unticked, including
+  `fr-rate-limiting` now that rate limiting itself is built. The ground is one
+  sentence long and is stated here rather than deferred: **no `@cpt-fr:` marker
+  kind is declared by any `.rs` source in this repository**, so under this
+  corpus's own tick-must-be-backed discipline no `fr-*` box can be backed yet.
+  (Checkable as `grep -rn '@cpt-fr:' --include='*.rs' .` from the repository
+  root → no match. The six kinds that are declared are `algo`, `begin`, `dod`,
+  `end`, `flow` and `state`, which is also why the rollup and feature-status
+  pair above cannot be marker-backed.) That ground binds every `fr-*` box in
+  this corpus, not only the two reconciliation ones it was first written
+  against — provenance: ruling F28, slice 5's whole-slice review, re-verified
+  by slice 6 at the same zero. The `fr-*` convention remains slice 9's to
+  settle corpus-wide. `fr-reconciliation-caller-scopes` additionally names a
+  requirement `PRD.md:755-759` states is deferred beyond v1; this slice
+  built only the rejection that names the reserved granularities, which
+  `dod-reconciliation-caller-scopes-reserved` already carries, backed by a
+  real marker.
+
+- **Design Principles Covered**: None — rate limiting and reconciliation are
+  operator-facing capabilities layered on the ingestion path; they introduce
+  no principle beyond fail-closed behavior already carried by attribution and
+  authorization.
+
+- **Design Constraints Covered**: None — none of the six §2.2 constraints
+  binds rate limiting or reconciliation uniquely; both are operator-facing
+  capabilities layered on top of ingestion.
+
+- **Domain Model Entities**:
+  - ReconciliationMetadata
+  - ReconciliationScope
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-component-ingestion-gateway`
+  - [ ] `p1` - `cpt-cf-usage-collector-component-query-gateway`
+    (§2.1/§2.6/§2.9 shared box — reasoning in §2.9's own `component-query-gateway` note, not restated here)
+
+- **API**:
+  - POST /usage-collector/v1/records (quota-gated)
+  - POST /usage-collector/v1/records/backfill (quota-gated)
+  - GET /usage-collector/v1/reconciliation
+    (usage_collector.get_reconciliation_metadata)
+
+- **Sequences**: None — the quota check and reconciliation read are steps
+  embedded in the ingestion and query sequences owned by other features, not
+  sequences of their own.
+
+- **Data**: None (see §1 Overview).
+
+### 2.10 [Data Classification & Privacy Boundary](feature-data-classification/) - LOW
+
+- [ ] `p3` - **ID**: `cpt-cf-usage-collector-feature-data-classification`
+
+- **Purpose**: States and enforces the three-class treatment of data the
+  Usage Collector persists — opaque platform identifiers, operational
+  telemetry, and caller-supplied metadata — so PII, payment, and regulated
+  data obligations stay delegated to the platform identity layer rather than
+  being interpreted or classified by this gear.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-attribution-authorization`
+
+- **Scope**:
+  - Treatment of tenant ID, subject ID, resource ID, and GTS type reference
+    as opaque platform identifiers, never interpreted, decoded, or
+    correlated to a natural person.
+  - Treatment of the quantity, window bounds, acceptance instant,
+    idempotency key, and correction references as non-personal operational
+    telemetry.
+  - Treatment of caller-supplied metadata as opaque, with the product-level
+    contract that a usage source must not place PII, payment data, regulated
+    health data, or credentials into it.
+
+- **Out of scope**:
+  - Metadata schema validation itself, which is a structural concern of
+    usage record ingestion.
+  - Any gear-local consent, DSR, or purge workflow, which the platform
+    identity and governance layers own.
+
+- **Requirements Covered**:
+
+  - [ ] `p3` - `cpt-cf-usage-collector-fr-data-classification`
+
+- **Design Principles Covered**: None — data classification restates a
+  boundary already implied by fail-closed and PDP-centric authorization; it
+  introduces no principle of its own.
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-constraint-pii-identity-layer`
+
+- **Domain Model Entities**:
+  - RecordMetadata
+
+- **Design Components**: None — data classification is a data-handling
+  contract that spans every component rather than a component-level
+  responsibility.
+
+- **API**: None — classification is a documentation and validation contract,
+  not an endpoint of its own.
+
+- **Sequences**: None — DESIGN Section 3.6 defines six sequences (emit, invalidate, query-aggregated, query-raw, read-feed, backfill) and none is dedicated to the data-classification boundary; it is checked inside each of those.
+
+- **Data**: None (see §1 Overview).
+
+### 2.11 [Read-Path Consistency & Freshness Contract](feature-consistency-freshness-contract/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-consistency-freshness-contract`
+
+- **Purpose**: Publishes the plugin-agnostic floor-and-ceiling consistency
+  contract between the synchronous ingestion acknowledgement and the raw,
+  aggregated, and feed query surfaces, so that every consumer and every
+  storage plugin codes against one documented staleness model rather than an
+  implicit, backend-specific one. This is
+  `cpt-cf-usage-collector-adr-consistency-contract`.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-query`,
+  `cpt-cf-usage-collector-feature-usage-feed`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - The gear-level floor: ingestion acknowledgement durability, no upper
+    bound on raw/aggregate/feed query visibility, no monotonic-reads
+    guarantee, and dedup-identity visibility bounded by declared retention.
+  - The per-plugin ceiling a deployment guide must publish across the four
+    consistency dimensions (write-path finality, raw visibility, aggregate
+    visibility, feed visibility).
+  - The aggregate path's readiness gate: a materialized aggregate is fit to
+    serve a consumer that acts on it only when its published ceiling is
+    finite and, where the consumer acts on it, at or below 5 minutes p95.
+  - The consumer rule that read-after-write flows must consume the
+    ingestion acknowledgement rather than the query surfaces.
+
+- **Out of scope**:
+  - The numeric throughput, latency, and availability thresholds themselves
+    (covered by throughput, latency, and availability SLOs).
+  - The feed's own recovery-time and bulk-read-rate objective (covered by the
+    usage feed feature).
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-query-freshness`
+  - [ ] `p2` - `cpt-cf-usage-collector-nfr-aggregate-freshness`
+
+- **Design Principles Covered**: None — the consistency contract is stated at
+  NFR level in DESIGN §3.10 rather than as a §2.1 design principle.
+
+- **Design Constraints Covered**: None — the numeric threshold constraint is
+  owned by the throughput, latency, and availability SLOs feature, per the
+  Out of scope bullet above.
+
+- **Domain Model Entities**: None — the contract governs cross-cutting
+  visibility behavior rather than introducing a domain entity of its own.
+
+- **Design Components**: None — the contract binds every component's read
+  and write paths rather than one component in particular.
+
+- **API**: None — the consistency contract is a published behavioral
+  guarantee, not an endpoint.
+
+- **Sequences**: None — none of the six DESIGN Section 3.6 sequences is dedicated to the consistency and freshness contract; the contract is a cross-cutting property checked across all six.
+
+- **Data**: None (see §1 Overview).
+
+### 2.12 [Throughput, Latency & Availability SLOs](feature-throughput-latency-availability/) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-throughput-latency-availability`
+
+- **Purpose**: Binds the ingestion and query paths to the numeric performance
+  envelope the platform's high-volume usage sources (LLM Gateway, API
+  Gateway) and interactive consumers require: sustained and burst ingestion
+  throughput, ingestion and aggregation latency ceilings, workload isolation
+  between the two, and monthly ingestion availability, all measured against
+  one shared throughput profile.
+
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-usage-query`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
+
+- **Scope**:
+  - The shared throughput-profile envelope: sustained rate, peak burst,
+    concurrent aggregation queries, and daily transaction volume.
+  - Ingestion latency (p95 ≤ 200ms) and ingestion throughput (≥ 10,000
+    entries/sec) under that envelope.
+  - Aggregation query latency (p95 ≤ 500ms over a 30-day single-tenant
+    range) under the same envelope.
+  - Workload isolation so concurrent aggregation queries do not degrade
+    ingestion latency, and 99.95% monthly ingestion availability.
+
+- **Out of scope**:
+  - Staleness and freshness bounds, which are the consistency and freshness
+    contract's concern rather than a throughput or latency figure.
+  - The feed's own bulk-replay recovery objective (covered by the usage
+    feed feature).
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-query-latency`
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-availability`
   - [ ] `p1` - `cpt-cf-usage-collector-nfr-throughput`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-throughput-profile`
   - [ ] `p1` - `cpt-cf-usage-collector-nfr-ingestion-latency`
   - [ ] `p2` - `cpt-cf-usage-collector-nfr-workload-isolation`
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-throughput-profile`
 
-- **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-idempotency-by-key`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-semantics-enforcement`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-fail-closed`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-pluggable-storage`
+- **Design Principles Covered**: None — the throughput and latency envelope
+  is an NFR allocation rather than a §2.1 design principle.
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-no-business-logic`
+
   - [ ] `p2` - `cpt-cf-usage-collector-constraint-nfr-thresholds`
-  - `p2` - `cpt-cf-usage-collector-adr-caller-supplied-attribution`
-  - `p2` - `cpt-cf-usage-collector-adr-mandatory-idempotency`
-  - `p2` - `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` (per Amendment 2026-06-02: ingest-time closed-key membership validation against the L1-cached `metadata_fields: HashSet<String>` — undeclared keys raise `unknown_metadata_key`; all values typed as String end-to-end; `gts_id` FK column on `usage_records` references the plugin-owned `usage_type_catalog` via `ON DELETE RESTRICT`; the UsageType existence guarantee is enforced at the storage engine)
 
-- **Domain Model Entities**:
-  - UsageRecord
-  - RecordMetadata
-  - TenantRef (caller-supplied tenant attribution carried via `SecurityContext`; tenant scope materialized on every persisted record's `tenant_id` attribution via the Plugin SPI persist capability)
-  - ResourceRef
-  - SubjectRef
-  - IdempotencyKey
-  - UsageType
-  - `SecurityContext`
+- **Domain Model Entities**: None — this feature binds measured behavior
+  rather than introducing a domain entity.
 
-- **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-ingestion-gateway`
+- **Design Components**: None — the SLOs bind the ingestion and query
+  components' runtime behavior rather than naming one component uniquely.
 
-- **API**:
-  - POST /usage-collector/v1/records (accepts single and batched usage records; batched submissions capped at 100 records per call)
+- **API**: None — the SLOs bind existing ingestion and query endpoints
+  rather than adding a surface of their own.
 
-- **Sequences**:
-  - `p1` - `cpt-cf-usage-collector-seq-emit-usage`
+- **Sequences**: None — none of the six DESIGN Section 3.6 sequences is dedicated to the throughput, latency, or availability SLOs; they are measured against all six rather than owning one.
 
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
+- **Data**: None (see §1 Overview).
 
-### 2.4 Usage Query — MEDIUM
+### 2.13 [Public Surface Contract Stability & Versioning](feature-contract-stability/) - MEDIUM
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-usage-query`
+- [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-contract-stability`
 
-- **Purpose**: Provide the single read path for the metering substrate — aggregated and raw — through one PDP-authorized Query Gateway that anchors every read on the resolved `SecurityContext`, composes user-supplied filters with PDP-returned constraints so the authorized scope can only narrow, and pushes server-side SUM / COUNT / MIN / MAX / AVG with grouping (aggregated path) and cursor-paginated record retrieval (raw path) into the active storage plugin. Time range and a single UsageType are mandatory filters (both the aggregated and raw paths require `gts_id`, because the per-UsageType declared-dimension set must be resolved before `$filter` / `$apply` can be admitted); the Query Gateway validates filter structure against fixed fields plus the queried UsageType's declared dimensions, refuses to widen scope under any user-supplied filter, and rejects unregistered UsageType references before plugin dispatch. PDP denial, empty constraints, or PDP unavailability fail closed with no cached decisions and no synthesized identity, while an empty match within the authorized scope returns an empty result set / page rather than an error.
+- **Purpose**: Guarantees that the SDK trait, the Plugin SPI, and the REST
+  API each stay stable within a major version from their 1.0 release onward,
+  so plugin authors, in-process consumer gears, and remote usage sources
+  migrate on schedules independent of the Usage Collector. This is
+  `cpt-cf-usage-collector-adr-contract-stability`.
 
-- **Depends On**: `cpt-cf-usage-collector-feature-foundation`, `cpt-cf-usage-collector-feature-usage-type-lifecycle`, `cpt-cf-usage-collector-feature-usage-emission`, `cpt-cf-usage-collector-feature-usage-compensation`
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-usage-query`,
+  `cpt-cf-usage-collector-feature-usage-feed`,
+  `cpt-cf-usage-collector-feature-backfill-retention`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`
 
 - **Scope**:
-  - Aggregated query path (`POST /usage-collector/v1/records/aggregate`) — mandatory time range and single-UsageType filter, optional tenant / subject / resource filters, server-side SUM / COUNT / MIN / MAX / AVG with grouping pushed into the bound storage plugin via the Plugin SPI. `AggregationQuery.group_by` is **fixed fields plus per-UsageType declared metadata keys**; fixed fields are `tenant`, `resource_ref`, `subject_ref`, `created_at`, `status`; dynamic fields are the queried usage-type's declared keys from `metadata_fields` resolved via a per-query `get_usage_type` SPI dispatch against the storage plugin. Cross-UsageType aggregation is out of scope — single-UsageType is required so the declared-key set is unambiguous.
-  - Raw query path (`GET /usage-collector/v1/records`) — `RawQuery.gts_id` is **REQUIRED**; OData query parameters `$filter` (mandatory time range plus optional narrowing on fixed fields and the queried usage-type's declared metadata keys), `$orderby` (optional; normalized gateway-side to end in the canonical unique `(created_at, id)` suffix, and rejected `400` when it mixes sort directions or names an optional/nullable field), `$top` (page size in `[1, 1000]`; a value above the cap is rejected `400`, never clamped), and `cursor` (toolkit cursor encoded by the gateway over the standardized sort keyset). The declared-key set the `$filter` AST is type-checked against is resolved per request from the queried UsageType's `metadata_fields` list via a `get_usage_type` SPI dispatch against the storage plugin; there are no undeclared "extras" — undeclared keys are rejected at ingest, so every row only carries declared keys. Cursor decode and validate-against-current-`$filter`/`$orderby` happen at the gateway via `toolkit_odata::validate_cursor_against`; the plugin is dispatched with a structured `(filter_ast, order, page_after, limit)` tuple and returns `(rows, last_keyset)` from which the gateway re-issues the next cursor. The response envelope is `toolkit_odata::Page<UsageRecord>`.
-  - PDP constraint application on every query through the per-component PDP authorization helper against `cpt-cf-usage-collector-contract-authz-resolver`, composing the returned `PdpConstraint`s with user-supplied filters so the result set can only narrow within the authorized scope.
-  - Tenant isolation: every read is anchored on the resolved `SecurityContext` and PDP-returned constraints, with no cross-tenant read possible absent an explicit PDP decision permitting it.
-  - Single-UsageType filter validation and per-UsageType declared-dimension resolution via per-query `get_usage_type` SPI dispatch against `cpt-cf-usage-collector-contract-storage-plugin` on the aggregated and raw paths — unregistered UsageType references are rejected with an actionable error envelope before plugin aggregate / raw dispatch (whose authoritative ingest-time rejection is owned by [§2.3](#23-usage-emission--high) Usage Emission and whose read-side validation is shared on this read path); `$filter` clauses naming a property not in the `UsageRecordFilterField` set are rejected by `toolkit-odata` as `InvalidArgument` (`field_violations[0].field="$filter"`, `.reason="INVALID_FILTER"`).
-  - Active-and-inactive record visibility: the Query Gateway returns both `active` and `inactive` rows from `usage_records` within the PDP-authorized scope, preserving auditable history after `cpt-cf-usage-collector-seq-deactivate-event` flips the `status` column; distinguishing the two values is the caller's responsibility.
-  - Fail-closed posture on AuthN, PDP, or plugin unavailability — no synthesized identity, no cached decision, no inferred result; an empty match within the authorized scope returns an empty result set / page (not an error).
+  - The major-version stability contract across all three public surfaces,
+    starting at each surface's 1.0 release.
+  - The definition of additive versus breaking change per surface, and the
+    one-migration-window support policy for a superseded major version.
+  - The structural encoding of a surface's major version (Rust trait name
+    suffix; REST path version; SPI type suffix).
 
 - **Out of scope**:
-  - Client-side aggregation, widening of the authorized scope under any user-supplied filter, and any business-rule or pricing filtering — out by `cpt-cf-usage-collector-constraint-no-business-logic` and owned by downstream consumers.
-  - Cross-tenant reads without an explicit PDP decision permitting them — owned by PDP policy, not by the Query Gateway.
-  - Write paths (single emit, batch emit, idempotency dedup and conflict rejection — exact-equality retries silently absorbed, canonical-field mismatches rejected as `idempotency_conflict`, counter / gauge semantics enforcement, `RecordMetadata` size-cap enforcement) — owned by [§2.3](#23-usage-emission-high) Usage Emission.
-  - UsageType registration, deletion, and catalog mutation — owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle; the Query Gateway only reads the catalog to validate the mandatory single-UsageType filter.
-  - Event-driven `active → inactive` deactivation transitions — owned by [§2.5](#25-event-deactivation-medium) Event Deactivation.
-  - Plugin host lifecycle, shared PDP authorization helper definition, REST / SDK / Plugin SPI surface declaration, and deployment topology — owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Gear Foundation & Pluggable Storage.
-  - Concrete plugin query execution (native acceleration structures, partitioning, sort orders, retention) — owned by the active storage plugin behind the Plugin SPI.
+  - The functional content of any one surface, which is owned by the
+    feature exposing it (ingestion, query, feed, backfill, pluggable
+    storage).
 
 - **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-query-aggregation`
-  - [ ] `p2` - `cpt-cf-usage-collector-fr-query-raw`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-tenant-isolation`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-query-latency`
-  - [ ] `p2` - `cpt-cf-usage-collector-nfr-workload-isolation`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-plugin-contract-stability`
 
 - **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-pdp-centric-authorization`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-fail-closed`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-aggregate-asymmetry`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-canonical-errors`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-canonical-page`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-cursor-gateway-ownership`
+
+  - [ ] `p2` - `cpt-cf-usage-collector-principle-contract-stability`
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-no-business-logic`
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-nfr-thresholds`
-  - `p2` - `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` (per Amendment 2026-06-02 dimension-aware query path: `RawQuery.gts_id` REQUIRED; `AggregationQuery.group_by` = fixed fields + per-UsageType declared metadata keys; `$filter` accepts declared keys over fixed fields; declared keys resolved per request from the queried UsageType's `metadata_fields` list; UsageType existence check on the aggregated and raw paths dispatches `get_usage_type` directly against the plugin-owned `usage_type_catalog`)
 
-- **Domain Model Entities**:
-  - `UsageTypeGtsId` — typed usage-type key (GTS identifier). Required named parameter on both `list_usage_records` and `query_aggregated_usage_records`; the gateway rejects any `gts_id`-touching predicate in the `ODataQuery` filter so the typed parameter is the single source of truth (replaces the previous "MUST include `gts_id eq '<id>'` in `$filter`" runtime-only rule).
-  - Bounded time window — expressed as `created_at ge … and created_at lt …` predicates in the `ODataQuery` `$filter` on both `list_usage_records` and `query_aggregated_usage_records` (mandatory; a lower and an upper bound are required, else `MISSING_TIME_WINDOW`). There is no free-standing `TimeWindow` entity — `created_at` is a first-class `UsageRecordFilterField`.
-  - `AggregationOp` — closed enum SUM / COUNT / MIN / MAX / AVG.
-  - `AggregationDimension` — closed enum of group-by dimensions: `TenantId`, `ResourceId`, `ResourceType`, `SubjectId`, `SubjectType`, `Metadata(<key>)`. `gts_id` / `status` / `corrects_id` deliberately omitted (degenerate or plugin-internal).
-  - `AggregationSpec` — `op` + ordered `group_by`; empty `group_by` = single-scalar result.
-  - `AggregationBucket` — `key: Vec<String>` (in `group_by` order; empty for the no-grouping case) and `value: Option<BigDecimal>` (arbitrary precision; wire-encoded as a JSON string; `AVG` may carry a plugin-chosen rounding scale on non-terminating quotients). Each `key` entry is the string form of the corresponding `AggregationDimension` (TenantId → `Uuid::to_string()`, lowercase hyphenated; all others verbatim from the record).
-  - `AggregationResult` — `Vec<AggregationBucket>`.
-  - RawQuery — `gts_id` is REQUIRED.
-  - `UsageRecordFilterField` — macro-generated by `#[derive(ODataFilterable)]` on the SDK-side schema struct `UsageRecordQuery` (fixed fields: `gts_id`, `tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`, `corrects_id`, `status`). Implements `toolkit_odata::filter::FilterField`; plugins bind it to storage columns via a `FieldToColumn<UsageRecordFilterField>` mapper next to their entity definition.
-  - `MetadataFilter` — typed side channel for dynamic `UsageRecord.metadata` JSON-key filtering (one slice entry per declared metadata key; AND across entries, OR within `values()`). The OData filter surface in `toolkit-odata` cannot express filtering on `serde_json::Value` map keys, so per-UsageType declared keys ride this parameter rather than the `ODataQuery`.
-  - `Keyset` — canonical `(created_at, id)` sort tuple consumed by the toolkit cursor envelope for raw-read pagination.
-  - `PdpConstraint`
-  - `SecurityContext`
-  - ResourceRef
+  - [ ] `p1` - `cpt-cf-usage-collector-constraint-plugin-contract-stability`
 
-- **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-query-gateway`
+- **Domain Model Entities**: None — versioning is a contract-evolution rule
+  rather than a domain entity.
 
-- **API**:
-  - POST /usage-collector/v1/records/aggregate
-  - GET /usage-collector/v1/records
+- **Design Components**: None — the stability contract spans the REST
+  surface, the SDK trait, and the Plugin SPI rather than one domain
+  component.
 
-- **Sequences**:
-  - `p1` - `cpt-cf-usage-collector-seq-query-aggregated`
-  - `p2` - `cpt-cf-usage-collector-seq-query-raw`
+- **API**: None — the contract governs how existing endpoints and traits may
+  evolve, not a new endpoint.
 
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
+- **Sequences**: None — none of the six DESIGN Section 3.6 sequences is dedicated to contract stability; the stability guarantee spans the REST, SDK, and Plugin SPI surfaces exercised by all six.
 
-- **Contracts**:
-  - [ ] `p1` - `cpt-cf-usage-collector-contract-downstream-usage-reader`
+- **Data**: None (see §1 Overview).
 
-### 2.5 Event Deactivation — MEDIUM
+### 2.14 [Operational Visibility & Telemetry](feature-operational-visibility/) - MEDIUM
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-event-deactivation`
+- [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-operational-visibility`
 
-- **Purpose**: Provide the PDP-authorized error-retraction path that flips a single previously emitted record's `status` column from `active` to `inactive` without mutating any other property, realizing immutability-via-deactivation rather than in-place edits or hard deletion. Deactivation applies uniformly to any `UsageRecord` — both usage rows (`corrects_id IS NULL`) and compensation rows (`corrects_id IS NOT NULL`) — and when the target row is a usage row, it triggers a **depth-1 cascade** that, within the same atomic storage-layer transition, flips every currently-active compensation row whose `corrects_id` equals the target row's id from `active` to `inactive` (see the cross-link to [§2.6](#26-compensation--medium) Compensation below). The Deactivation Handler receives the operator's already-resolved `SecurityContext` (populated upstream by the ToolKit gateway on REST via `OperationBuilder::authenticated()` or supplied directly to the SDK), runs the request through the per-component PDP authorization helper against `cpt-cf-usage-collector-contract-authz-resolver` fail-closed, and issues a status-only atomic transition through the Plugin SPI's `deactivate_usage_record` capability so the plugin can enforce monotonicity at the storage layer. Inactive records remain queryable through the Query Gateway, preserving auditable history for downstream consumers while the substrate stays free of mutable-record patterns.
+- **Purpose**: Integrates ingestion latency, ingestion error rate, query
+  latency, PDP error rate, storage-plugin readiness, and GTS type resolution
+  failure and cache-staleness metrics into shared platform dashboards and
+  alert routing, and emits a structured, correlation-tagged log entry for
+  every accepted and rejected operation, pushed via OTLP from the platform's
+  global meter provider.
 
-- **Depends On**: `cpt-cf-usage-collector-feature-foundation`, `cpt-cf-usage-collector-feature-usage-emission`
+- **Depends On**: `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-usage-query`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-pluggable-storage`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`
 
 - **Scope**:
-  - Deactivation Handler endpoint (`POST /usage-collector/v1/records/{id}/deactivate`) dispatching a status-only transition.
-  - Per-call authentication is owned by the ToolKit gateway upstream of the collector (the gear NEVER consumes `authn-resolver`); per-call PDP authorization runs inline through the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`, fail-closed on PDP unavailability with no synthesized identity and no cached PDP decision.
-  - One-way `active → inactive` `status` column transition on `usage_records`; no other column is mutated. The latch is uniform across both row kinds — neither a usage row (`corrects_id IS NULL`) nor a compensation row (`corrects_id IS NOT NULL`) has a reverse transition.
-  - **Cascade (depth-1 only)**: when the target row is a usage row (`corrects_id IS NULL`), the Plugin SPI's `deactivate_usage_record` capability flips the target row AND every currently-active compensation row whose `corrects_id` equals the target row's id (within the same `(tenant_id, gts_id)` scope) from `active` to `inactive` in **one atomic storage-layer transition**; partial cascades are structurally impossible. The cascade is **depth-1 only** — transitive cascade is out of scope; by the L1 referential rule, no row may carry `corrects_id` targeting a row whose `corrects_id IS NOT NULL`, so deactivating a compensation row is a single-row, no-cascade operation by construction. The success outcome carries `{ primary_id, cascaded_compensation_ids: [...] }`, where `cascaded_compensation_ids` is non-empty only when at least one active referencing compensation row was cascade-flipped. See [§2.6](#26-compensation--medium) Compensation for the producer of the cascaded rows. Cross-link: `cpt-cf-usage-collector-feature-usage-compensation`.
-  - **Concurrency rule**: a compensation submission referencing a row R that arrives while R is being deactivated is rejected by the ingestion-path L1 "referenced record must be active" check; no compensation can be admitted referencing a row that has already left `active`. The rule adds no new lock or coordinator — it depends only on the L1 check inlined in `features/usage-emission.md` and the atomicity of the cascade transition above.
-  - Atomic monotonic transition via the Plugin SPI's `deactivate_usage_record` capability; the plugin returns `Transitioned { primary_id, cascaded_compensation_ids }`, `already-inactive`, or `not-found`, and the handler surfaces each outcome deterministically as a 2xx confirmation or actionable error envelope.
-  - Audit-trail correlation: a request-level correlation identifier is propagated through the deactivation flow so platform gateway and PDP decision logs can be reconciled with gear-level activity.
-  - Preserves queryability of inactive records: inactive rows of either kind (usage rows with `corrects_id IS NULL` and compensation rows with `corrects_id IS NOT NULL`) remain visible to the Query Gateway so downstream consumers can distinguish active from inactive results.
+  - Domain metrics for ingestion latency, ingestion error rate, query
+    latency, PDP error rate, storage-plugin readiness, and GTS type
+    resolution failures and declaration-cache staleness.
+  - Structured logging of every accepted and rejected API operation,
+    carrying the inbound correlation identifier unchanged.
+  - OTLP push emission of operational telemetry via the platform's global
+    `SdkMeterProvider`.
 
 - **Out of scope**:
-  - Reactivation (`inactive → active`) — the Usage Collector does not provide a reactivation operation, and any such request is rejected; the one-way latch is uniform across both row kinds (no reverse transition for cascade-flipped compensation rows either).
-  - Bulk-by-query deactivation — every deactivation targets exactly one **primary** record by `id`; multi-record selection by filter is not offered. (The depth-1 cascade is **not** a bulk-by-filter selection — it is a structurally-bounded set-flip of active compensations whose `corrects_id` equals the primary row's `id`, performed inside the same atomic transition.)
-  - Transitive cascade — the cascade is **depth-1 only**. A compensation row cannot itself be referenced by another `corrects_id`, because L1 rejects any incoming `corrects_id` whose target row has `corrects_id IS NOT NULL`, so deactivating a compensation row produces `cascaded_compensation_ids: []`.
-  - Counter value-reversal (refunds, credits, credit-notes, partial releases) — deactivation is **error retraction**, not value-reversal. Caller-driven value-reversal is owned by [§2.6](#26-compensation--medium) Compensation; computing refunds/credits/credit-notes/quota remains a downstream-consumer responsibility per the un-policed-net stance in `cpt-cf-usage-collector-adr-usage-compensation`.
-  - Field edits of any kind other than the `status` column — no value, timestamp, metadata, tenant, resource, subject, UsageType, `corrects_id`, or idempotency-key mutation is permitted after acceptance.
-  - Hard deletion of `usage_records` rows — inactive records of either kind (usage rows and compensation rows) remain queryable; physical retention and purge are owned by the active storage plugin and operator deployment profile, subject to the strict key-preservation obligation that retention may reclaim or purge record bodies but MUST NOT free the `(tenant_id, gts_id, idempotency_key, created_at)` dedup key tuple, which the plugin preserves permanently.
-  - Gear-local audit event emission for the deactivate operation — owned by the platform gateway access log and PDP decision logs; per-record audit-ledger emission inside the gear is explicitly deferred.
-  - Write paths for usage record ingestion, idempotency dedup and conflict rejection (exact-equality retries silently absorbed; canonical-field mismatches rejected as `idempotency_conflict`), counter / gauge semantics enforcement, the four-cell value-sign matrix, the L1 `corrects_id` referential checks, and `RecordMetadata` size-cap enforcement — owned by [§2.3](#23-usage-emission-high) Usage Emission (with the compensation flow inlined there) and [§2.6](#26-compensation--medium) Compensation.
-  - Aggregated and raw read-path query execution, SUM-nets aggregation, and PDP-constraint composition — owned by [§2.4](#24-usage-query-medium) Usage Query (which continues to return inactive records of either kind — usage rows and compensation rows — as part of its scope).
-  - UsageType registration, deletion, and catalog mutation — owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle.
-  - Plugin host lifecycle, shared PDP authorization helper definition, REST / SDK / Plugin SPI surface declaration, and deployment topology — owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Gear Foundation & Pluggable Storage.
+  - Definition of the numeric thresholds those metrics are measured against
+    (covered by throughput, latency, and availability SLOs, and by the
+    consistency and freshness contract).
+  - Consumer-side stall detection, which reads the watermarks reconciliation
+    metadata exposes but is not performed by this gear.
 
 - **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-event-deactivation`
-  - [ ] `p1` - `cpt-cf-usage-collector-nfr-availability`
+
+  - [ ] `p1` - `cpt-cf-usage-collector-nfr-operational-visibility`
 
 - **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-monotonic-deactivation`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-fail-closed`
 
-- **Design Constraints Covered**:
-  - `p2` - `cpt-cf-usage-collector-adr-monotonic-deactivation`
-  - `p2` - `cpt-cf-usage-collector-adr-usage-compensation` (depth-1 cascade boundary — compensating a compensation is structurally forbidden, so deactivating a `compensation` row never cascades)
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-no-business-logic`
+  - [x] `p1` - `cpt-cf-usage-collector-principle-otlp-push-emission`
 
-- **Domain Model Entities**:
-  - UsageRecord — only the `status` column is transitioned; all other properties (including `corrects_id`) are immutable after acceptance. Presence of `corrects_id` is the sole structural discriminator between a usage row and a compensation row and determines whether cascade evaluation runs (only when `corrects_id IS NULL`).
-  - UsageRecordStatus
-  - `SecurityContext`
+- **Design Constraints Covered**: None — none of the six §2.2 constraints
+  binds telemetry uniquely; it observes the other features' behavior rather
+  than constraining the architecture itself.
 
-- **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-deactivation-handler`
+- **Domain Model Entities**: None — telemetry is emitted about domain
+  operations rather than modeled as a domain entity.
 
-- **API**:
-  - POST /usage-collector/v1/records/{id}/deactivate
+- **Design Components**: None — metrics and logs are emitted from every
+  component rather than owned by one.
 
-- **Sequences**:
-  - `p1` - `cpt-cf-usage-collector-seq-deactivate-event` (depth-1 cascade committed atomically inside the plugin transaction; the SDK / REST surface returns no body — successful deactivation is `Ok(())` (HTTP 204), per the cross-link in [§2.6](#26-compensation--medium) Compensation)
+- **API**: None — telemetry is emitted alongside existing endpoints, not
+  exposed as one.
 
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
+- **Sequences**: None — none of the six DESIGN Section 3.6 sequences is dedicated to operational visibility; telemetry is emitted as a cross-cutting step inside each of them.
 
-### 2.6 Compensation — MEDIUM
+- **Data**: None (see §1 Overview).
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-usage-compensation`
-
-- **Purpose**: Provide the append-only **counter value-reversal** primitive that lets an authorized caller gear record a real-world give-back (capacity refund, partial cancellation, dispute resolution, billing-period correction) as a signed-negative compensation row, structurally a `UsageRecord` with `corrects_id` set, that references a prior usage row (a `UsageRecord` with `corrects_id IS NULL`). The entry rides the **existing unified ingestion path** (the same REST endpoint, SDK method, and Plugin SPI `persist` capability as ordinary emission — there is NO dedicated `compensate` REST path, SDK method, or SPI call); it is recorded under PDP attribution and a mandatory caller-supplied idempotency key, and is netted into `SUM` aggregations without modifying or annotating the original usage row. Compensation is **recording, not computing**: the Usage Collector never decides refunds, credits, credit-notes, quotas, lots, or per-record remaining amounts, and never enforces non-negative net (per the un-policed-net stance in `cpt-cf-usage-collector-adr-usage-compensation`). The compensation flow is **inlined inside `features/usage-emission.md`** (under §2 Actor Flows, flow ID `cpt-cf-usage-collector-flow-usage-emission-compensation`); there is NO standalone `features/usage-compensation.md` file.
-
-- **Depends On**: `cpt-cf-usage-collector-feature-foundation`, `cpt-cf-usage-collector-feature-usage-type-lifecycle`, `cpt-cf-usage-collector-feature-usage-emission`
-
-- **Scope**:
-  - Unified ingestion path: every compensation emit flows through `POST /usage-collector/v1/records` and the same SDK emit method as ordinary usage, dispatched through `cpt-cf-usage-collector-component-ingestion-gateway` and persisted via the Plugin SPI's existing `persist` capability (which carries signed `value` and an optional `corrects_id`).
-  - Structural discrimination: a compensation row is a `UsageRecord` with `corrects_id` set; a usage row is a `UsageRecord` with `corrects_id IS NULL`. Presence of `corrects_id` is the sole structural discriminator between the two on every emit.
-  - Four-cell value-sign matrix (enforced at validation time by the semantics-enforcement-on-ingest algorithm): counter with `corrects_id IS NULL` requires `value >= 0`; counter with `corrects_id` set requires `value < 0` (strictly negative); gauge with `corrects_id IS NULL` accepts any signed value; gauge with `corrects_id` set is **REJECTED** before persistence with `gauge_compensation_rejected` (compensation is counter-only).
-  - L1 `corrects_id` referential checks (synchronous, on the ingestion path): the referenced row MUST exist (else `corrects_id_not_found`), MUST itself be a usage row (i.e. `corrects_id IS NULL`; otherwise `corrects_id_targets_compensation`), MUST share the full identity tuple `(tenant_id, gts_id, resource_ref, subject_ref)` with the incoming compensation — `subject_ref` presence is part of the identity (`None` vs `Some(_)` is a scope mismatch) — (else `corrects_id_wrong_scope`), and MUST be `status = active` (else `corrects_id_inactive`). There is NO L2 layer — no per-record remaining-amount tracking, no lot / FIFO-LIFO state, no negative-net detection.
-  - PDP attribution and mandatory caller-supplied idempotency key: unchanged from ordinary ingestion. Mandatory idempotency makes retries safe end-to-end and prevents double-refund for free.
-  - Concurrency rule: a compensation referencing usage row R that arrives while R is being deactivated is rejected by the L1 "referenced record must be active" check, surfaced on the wire as `Conflict` (`context.reason="CORRECTS_ID_INACTIVE"`, HTTP `409`) per the `usage-collector-v1.yaml` `context.reason` taxonomy and `sdk-trait.md` `ConflictReason::CorrectsIdInactive`; no quarantine, no retry queue, no compensating-cascade for the rejection (the caller retries at its own discretion, made safe by the mandatory idempotency key).
-  - SUM-nets aggregation contract (consumed by [§2.4](#24-usage-query-medium) Usage Query and implemented by the Plugin SPI's aggregation capability): `SUM(value)` nets across active rows of both kinds — usage rows (`corrects_id IS NULL`) and compensation rows (`corrects_id IS NOT NULL`) — treating `value` as signed, so `SUM` is the signed net total per `(tenant_id, gts_id)` group. `COUNT`, `MIN`, `MAX`, and `AVG` operate over active rows `WHERE corrects_id IS NULL` — **compensation rows adjust SUM; they are not events.** Status filtering is orthogonal to the structural discrimination — deactivated rows of either kind are excluded before aggregation.
-  - Persistence through the Plugin SPI's `persist` capability writes the signed `value` and the nullable `corrects_id` column atomically with the existing dedup composite `(tenant_id, gts_id, idempotency_key, created_at)`; the plugin enforces structural constraints only (schema shape, idempotency-key uniqueness, atomicity, value-sign matrix) and MUST NOT re-execute the caller's L1 checks.
-  - Cascade-coupling with Event Deactivation: when a usage row (`corrects_id IS NULL`) is deactivated, every currently-active compensation row whose `corrects_id` equals that row's id is cascade-flipped to `inactive` in the same atomic Plugin SPI transition — the producer of those rows is this capability; the depth-1 cascade itself is owned by [§2.5](#25-event-deactivation--medium) Event Deactivation.
-
-- **Out of scope**:
-  - Compensating a compensation — forbidden by `cpt-cf-usage-collector-adr-usage-compensation` non-goals; `corrects_id` MUST reference a row whose `corrects_id IS NULL`. An incoming `corrects_id` whose target row has `corrects_id IS NOT NULL` is rejected at L1 with `corrects_id_targets_compensation`, which is what bounds the deactivation cascade to depth-1.
-  - Positive or signed compensations — the value-sign matrix REQUIRES `value < 0` for `counter + compensation` and REJECTS any `compensation` against a gauge UsageType. There is no "positive compensation" code path.
-  - L2 enforcement / per-record remaining-amount tracking — no remaining-amount column on `usage_records`, no per-lot ledger, no FIFO/LIFO accounting; mandatory idempotency replaces any need for "remaining amount" arithmetic.
-  - Negative-net detection or alerting — the Usage Collector does NOT validate non-negative net and does NOT emit a negative-net detection signal per the un-policed-net stance in `cpt-cf-usage-collector-adr-usage-compensation`; downstream consumers own any "net can't be negative" policy.
-  - Lot / FIFO-LIFO tracking — out of scope for the metering substrate.
-  - Computing refunds, credits, credit-notes, or quota balances — explicitly owned by downstream consumers; the Usage Collector records what the caller gear decides to apply, never computes one itself.
-  - Gauge compensation — REJECTED at validation per the value matrix; gauges only carry point-in-time `usage` values.
-  - A dedicated `compensate` REST endpoint, SDK method, or Plugin SPI call — explicitly out of scope per the locked `api_shape = single ingestion path`. Compensation rides the unified ingestion path.
-  - A separate `features/usage-compensation.md` document — explicitly out of scope per the locked `feature_doc_shape = inline-in-emission`. The compensation flow is inlined inside `features/usage-emission.md` (flow ID `cpt-cf-usage-collector-flow-usage-emission-compensation`).
-  - Event-driven `active → inactive` deactivation (the one-way `status` latch and its depth-1 cascade) — owned by [§2.5](#25-event-deactivation--medium) Event Deactivation. This capability is the **producer** of the rows the cascade flips, not the cascade owner.
-  - Aggregated and raw read-path query execution — owned by [§2.4](#24-usage-query-medium) Usage Query; this capability defines the SUM-nets / usage-only aggregation **contract** the query path consumes, but the query execution itself lives there.
-  - UsageType registration, deletion, and catalog mutation — owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle; the compensation flow only reads the catalog to confirm the target UsageType is a counter.
-  - Plugin host lifecycle, REST / SDK / Plugin SPI surface declaration, and deployment topology — owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Gear Foundation & Pluggable Storage.
-
-- **Requirements Covered**:
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-usage-compensation`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-idempotency` (compensations carry mandatory caller-supplied idempotency keys on the same dedup composite — exact-equality retries silently absorbed, canonical-field mismatches rejected as `idempotency_conflict`)
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-ingestion-authorization` (compensations are PDP-authorized on the same attribution tuple as ordinary emissions)
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-counter-semantics` (compensation is counter-only — gauge compensation is rejected)
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-tenant-attribution` (compensation MUST share `(tenant_id, gts_id, resource_ref, subject_ref)` with the row it references)
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-resource-attribution`
-  - [ ] `p1` - `cpt-cf-usage-collector-fr-subject-attribution`
-
-- **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-idempotency-by-key`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-semantics-enforcement`
-  - [ ] `p2` - `cpt-cf-usage-collector-principle-fail-closed`
-
-- **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-usage-collector-constraint-no-business-logic` (recording, not computing — symmetric with `+value` recording)
-  - `p2` - `cpt-cf-usage-collector-adr-usage-compensation`
-  - `p2` - `cpt-cf-usage-collector-adr-mandatory-idempotency`
-  - `p2` - `cpt-cf-usage-collector-adr-caller-supplied-attribution`
-
-- **Domain Model Entities**:
-  - UsageRecord — carries a signed `value` and a nullable `corrects_id` (FK semantic to a same-table row); presence of `corrects_id` is the sole structural discriminator between a usage row (`corrects_id IS NULL`) and a compensation row (`corrects_id IS NOT NULL`). Writer is shared with [§2.3](#23-usage-emission-high) Usage Emission via the unified ingestion path.
-  - UsageType — only counter UsageTypes accept compensation; the counter/gauge predicate via `UsageType::is_counter()` (reads the stored `kind` column) drives the four-cell value-sign matrix.
-  - IdempotencyKey — mandatory, same dedup composite as ordinary ingestion.
-  - ResourceRef
-  - SubjectRef
-  - `SecurityContext`
-
-- **Design Components**:
-  - [ ] `p2` - `cpt-cf-usage-collector-component-ingestion-gateway` (shared with [§2.3](#23-usage-emission-high) Usage Emission via the unified ingestion path; this capability adds `corrects_id`-presence discrimination and the L1 `corrects_id` referential checks inside the same component, never as a separate gateway)
-  - **Validation** (a logical sub-capacity of the ingestion gateway, NOT a new design component): `corrects_id`-presence discrimination, the four-cell value-sign matrix, and the L1 `corrects_id` referential checks (existence ∧ target `corrects_id IS NULL` ∧ same `(tenant_id, gts_id)` ∧ `active`).
-
-- **API**:
-  - POST /usage-collector/v1/records (shared with [§2.3](#23-usage-emission-high) Usage Emission — the unified ingestion endpoint accepts an optional `corrects_id` per record, whose presence structurally distinguishes a compensation row from a usage row; there is NO dedicated `compensate` path)
-
-- **Sequences**:
-  - `p1` - `cpt-cf-usage-collector-seq-emit-usage` (shared with [§2.3](#23-usage-emission-high) Usage Emission — the same sequence carries compensation emissions; the inlined `cpt-cf-usage-collector-flow-usage-emission-compensation` flow under §2 of `features/usage-emission.md` documents the compensation-specific preconditions, validation pipeline, and error scenarios)
-
-- **Data**:
-  - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
-
-- **Feature flow anchor**: the **inlined "Compensation Emission" flow** inside `features/usage-emission.md` under §2 Actor Flows (`cpt-cf-usage-collector-flow-usage-emission-compensation`). There is NO separate `features/usage-compensation.md` file; the compensation flow is documented alongside the ordinary usage emission flow because both ride the same unified ingestion path.
-
-### 2.7 Deliberate Omissions
-
-The following `cpt-cf-usage-collector-*` IDs from the element inventory are intentionally not assigned to any [§2.1](#21-gear-foundation-pluggable-storage-high)..[§2.6](#26-compensation--medium) feature. Each omission is justified by either the kind being a non-implementation artifact (role descriptions, section anchors, PRD-side abstractions) or by an explicit scope boundary stated in DESIGN/PRD.
-
-- `cpt-cf-usage-collector-actor-platform-developer`: PRD-side role description for the platform developer audience; gear surfaces (SDK trait, REST, Plugin SPI) are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation, no actor-specific implementation artifact required.
-- `cpt-cf-usage-collector-actor-platform-operator`: PRD-side role description for the operator audience; operator authority is enforced via the shared PDP authorization helper owned by [§2.1](#21-gear-foundation-pluggable-storage-high), with concrete operator flows (usage-type register/delete, deactivate) already covered by [§2.2](#22-usage-type-catalog-lifecycle-high) and [§2.5](#25-event-deactivation-medium).
-- `cpt-cf-usage-collector-actor-storage-backend`: PRD-side role description for storage-vendor implementors; the Plugin SPI contract surface they implement is owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation.
-- `cpt-cf-usage-collector-actor-tenant-admin`: PRD-side role description for tenant administrators; tenant-scoped read authority is enforced via PDP constraints owned by [§2.4](#24-usage-query-medium) Usage Query and tenant attribution owned by [§2.3](#23-usage-emission-high) Usage Emission.
-- `cpt-cf-usage-collector-actor-usage-consumer`: PRD-side role description for downstream consumers of usage data; the consumer-facing read surface is owned by [§2.4](#24-usage-query-medium) Usage Query via the Query Gateway and the downstream-usage-reader contract.
-- `cpt-cf-usage-collector-actor-usage-source`: PRD-side role description for caller gears emitting usage; the caller-gear write surface is owned by [§2.3](#23-usage-emission-high) Usage Emission.
-- `cpt-cf-usage-collector-design-overview`: Top-level DESIGN.md section anchor; its constituent design elements (components, sequences, principles, entities) are each individually assigned to features [§2.1](#21-gear-foundation-pluggable-storage-high)..[§2.5](#25-event-deactivation-medium).
-- `cpt-cf-usage-collector-design-security-architecture`: DESIGN.md section anchor for the security architecture; constituent principles (`principle-fail-closed`, `principle-pdp-centric-authorization`) and the shared PDP authorization helper definition are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation.
-- `cpt-cf-usage-collector-design-performance-operations-architecture`: DESIGN.md section anchor for performance/operations architecture; constituent NFRs (throughput, latency, workload-isolation) are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation and [§2.3](#23-usage-emission-high) Usage Emission. `cpt-cf-usage-collector-nfr-operational-visibility` is **foundation-owned** ([§2.1](#21-gear-foundation-pluggable-storage-high), which owns the meter bootstrap, naming/label-cardinality contract, and PDP-helper + plugin-host instruments) and realized in per-component **shares** by the features that own each operation's emit points: ingestion instruments by [§2.3](#23-usage-emission-high) Usage Emission, query-gateway instruments by [§2.4](#24-usage-query-medium) Usage Query, deactivation-handler instruments by [§2.5](#25-event-deactivation-medium) Event Deactivation, and the UsageType-catalog instruments by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle. Each such feature DoD references the foundation-owned NFR (a share), and the DESIGN §3.11.5 operational-metric inventory is the authoritative per-component assignment; the shares are cross-feature coverage-by-reference, not duplicated ownership, so they carry no additional §2.2–§2.5 "Requirements Covered" rows.
-- `cpt-cf-usage-collector-design-maintainability-testing-ux-integration`: DESIGN.md section anchor for maintainability/testing/UX/integration architecture; constituent NFRs (developer-operator-experience, documentation-coverage, error-experience) are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation.
-- `cpt-cf-usage-collector-usecase-register-usage-type`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-register-usage-type` owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle; no separate implementation artifact required.
-- `cpt-cf-usage-collector-usecase-delete-usage-type`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-delete-usage-type` owned by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle.
-- `cpt-cf-usage-collector-usecase-emit`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-emit-usage` owned by [§2.3](#23-usage-emission-high) Usage Emission.
-- `cpt-cf-usage-collector-usecase-query-aggregated`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-query-aggregated` owned by [§2.4](#24-usage-query-medium) Usage Query.
-- `cpt-cf-usage-collector-usecase-query-raw`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-query-raw` owned by [§2.4](#24-usage-query-medium) Usage Query.
-- `cpt-cf-usage-collector-usecase-deactivate-event`: PRD-side use case realized 1:1 by `cpt-cf-usage-collector-seq-deactivate-event` owned by [§2.5](#25-event-deactivation-medium) Event Deactivation.
-- `cpt-cf-usage-collector-constraint-pii-identity-layer`: Explicit out-of-scope marker stating PII handling is owned by the platform identity layer, not the Usage Collector; no implementation in this gear.
-- The legacy two-catalog model and uuid5-from-type derivation are retired in favour of `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` (ADR-0012, including its 2026-06-02 amendment): a single plugin-DB catalog managed via SDK/REST, usage records reference UsageTypes via `gts_id` directly, the UsageType specification no longer carries `parent_type_uuid` / `x-uc-indexable` / `abstract`, and `metadata_schema` is replaced by closed `metadata_fields: Vec<String>` (all values typed as String). The gateway dispatches catalog reads directly to the plugin SoR per call and holds no gateway-local catalog state.
-- _cpt-cf-usage-collector-seq-boot-seed-declared-usage-types_ (deleted ID, no backticks): **REMOVED** from DESIGN by ADR-0012 (declared-catalog model retired in favor of a single plugin-DB catalog managed via SDK/REST). No boot-time seeding sequence exists; the dropped workstream that owned this sequence under [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation has been retired in this DECOMPOSITION.
+---
 
 ## 3. Feature Dependencies
 
 ```text
-cpt-cf-usage-collector-feature-foundation
-    │
-    ├─→ cpt-cf-usage-collector-feature-usage-type-lifecycle
-    │       │
-    │       ├─→ cpt-cf-usage-collector-feature-usage-emission        (also ← foundation)
-    │       │       │
-    │       │       ├─→ cpt-cf-usage-collector-feature-usage-compensation   (also ← foundation, usage-type-lifecycle)
-    │       │       │         │
-    │       │       │         └─→ cpt-cf-usage-collector-feature-usage-query   (SUM-nets aggregation contract)
-    │       │       │
-    │       │       ├─→ cpt-cf-usage-collector-feature-usage-query           (also ← foundation, usage-type-lifecycle)
-    │       │       │
-    │       │       └─→ cpt-cf-usage-collector-feature-event-deactivation    (also ← foundation)
-    │       │                 │
-    │       │                 └─ ─ ─depth-1 cascade─ ─ ─→ cpt-cf-usage-collector-feature-usage-compensation
-    │       │
-    │       └─→ (also reached by usage-query and usage-compensation directly for catalog reads)
-```
+cpt-cf-usage-collector-feature-attribution-authorization      (cross-cutting; direct prerequisite for 8 of the other 13 features)
+cpt-cf-usage-collector-feature-usage-type-resolution           (cross-cutting; direct prerequisite for 5: ingestion, invalidation, query, backfill-retention, operational-visibility)
+cpt-cf-usage-collector-feature-pluggable-storage                (cross-cutting; direct prerequisite for 10 of the other 13 -- all but its two foundation peers above and data-classification)
 
-Direct edges captured by the diagram: foundation → {usage-type-lifecycle, usage-emission, usage-query, event-deactivation, usage-compensation}; usage-type-lifecycle → {usage-emission, usage-query, usage-compensation}; usage-emission → {usage-query, event-deactivation, usage-compensation}; usage-compensation → usage-query (SUM-nets aggregation contract); event-deactivation ⇢ usage-compensation (depth-1 cascade — operational coupling, not a feature-implementation prerequisite, because deactivation operates on rows produced by compensation but does not require the compensation capability to be implemented first; the cascade is a no-op when no compensation row exists).
+(the three foundation features above, jointly)
+    |
+    +-- cpt-cf-usage-collector-feature-usage-record-ingestion
+            |
+            +-- cpt-cf-usage-collector-feature-record-invalidation
+            |       |
+            |       +-- cpt-cf-usage-collector-feature-usage-query
+            |               |
+            |               +-- cpt-cf-usage-collector-feature-rate-limiting-reconciliation
+            |               +-- cpt-cf-usage-collector-feature-throughput-latency-availability
+            |               +-- cpt-cf-usage-collector-feature-operational-visibility
+            |
+            +-- cpt-cf-usage-collector-feature-backfill-retention
+                    |
+                    +-- cpt-cf-usage-collector-feature-usage-feed (also <- record-invalidation; numbered ahead of backfill-retention but depends forward on it -- see rationale)
+                            |
+                            +-- cpt-cf-usage-collector-feature-consistency-freshness-contract (also <- usage-query)
+                            +-- cpt-cf-usage-collector-feature-contract-stability (also <- usage-query)
+
+cpt-cf-usage-collector-feature-attribution-authorization (repeated from the top of this diagram, where its full fan-out of 8 is stated; only the data-classification edge is drawn here)
+    |
+    +-- cpt-cf-usage-collector-feature-data-classification (attribution-authorization is its only prerequisite, and it is the only non-foundation feature that does not depend on pluggable-storage)
+```
 
 **Dependency Rationale**:
 
-- `cpt-cf-usage-collector-feature-usage-type-lifecycle` requires `cpt-cf-usage-collector-feature-foundation`: the catalog mutation flow needs the substrate's Plugin SPI (to persist UsageType definitions), the shared PDP authorization helper (to gate operator authority against `cpt-cf-usage-collector-contract-authz-resolver`), and the GTS Registry contract (to resolve the configured plugin binding) — all owned by Foundation.
-- `cpt-cf-usage-collector-feature-usage-emission` requires `cpt-cf-usage-collector-feature-foundation`: the ingestion path uses the Plugin SPI for durable persistence and the shared PDP authorization helper (against `cpt-cf-usage-collector-contract-authz-resolver`) for per-call attribution authorization, both owned by Foundation.
-- `cpt-cf-usage-collector-feature-usage-emission` requires `cpt-cf-usage-collector-feature-usage-type-lifecycle`: every accepted emit consults the Usage Type Catalog for UsageType existence and semantics enforcement before plugin dispatch, so the Usage Type Catalog owned by Usage Type Lifecycle must exist first.
-- `cpt-cf-usage-collector-feature-usage-query` requires `cpt-cf-usage-collector-feature-foundation`: the Query Gateway anchors every read on the resolved `SecurityContext` and composes user-supplied filters with `PdpConstraint`s returned by the shared PDP authorization helper (against `cpt-cf-usage-collector-contract-authz-resolver`), both owned by Foundation, and dispatches reads through the Plugin SPI binding.
-- `cpt-cf-usage-collector-feature-usage-query` requires `cpt-cf-usage-collector-feature-usage-type-lifecycle`: the aggregated path validates the mandatory single-UsageType filter against the Usage Type Catalog on every request, dispatching `get_usage_type` directly against the storage plugin SPI and rejecting unregistered UsageType references before plugin aggregate / raw dispatch — the read-side surface of `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics` (the FR's authoritative ingest-time rejection is owned by [§2.3](#23-usage-emission-high) Usage Emission).
-- `cpt-cf-usage-collector-feature-usage-query` requires `cpt-cf-usage-collector-feature-usage-emission`: aggregated and raw reads scan the `usage_records` table that is written exclusively by the ingestion path — there is nothing to read until Usage Emission has accepted records.
-- `cpt-cf-usage-collector-feature-usage-query` requires `cpt-cf-usage-collector-feature-usage-compensation`: the SUM-nets aggregation contract (signed `SUM` nets across active rows of both kinds — usage rows (`corrects_id IS NULL`) and compensation rows (`corrects_id IS NOT NULL`); `COUNT/MIN/MAX/AVG` operate over active rows `WHERE corrects_id IS NULL` — "compensation rows adjust SUM; they are not events") is defined by Compensation and consumed by the Query Gateway's aggregation path. Without Compensation's value-sign semantics and `corrects_id`-presence discriminator, the Query Gateway cannot realize SUM-nets aggregation.
-- `cpt-cf-usage-collector-feature-event-deactivation` requires `cpt-cf-usage-collector-feature-foundation`: the Deactivation Handler receives the operator's already-resolved `SecurityContext` (populated upstream by the ToolKit gateway via `OperationBuilder::authenticated()` on REST or supplied directly to the SDK; the gear NEVER consumes `authn-resolver`) and authorizes the transition inline through the shared PDP authorization helper against `cpt-cf-usage-collector-contract-authz-resolver`, both owned by Foundation, and dispatches the status-only transition through the Plugin SPI binding.
-- `cpt-cf-usage-collector-feature-event-deactivation` requires `cpt-cf-usage-collector-feature-usage-emission`: the one-way `active → inactive` `status`-column transition targets exactly one **primary** row in `usage_records`, which is written exclusively by Usage Emission — no row can be deactivated until it has first been ingested.
-- `cpt-cf-usage-collector-feature-event-deactivation` is coupled to `cpt-cf-usage-collector-feature-usage-compensation` via the **depth-1 cascade**: when the primary row is a usage row (`corrects_id IS NULL`), the Plugin SPI's `deactivate_usage_record` capability cascade-flips every currently-active compensation row whose `corrects_id` equals the primary row's id (within the same `(tenant_id, gts_id)` scope) from `active` to `inactive` in the same atomic transition. This is a **runtime coupling**, not a hard implementation-prerequisite: deactivation MAY ship before Compensation's writer surface is exercised (the cascade is structurally a no-op when no compensation rows exist), but the cascade outcome shape (`{ primary_id, cascaded_compensation_ids: [...] }`) is jointly owned by both capabilities. The structural depth-1 bound comes from `cpt-cf-usage-collector-adr-usage-compensation` (a `corrects_id` cannot target a row with `corrects_id IS NOT NULL`), not from a runtime check.
-- `cpt-cf-usage-collector-feature-usage-compensation` requires `cpt-cf-usage-collector-feature-foundation`: the compensation flow rides the unified ingestion path through the shared PDP authorization helper (against `cpt-cf-usage-collector-contract-authz-resolver`) and the Plugin SPI's existing `persist` capability, both owned by Foundation.
-- `cpt-cf-usage-collector-feature-usage-compensation` requires `cpt-cf-usage-collector-feature-usage-type-lifecycle`: the four-cell value-sign matrix needs the target UsageType's counter-or-gauge semantics (compensation is counter-only — `gauge + compensation` is rejected before persistence), consulted via the Usage Type Catalog projection on every compensation emit.
-- `cpt-cf-usage-collector-feature-usage-compensation` requires `cpt-cf-usage-collector-feature-usage-emission`: compensation rides the **same unified ingestion path** (the Ingestion Gateway component, the same REST endpoint, the same SDK emit method, the same Plugin SPI `persist` capability) as ordinary emission — it extends Usage Emission's writer surface by relying on the optional `corrects_id` column to mark a compensation row; it does not introduce a parallel writer surface. The L1 `corrects_id` referential check requires that the referenced usage row (a row with `corrects_id IS NULL`) already exists, so the writer side of Usage Emission must be operational before any compensation can be recorded.
-- `cpt-cf-usage-collector-feature-usage-compensation` and `cpt-cf-usage-collector-feature-event-deactivation` are mutually independent **as capability implementations** but **operationally coupled** at runtime via the depth-1 cascade (described above). Neither requires the other to be implemented first; both extend the same `usage_records` table and Plugin SPI surface owned by Foundation and Usage Emission.
-- `cpt-cf-usage-collector-feature-usage-query` and `cpt-cf-usage-collector-feature-event-deactivation` are independent of each other and can be developed in parallel: they share upstream dependencies on Foundation and Usage Emission but neither produces input consumed by the other (the Query Gateway reads `usage_records` for both `active` and `inactive` rows of either kind — usage rows and compensation rows; the Deactivation Handler writes only the `status` column — possibly across multiple rows in one atomic transition via the depth-1 cascade — and does not depend on any query path).
+- `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`, and
+  `cpt-cf-usage-collector-feature-pluggable-storage` depend on nothing else in
+  this list. Each states a rule that other features consume rather than one
+  that itself needs a prior capability. The PDP gate, the GTS declaration,
+  and the plugin dispatch seam are all independent of how ingestion, query,
+  or the feed later use them. Together they form the foundation tier every
+  other feature is built on. The diagram does not draw a separate arrow from
+  each of these three foundation features to every one of their dependents.
+  Instead it states the dependent count once at the top. Concretely,
+  attribution-authorization directly gates ingestion, invalidation, query,
+  the feed, backfill-retention, rate-limiting-reconciliation,
+  data-classification, and operational-visibility. Usage-type-resolution
+  directly gates ingestion, invalidation, query, backfill-retention, and
+  operational-visibility. Pluggable-storage directly gates every feature
+  below it in the tree except data-classification, which is a data-handling
+  contract rather than a storage-facing code path.
+- `cpt-cf-usage-collector-feature-usage-record-ingestion` depends on all three
+  foundation features. Every accepted **Usage Record** must first pass the
+  PDP-authorized attribution check. It must also resolve its `gts_type_id` to
+  a declaration before validation and identity derivation can run. Then it
+  persists through the Plugin Host's dispatch. Ingestion performs none of
+  this itself (DESIGN §3.4, §3.6 emit-usage sequence).
+- `cpt-cf-usage-collector-feature-record-invalidation` depends on
+  `usage-record-ingestion` because an invalidation entry resolves its target
+  from the same dedup identity. It also reuses the same identity derivation
+  and metadata validation ingestion establishes. It depends on
+  attribution-authorization, usage-type-resolution, and pluggable-storage for
+  the same reasons ingestion does. Every invalidation entry is itself a write
+  that must clear the PDP gate, resolve the target's GTS type, and dispatch
+  through the same plugin.
+- `cpt-cf-usage-collector-feature-usage-query` depends on
+  `usage-record-ingestion` because it reads the entries ingestion writes, and
+  on `record-invalidation` because both read paths share invalidation's
+  entry-type and target-resolution identity. The raw path returns a withdrawn
+  record and its invalidation entry as persisted, applying no fold and
+  marking nothing. Callers therefore interpret `entry_type` and `invalidates`
+  themselves (DESIGN §3.2 Query Gateway). The aggregation path excludes
+  withdrawn pairs, and that exclusion is pushed down to the storage plugin
+  (DESIGN §3.6). It depends on attribution-authorization (PDP constraints
+  applied before any user filter), usage-type-resolution (the declared fold
+  aggregation serves), and pluggable-storage (the plugin executes the
+  query).
+- `cpt-cf-usage-collector-feature-backfill-retention` depends on
+  `usage-record-ingestion` because its validation is identical to the live
+  path except for the past-tolerance it replaces. It depends on
+  `usage-type-resolution` because backfill validation, like the live path,
+  must resolve the entry's `gts_type_id` to its declaration for unit binding
+  and metadata validation. The retention floor formula is `backfill window +
+  operational replay horizon`. The horizon is a fixed deployment parameter
+  the gear does not read (DESIGN §3.8). The per-type value in play is the
+  declared retention policy the storage plugin reads directly from
+  `types-registry` (DESIGN §1.2). It depends on attribution-authorization and
+  pluggable-storage for the same PDP-gating and plugin-dispatch reasons as
+  ingestion. Its relationship to `record-invalidation` is an open coupling,
+  not a resolved dependency. The backfill route also admits invalidation
+  entries (§2.5's own API field). `record-invalidation` owns the invalidation
+  rules applied on that route. `backfill-retention` owns only the route
+  itself, its window bound, and its distinct permission and workload
+  isolation. This decomposition does not resolve the shared path to a
+  one-way dependency. The FEATURE documents for these two features must
+  settle which one delivers the backfill-invalidation variant.
+- `cpt-cf-usage-collector-feature-usage-feed` depends on
+  `usage-record-ingestion` because it replays the same entries. It also
+  depends on `record-invalidation`. A correction must appear at its own feed
+  position immediately after the entry it withdraws, which requires
+  invalidation's target-and-withdrawal semantics. It depends on
+  attribution-authorization and pluggable-storage for the same gating and
+  dispatch reasons as query. It does not depend on usage-type-resolution,
+  because subscription is by caller-declared GTS type rather than by
+  resolving a declaration for read shaping. Uniquely, it also depends on
+  `backfill-retention`, a later-numbered, lower-priority entry. The retention
+  floor is `backfill window + operational replay horizon`, and the backfill
+  window is a value backfill-retention configures. The feed's conformance to
+  that floor therefore depends forward on backfill-retention. The storage
+  plugin still enforces the cursor refusal itself, from what it still holds
+  (DESIGN §3.2 Feed Gateway). This is the one ordering irregularity in the
+  set, already called out in §1 Overview and in this entry's own Depends On
+  field.
+- `cpt-cf-usage-collector-feature-rate-limiting-reconciliation` depends on
+  `usage-record-ingestion` because its per-subject quota is charged on the
+  ingestion path. It also depends on `usage-query`, because reconciliation
+  metadata is served as the Query Gateway's fourth read path (DESIGN §3.5,
+  External Dependencies). It depends on attribution-authorization and
+  pluggable-storage as well. The reconciliation counters and watermarks the
+  Plugin SPI exposes must still clear the PDP gate before a caller can read
+  them.
+- `cpt-cf-usage-collector-feature-data-classification` depends only on
+  `attribution-authorization`. Its three-class data treatment builds directly
+  on attribution's opaque-identifier boundary: tenant, subject, resource, and
+  GTS type reference are never interpreted beyond that boundary. It has no
+  Design Component of its own, so it does not gate or get gated by the
+  ingestion, query, or feed code paths.
+- `cpt-cf-usage-collector-feature-consistency-freshness-contract` depends on
+  `usage-query` and `usage-feed` because it publishes the plugin-agnostic
+  staleness floor and ceiling those two read surfaces must honor. It also
+  depends on `pluggable-storage`, because the per-plugin ceiling it requires
+  is a property the bound plugin, not the gear, must publish.
+- `cpt-cf-usage-collector-feature-throughput-latency-availability` depends on
+  `usage-record-ingestion` and `usage-query`. Its numeric envelope —
+  ingestion latency and throughput, aggregation query latency, workload
+  isolation — is measured directly against those two paths. It also depends
+  on `pluggable-storage`, because the bound plugin's own performance is what
+  the envelope ultimately bounds.
+- `cpt-cf-usage-collector-feature-contract-stability` depends on
+  `usage-record-ingestion`, `usage-query`, `usage-feed`, and
+  `backfill-retention`, because the REST endpoints and SDK trait it
+  stabilizes belong to those four features. It also depends on
+  `pluggable-storage`, because the Plugin SPI is the third public surface the
+  stability contract covers.
+- `cpt-cf-usage-collector-feature-operational-visibility` depends on
+  `usage-record-ingestion`, `usage-query`, `attribution-authorization`,
+  `pluggable-storage`, and `usage-type-resolution`. Its metrics are named
+  directly after those features' failure and latency modes. They cover
+  ingestion latency and error rate, query latency, PDP error rate,
+  storage-plugin readiness, and GTS resolution failure and cache staleness.
+  Each metric needs its source feature defined first.
 
-## 4. Crate Layout & Platform Dependencies
+**Parallelization**:
 
-The Usage Collector ships exactly two first-party crates following the platform-standard `<gear>` + `<gear>-sdk` two-crate layout used by every reference gear (`credstore`, `authn-resolver`, `authz-resolver`). There is no separate `-contracts` crate and no separate `-plugin-api` crate: the consumer SDK trait, the plugin trait, the GTS spec for plugin discovery, the domain models, and the public error enum all live inside the single `usage-collector-sdk` crate alongside each other.
-
-### 4.1 Two-crate layout
-
-- `usage-collector-sdk` (public contract crate):
-  - Purpose: public contract surface consumed in-process by caller gears and downstream readers AND by plugin authors. Single source of truth for the SDK trait, the Plugin trait, the GTS spec, the domain models, and the public error enum.
-  - File layout under `src/`:
-    - `api.rs` — `UsageCollectorClientV1` trait (consumer SDK trait; what gears call via ClientHub).
-    - `plugin_api.rs` — `UsageCollectorPluginV1` trait (what plugin authors implement).
-    - `gts.rs` — GTS spec for plugin discovery and binding (reserved; populated by the plugin-registration step per DESIGN §3.12.9).
-    - `models.rs` — domain data types: `UsageRecord`, `ResourceRef`, `SubjectRef`, `UsageType`, `UsageTypeGtsId`, `IdempotencyKey`, `RecordMetadata`, `PdpDecision`, `PdpConstraint`, `PluginBinding`, `AggregationOp`, `AggregationDimension`, `AggregationSpec`, `AggregationBucket`, `AggregationResult`, `RawQuery`, `UsageRecordQuery` (filterable-field schema fed to `#[derive(ODataFilterable)]`), `UsageRecordFilterField` (the macro-generated enum), `MetadataFilter` (typed side channel for JSON-key filtering), `Keyset`, and related plain Rust types. MUST NOT derive `utoipa::ToSchema`.
-    - `error.rs` — public error enum surfaced through the SDK trait and the Plugin trait.
-    - `lib.rs` — re-exports.
-
-- `usage-collector` (host gear crate):
-  - Purpose: REST machinery, gear wiring, plugin resolution, and the in-process implementation of the SDK trait.
-  - File layout under `src/`:
-    - `gear.rs` — `#[toolkit::gear]` entrypoint, ClientHub wiring, REST route registration.
-    - `config.rs` — gear config.
-    - `domain/service.rs` — business logic, plugin dispatch.
-    - `domain/local_client.rs` — `UsageCollectorLocalClient` implementing `UsageCollectorClientV1`, registered un-scoped into ClientHub for in-process callers via `ctx.client_hub().register::<dyn UsageCollectorClientV1>(...)`.
-    - `domain/error.rs` — internal `DomainError` with `From` bridges to the SDK error enum.
-    - `api/rest/routes.rs` — `OperationBuilder` registrations.
-    - `api/rest/handlers.rs` — thin pass-throughs that call the local client.
-    - `api/rest/dto.rs` — wire DTOs with a `Dto` suffix (e.g. `UsageRecordDto`, `UsageTypeDto`, `AggregationResultDto`), each deriving `serde::Serialize` / `serde::Deserialize` and `utoipa::ToSchema`. Request bodies named for their operation (`CreateUsageRecordsRequest`, `QueryAggregatedUsageRecordsRequest`) are the exception to the suffix convention.
-    - `api/rest/mappers.rs` — explicit `From` / `TryFrom` (or named) functions that convert between domain entities (from `usage-collector-sdk`) and DTOs. Mapping is one-way per direction and never embedded inside handlers.
-    - `infra/` — implementation glue (e.g. `sdk_error_mapping.rs` for translating internal `DomainError` to the public SDK error enum).
-  - OData parsing, gateway-cursor handling (decode / validate / re-issue `CursorV1` over the standardized `(created_at, id)` keyset), and canonical error mapping live in this crate, behind `OperationBuilder` route registrations that produce the runtime-emitted OpenAPI document via `OpenApiRegistryImpl`.
-
-- Concrete-plugin crates (out of scope to implement here; the spec only describes how they plug in): one per backend under `gears/system/usage-collector/plugins/<backend>/` (e.g. `usage-collector-plugin-clickhouse`, `usage-collector-plugin-timescaledb`), depend on `usage-collector-sdk` only — never on the host crate — and are compiled in at the workspace level.
-
-### 4.2 Direct platform dependencies
-
-The crates depend directly on the following ToolKit platform crates (existing edges to storage plugins, the `authz-resolver` consumer SDK, the GTS Registry contract, and the runtime are preserved unchanged):
-
-- `usage-collector-sdk` (public contract crate):
-  - `toolkit` — ToolKit core building blocks consumed by the SDK and Plugin traits.
-  - `toolkit-gts` and `gts`, `gts-macros` — GTS spec macros and runtime used to declare the plugin discovery type system.
-  - `toolkit-security` — `SecurityContext` and related security primitives surfaced through the trait signatures.
-  - `async-trait` — used by the SDK and Plugin trait definitions.
-  - `thiserror` — error enum derivation in `error.rs`.
-  - `serde`, `schemars` — domain-model derives (plain serialization only; no `utoipa::ToSchema`).
-  - `toolkit-odata` — `Page<T>` and `ODataQuery` re-exports plus the `toolkit_odata::filter::FilterField` trait that the macro-generated `UsageRecordFilterField` enum implements.
-  - `toolkit-odata-macros` — provides `#[derive(ODataFilterable)]`, applied to the `UsageRecordQuery` schema struct to generate `UsageRecordFilterField` and its `FilterField` impl. Plugin impl crates supply the `FieldToColumn<UsageRecordFilterField>` mapper.
-
-  The SDK crate does **NOT** depend on `toolkit-canonical-errors`. Consumers pattern-match `UsageCollectorError` variants directly; the lift to `toolkit_canonical_errors::CanonicalError` lives in the host crate at `usage-collector/src/infra/sdk_error_mapping.rs`. This mirrors the platform standard set by `account-management-sdk`, `credstore-sdk`, `authn-resolver-sdk`, and `authz-resolver-sdk`: SDK crates publish a flat gear-specific error enum (via `thiserror::Error`) and never take a dependency on the canonical-errors envelope crate.
-
-- `usage-collector` (host gear crate):
-  - `usage-collector-sdk` — the public contract crate (path dependency).
-  - `toolkit` — ToolKit core building blocks for gear wiring and REST registration.
-  - `toolkit-canonical-errors` — provides the canonical `Problem` error envelope. The host crate's `infra/sdk_error_mapping.rs` lifts `UsageCollectorError` (from the SDK) into `toolkit_canonical_errors::CanonicalError`, whose built-in `IntoResponse` produces the RFC-9457 `Problem` response. The typed `ValidationReason` / `ConflictReason` discriminators carried by the SDK variants ride onto `field_violations[].reason` (400) and `context.reason` (409) through this lift, not the platform crate.
-  - `toolkit-odata` — `Page<T>` re-export and OData query parsing (`$filter`, `$orderby`, `$top`, `cursor`), plus `toolkit_odata::validate_cursor_against` for cursor binding checks.
-  - `types-registry-sdk` — GTS instance and type registry lookups (`TypesRegistryClient::list_instances`) consumed by the host's `GtsPluginSelector` lazily on the first dispatch after the `types-registry` is consistent (single-flight `get_or_init`, cached for the `Service`'s lifetime); binding changes require a gear restart.
-  - `toolkit-security` — `SecurityContext` propagation across REST handlers and the local client.
-  - `axum`, `tokio`, and other standard runtime / HTTP dependencies.
-
-### 4.3 Plugin discovery and dispatch
-
-Plugin discovery follows the platform-standard `PluginV1<P>` + `types-registry` + `ClientHub` pattern shared with `credstore`, `authn-resolver`, and `authz-resolver`, and DESIGN §3.5 "Plugin Resolution and Dispatch". The lifecycle has four steps; the host crate has no compile-time dependency on any concrete plugin crate, so binding is purely a runtime concern resolved through `types-registry` + `ClientHub`.
-
-1. **SDK declares the GTS spec**: `usage-collector-sdk/src/gts.rs` declares the unit-struct `UsageCollectorPluginSpecV1` via `#[gts_type_schema(base = PluginV1, schema_id = "gts.cf.toolkit.plugins.plugin.v1~cf.core.uc.plugin.v1~", description = "Usage Collector plugin specification", properties = "")]`. The empty `properties = ""` is intentional — instance metadata (`vendor`, `priority`) is carried by the `PluginV1<P>` base type and is not duplicated in the usage-collector-specific spec.
-2. **Plugin `init()` publishes the instance**: each `usage-collector-plugin-<backend>` crate's `#[toolkit::gear]` `init(...)` calls `PluginV1::<UsageCollectorPluginSpecV1>::build_registration("<vendor>.<package>.usage_collector_plugin.v1", cfg.vendor, cfg.priority)?` to assemble the `(instance_id, payload)` pair, registers the payload through `ctx.client_hub().get::<dyn TypesRegistryClient>()?.register(vec![payload]).await?` (gated by `RegisterResult::ensure_all_ok`), and registers the trait object via `ctx.client_hub().register_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(&instance_id), api)`.
-3. **Host resolves and caches the bound instance**: the host's `cpt-cf-usage-collector-component-plugin-host` (in `usage-collector/src/domain/service.rs`) holds a `GtsPluginSelector` that lazily resolves the bound plugin instance — it queries `types-registry` with `UsageCollectorPluginSpecV1::gts_schema_id()` for the pattern `gts.cf.toolkit.plugins.plugin.v1~cf.core.uc.plugin.v1~*`, then calls `choose_plugin_instance::<UsageCollectorPluginSpecV1>(&self.vendor, instances)` to pick the lowest-priority match for the configured `[usage_collector].vendor`. The resolved `GtsInstanceId` is cached in the selector for the `Service`'s lifetime.
-4. **Per-request dispatch is an in-memory scoped lookup**: each ingestion / query / deactivation / UsageType-lifecycle call resolves the bound plugin by `self.hub.try_get_scoped::<dyn UsageCollectorPluginV1>(&ClientScope::gts_id(instance_id.as_ref()))` and dispatches against the returned `Arc<dyn UsageCollectorPluginV1>`. There is no `types-registry` round-trip on the warm path; a cold-path lookup (first call after bootstrap, or after a binding refresh) executes the selector's resolution + caches the result.
-
-Compile-time linkage is static at the workspace level: plugin crates are built as part of the same Cargo workspace and registered with ToolKit via `#[toolkit::gear]` at startup, but the host `usage-collector` crate depends only on `usage-collector-sdk` and `types-registry-sdk` — never on a concrete `usage-collector-plugin-<backend>` crate. Adding or swapping a plugin is a workspace-build + config-vendor change, not a host-crate change.
-
-## 5. Document Changelog
-
-| Version | Date       | Author          | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0.5.0   | 2026-07-17 | usage-collector | Cascaded ADR-0014 (`cpt-cf-usage-collector-adr-created-at-in-dedup-identity`) into the decomposition. Dedup key is now the 4-tuple `(tenant_id, gts_id, idempotency_key, created_at)`; `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`; `created_at` removed from the canonical-field conflict comparison set (`value`, `resource_ref`, `subject_ref`, `corrects_id`, `metadata`). Same-key/different-`created_at` is a distinct record, not an `idempotency_conflict` Conflict. No component-set or Plugin SPI method-set change. |
-| 0.4.0   | 2026-07-07 | usage-collector | Cascaded `cpt-cf-usage-collector-adr-deterministic-usage-record-id` (ADR-0013) into the decomposition. The usage-record identity is now gateway-derived rather than a client input: `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ idempotency_key)` under the fixed namespace `56313026-863b-4de8-b32b-1f96b67306ed` (`usage_collector_sdk::derive_usage_record_id`), removed from the create request (a stray `id` is rejected `400`), and renamed `uuid → id` throughout (including the `(created_at, id)` keyset tuple and the server-owned `id`/`status` dedup exclusion). Guarantees identity uniqueness by construction and eliminates false idempotency conflicts on exact retries. No change to the component set, the dedup tuple, or the plugin SPI method set. |
-| 0.3.0   | 2026-06-02 | Cypilot Phase 7 | Cascaded the `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` 2026-06-02 amendment (simplifications 5 + 6) into the decomposition. Dropped every `jsonschema` runtime-dependency mention and every `metadata_schema JSONB` / `traits JSONB` / `Draft-07` reference; updated the catalog row to flat `gts_id` + `metadata_fields TEXT[]` + `created_at` (no `kind` column — derived from the `gts_id` prefix); rewrote ingest-time validation prose from "metadata-shape against the compiled validator" to "closed-key membership against the declared `metadata_fields` set" with the Problem `context.reason` now `unknown_metadata_key`; updated the §2.7 ADR-0007/0009/0010 supersession block to call out the amendment explicitly; no ADR-0010 references survive outside that supersession block. |
-| 0.2.0   | 2026-06-02 | Cypilot Phase 4 | Cascaded `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` into the decomposition. Removed the boot-seed-declared-types sequence from [§2.1](#21-gear-foundation--pluggable-storage--high) Foundation; pinned the canonical "Usage Type Catalog" terminology; pinned `gts_id` as the dedup-composite / FK / `corrects_id` scope reference; pruned the type-chain walk / `effective_schema()` / descendant-cascade L1-invalidation work-packages and the `parent_type_uuid` / `x-uc-indexable` / `abstract` complexity attributes from [§2.2](#22-usage-type-catalog--lifecycle--high) Usage Type Catalog & Lifecycle; pinned error variants `UsageTypeAlreadyExists` and `UsageTypeNotFound`; rewrote the [§2.7](#27-deliberate-omissions) ADR-0007/0009/0010 supersession block to point at ADR-0012 and added an omission entry for the removed boot-seed sequence.                                                                                                                            |
+- Tier 0 — `attribution-authorization`, `usage-type-resolution`, and
+  `pluggable-storage` — can be built fully in parallel; none reads the others'
+  output.
+- Tier 1 — `usage-record-ingestion` and `data-classification` — can be built
+  in parallel once tier 0 lands. Data-classification only needs
+  attribution-authorization; ingestion needs all three tier-0 features.
+- Tier 2 — `record-invalidation` and `backfill-retention` — can be built in
+  parallel once ingestion lands. Each reuses ingestion's validation and
+  identity logic independently of the other.
+- Tier 3 — `usage-query` and `usage-feed` — can be built in parallel once
+  their respective tier-2 prerequisites land. Usage-feed's build order still
+  has to wait on `backfill-retention`, not on `usage-query`, so the pair
+  genuinely does not block on each other.
+- Tier 4 — `rate-limiting-reconciliation`, `consistency-freshness-contract`,
+  `throughput-latency-availability`, `contract-stability`, and
+  `operational-visibility` — are all leaf features with no dependents. That
+  is 2.9 and 2.11 through 2.14 in the numbering; 2.10 is tier 1, not tier 4.
+  Nothing in the document builds on top of them, so they can be delivered
+  last, in any order relative to one another. They wait only on their
+  respective tier-1-through-3 prerequisites.

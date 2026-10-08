@@ -9,42 +9,47 @@ fn config_defaults_are_applied() {
     assert_eq!(cfg.pool_size_max, 16);
     assert_eq!(cfg.connection_timeout_secs, 10);
     assert_eq!(cfg.statement_timeout_secs, 30);
-    assert_eq!(cfg.retention_period_secs, 365 * 86_400);
+    assert_eq!(cfg.transaction_timeout_secs, 60);
+    assert_eq!(cfg.chunk_time_interval_secs, 604_800);
+    assert_eq!(cfg.type_key_slice_width, 1);
+    assert_eq!(cfg.retention_sweep_interval_secs, 3_600);
+    assert_eq!(cfg.feed_acceptance_slack_secs, 120);
     assert!(cfg.database_url.expose().is_empty());
 }
 
 #[test]
 fn validate_rejects_empty_database_url() {
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str("{}").unwrap();
-    assert!(cfg.validate().is_err());
+    let json = "{}";
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("an empty database_url must be rejected");
+    assert!(
+        err.contains("database_url"),
+        "the failure must name the field, got: {err}"
+    );
 }
 
 #[test]
 fn validate_rejects_min_gt_max_pool() {
-    let json = r#"{ "database_url": "postgres://x", "pool_size_min": 20, "pool_size_max": 4 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
-    assert!(cfg.validate().is_err());
+    assert!(validate_with(r#""pool_size_min": 20, "pool_size_max": 4"#).is_err());
 }
 
 #[test]
 fn validate_rejects_pool_max_of_one() {
     // A max of 1 self-deadlocks startup: post-migration setup holds the single
-    // connection under an advisory lock while the retention policy tries to
-    // acquire a second, so the pool must allow at least 2.
-    let json = r#"{ "database_url": "postgres://x", "pool_size_min": 1, "pool_size_max": 1 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    // connection under an advisory lock while the partitioning statements run
+    // on a second, so the pool must allow at least 2.
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""pool_size_min": 1, "pool_size_max": 1"#).is_err(),
         "pool_size_max of 1 must be rejected: it self-deadlocks post-migration setup"
     );
 }
 
 #[test]
 fn validate_rejects_zero_connection_timeout() {
-    let json = r#"{ "database_url": "postgres://x", "connection_timeout_secs": 0 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""connection_timeout_secs": 0"#).is_err(),
         "a zero acquire timeout yields a pool that times out immediately"
     );
 }
@@ -54,56 +59,150 @@ fn validate_rejects_zero_statement_timeout() {
     // Postgres treats `statement_timeout = 0` as *disabled* (no bound), which
     // would reintroduce the unbounded-query footgun this setting exists to close,
     // so a zero must be rejected rather than silently disabling the timeout.
-    let json = r#"{ "database_url": "postgres://x", "statement_timeout_secs": 0 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(
-        cfg.validate().is_err(),
+        validate_with(r#""statement_timeout_secs": 0"#).is_err(),
         "a zero statement_timeout disables the bound, leaving request-path queries unbounded"
     );
 }
 
 #[test]
 fn validate_accepts_nonzero_statement_timeout() {
-    let json = r#"{ "database_url": "postgres://x", "statement_timeout_secs": 45 }"#;
+    let json = r#"{ "database_url": "postgres://x",
+                   "statement_timeout_secs": 45 }"#;
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
     assert!(cfg.validate().is_ok());
 }
 
 #[test]
-fn validate_rejects_zero_retention() {
-    let json = r#"{ "database_url": "postgres://x", "retention_period_secs": 0 }"#;
-    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+fn a_transaction_timeout_at_or_below_the_statement_timeout_is_rejected() {
+    // `docs/DESIGN.md` §3.5: transaction_timeout_secs "MUST be greater than
+    // `statement_timeout_secs`; config load rejects a value that is not". The
+    // transaction timer starts no later than the statement timer, so at or below
+    // it the transaction bound always fires first and the *statement* bound is
+    // the one left unreachable. Measured on `timescale/timescaledb:2.29.2-pg18`,
+    // both at 5s over a 10s statement: `FATAL: terminating connection due to
+    // transaction timeout` — the session is terminated, which kills a pooled
+    // connection, where a statement timeout is a cancellable `ERROR`.
+    let mut cfg = valid_config();
+    cfg.statement_timeout_secs = 30;
+    cfg.transaction_timeout_secs = 30;
+    let err = cfg.validate().expect_err("equal timeouts must be rejected");
     assert!(
-        cfg.validate().is_err(),
-        "a zero retention window would drop every chunk immediately"
+        err.contains("transaction_timeout_secs") && err.contains("statement_timeout_secs"),
+        "the failure must name both fields, got: {err}"
     );
 }
 
 #[test]
-fn validate_rejects_excessive_retention() {
-    // A retention so large that `make_interval(secs => ...)` overflows at the
-    // DB would otherwise fail *after* migrations run, as a confusing
-    // post-migration init error. Catch it as a clean config error upfront.
+fn a_transaction_timeout_above_the_statement_timeout_is_accepted() {
+    let mut cfg = valid_config();
+    cfg.statement_timeout_secs = 30;
+    cfg.transaction_timeout_secs = 31;
+    cfg.validate()
+        .expect("a strictly greater transaction timeout is valid");
+}
+
+#[test]
+fn config_rejects_the_retired_replay_horizon_key() {
+    let json = r#"{ "database_url": "postgres://x", "feed_replay_horizon_secs": 3600 }"#;
+    assert!(serde_json::from_str::<TimescaleDbPluginConfig>(json).is_err());
+}
+
+#[test]
+fn a_zero_acceptance_slack_is_rejected() {
+    // Zero does NOT mean "guard disabled". A slack of zero would refuse every
+    // entry whose `accepted_at` is not the INSERT's own `statement_timestamp()`
+    // to the microsecond, which is every entry. Refused here so that reading
+    // cannot be reintroduced by accident.
+    let mut cfg = valid_config();
+    cfg.feed_acceptance_slack_secs = 0;
+    let err = cfg
+        .validate()
+        .expect_err("a zero acceptance slack must be rejected");
+    assert!(
+        err.contains("feed_acceptance_slack_secs"),
+        "the failure must name the field, got: {err}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_chunk_time_interval() {
+    let json = r#"{ "database_url": "postgres://x",
+                   "chunk_time_interval_secs": 0 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a zero-width chunk cannot hold a row"
+    );
+}
+
+#[test]
+fn validate_rejects_a_chunk_time_interval_beyond_the_interval_bound() {
     let json = format!(
-        r#"{{ "database_url": "postgres://x", "retention_period_secs": {} }}"#,
+        r#"{{ "database_url": "postgres://x",
+               "chunk_time_interval_secs": {} }}"#,
         u64::MAX
     );
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
     assert!(
         cfg.validate().is_err(),
-        "an absurd retention window must be rejected before it reaches make_interval"
+        "an interval make_interval cannot hold must fail before it reaches the database"
     );
 }
 
 #[test]
-fn validate_accepts_large_but_sane_retention() {
-    // 10 years is well within make_interval's range and a plausible operator
-    // choice; it must not trip the upper bound.
-    let ten_years = 10u64 * 365 * 86_400;
-    let json =
-        format!(r#"{{ "database_url": "postgres://x", "retention_period_secs": {ten_years} }}"#);
+fn validate_rejects_zero_type_key_slice_width() {
+    let json = r#"{ "database_url": "postgres://x",
+                   "type_key_slice_width": 0 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a slice must hold at least one type key"
+    );
+}
+
+#[test]
+fn validate_rejects_a_type_key_slice_width_wider_than_the_key_type() {
+    let json = r#"{ "database_url": "postgres://x",
+                   "type_key_slice_width": 2147483648 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "type_key is an int; a wider slice is meaningless"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_retention_sweep_interval() {
+    let json = r#"{ "database_url": "postgres://x",
+                   "retention_sweep_interval_secs": 0 }"#;
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.validate().is_err(),
+        "a zero interval would sweep in a hot loop"
+    );
+}
+
+#[test]
+fn validate_rejects_a_retention_sweep_interval_beyond_the_interval_bound() {
+    let json = format!(
+        r#"{{ "database_url": "postgres://x",
+               "retention_sweep_interval_secs": {} }}"#,
+        u64::MAX
+    );
     let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
-    assert!(cfg.validate().is_ok());
+    assert!(
+        cfg.validate().is_err(),
+        "an interval make_interval cannot hold must fail before it reaches the database"
+    );
+}
+
+#[test]
+fn config_rejects_the_retired_table_wide_retention_key() {
+    // Retention is per type now, read from types-registry. A config still
+    // carrying the table-wide window must fail loudly rather than be ignored.
+    let json = r#"{ "database_url": "postgres://x", "retention_period_secs": 31536000 }"#;
+    assert!(serde_json::from_str::<TimescaleDbPluginConfig>(json).is_err());
 }
 
 #[test]
@@ -144,4 +243,94 @@ fn debug_does_not_leak_database_url_password() {
         !dump.contains("sup3r-s3cret"),
         "Debug of the config must not leak the DSN password; got: {dump}"
     );
+}
+
+#[test]
+fn rollup_defaults_are_applied() {
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(cfg.rollup_materialization_lag_secs, 7_200);
+    assert_eq!(cfg.rollup_live_window_secs, 259_200);
+    assert_eq!(cfg.rollup_refresh_interval_secs, 120);
+    assert_eq!(cfg.rollup_history_refresh_interval_secs, 3_600);
+}
+
+/// A config that passes [`TimescaleDbPluginConfig::validate`], for a test that
+/// varies one field and asserts on the outcome.
+///
+/// The helper validates itself, so a test that then gets an `Err` knows the
+/// mutation it made is what produced it.
+fn valid_config() -> TimescaleDbPluginConfig {
+    let cfg: TimescaleDbPluginConfig =
+        serde_json::from_str(r#"{ "database_url": "postgres://u:p@h/db?sslmode=require" }"#)
+            .unwrap();
+    cfg.validate()
+        .expect("the helper must hand back a config that validates");
+    cfg
+}
+
+/// Parse `{ "database_url": "postgres://x", <extra> }` and validate it.
+fn validate_with(extra: &str) -> Result<(), String> {
+    let json = format!(r#"{{ "database_url": "postgres://x", {extra} }}"#);
+    let cfg: TimescaleDbPluginConfig = serde_json::from_str(&json).unwrap();
+    cfg.validate()
+}
+
+#[test]
+fn validate_rejects_a_chunk_interval_that_is_not_whole_hours() {
+    // Every hourly rollup bucket must lie inside one ledger chunk, or the
+    // retention cut cannot delete a bucket without under-counting a neighbour.
+    assert!(validate_with(r#""chunk_time_interval_secs": 5400"#).is_err());
+    assert!(validate_with(r#""chunk_time_interval_secs": 7200"#).is_ok());
+}
+
+#[test]
+fn validate_rejects_a_materialization_lag_that_is_not_whole_hours_or_under_one_hour() {
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 5400"#).is_err());
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 0"#).is_err());
+    assert!(validate_with(r#""rollup_materialization_lag_secs": 3600"#).is_ok());
+}
+
+#[test]
+fn validate_rejects_a_materialization_lag_not_below_the_live_window() {
+    assert!(
+        validate_with(
+            r#""rollup_materialization_lag_secs": 259200, "rollup_live_window_secs": 259200"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_rejects_a_live_window_that_is_not_whole_hours_or_beyond_the_bound() {
+    assert!(
+        validate_with(
+            r#""rollup_live_window_secs": 262800, "rollup_materialization_lag_secs": 3600"#
+        )
+        .is_ok()
+    );
+    assert!(validate_with(r#""rollup_live_window_secs": 260000"#).is_err());
+    assert!(
+        validate_with(&format!(
+            r#""rollup_live_window_secs": {}"#,
+            u64::MAX - (u64::MAX % 3600)
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_rejects_zero_or_unbounded_rollup_refresh_intervals() {
+    for key in [
+        "rollup_refresh_interval_secs",
+        "rollup_history_refresh_interval_secs",
+    ] {
+        assert!(
+            validate_with(&format!(r#""{key}": 0"#)).is_err(),
+            "{key} = 0"
+        );
+        assert!(
+            validate_with(&format!(r#""{key}": {}"#, u64::MAX)).is_err(),
+            "{key} = MAX"
+        );
+    }
 }

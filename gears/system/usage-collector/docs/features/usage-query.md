@@ -1,4 +1,34 @@
-# Feature: Usage Query
+Created:  2026-09-25 by Virtuozzo International GmbH
+Updated:  2026-09-25 by Virtuozzo International GmbH
+
+# Feature: Usage Query — Raw & Aggregated
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-featstatus-usage-query-implemented`
+
+**Task 11 traceability note.** Rollup; stays unticked while any identifier
+under this feature is open (slice 5's F3 / slice 4's E18 precedent). Twenty of
+this document's 28 identifiers tick, each behind a real `@cpt-` marker; eight
+stay open, with owners named at their own sections: the two withdrawn-pair /
+empty-selection DoDs and the exclusion-pushdown algo are the storage plugin's
+(`cpt-cf-usage-collector-feature-pluggable-storage`'s SPI contract, not this
+gear); the read-consistency posture is
+`cpt-cf-usage-collector-feature-consistency-freshness-contract` (feature
+2.11), not scheduled in this programme; `dod-scope-precedes-user-filter` is a
+Step-4a stop (the G17 aggregate-read measurement denied under a
+meter-narrowed grant on every shape driven — closing a route-level hole
+`domain/authz.rs`'s own doc already predicted, not surfacing a new gate-level
+one — which is the owner's to resolve in G17's release note, not this
+task's); and
+`flow-reconcile-aggregate-against-raw` has no gear code of its own to mark —
+every one of its steps is the calling consumer composing the two
+already-ticked read flows.
+
+- [ ] `p1` - `cpt-cf-usage-collector-feature-usage-query`
+
+Delivers the gear's two consumer read surfaces over accepted ledger entries — a
+cursor-paginated raw read that returns persisted fact, and an aggregated read
+that serves the queried meter's declared fold — together with the point lookup
+that reads one entry by its identifier.
 
 <!-- toc -->
 
@@ -7,945 +37,1116 @@
   - [1.2 Purpose](#12-purpose)
   - [1.3 Actors](#13-actors)
   - [1.4 References](#14-references)
-  - [1.5 Explicit Non-Applicability](#15-explicit-non-applicability)
-  - [1.6 Implementation Status](#16-implementation-status)
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
-  - [Query Aggregated](#query-aggregated)
-  - [Query Raw](#query-raw)
+  - [Aggregate One Meter Over a Closed Period](#aggregate-one-meter-over-a-closed-period)
+  - [Page the Raw Ledger for an Audit](#page-the-raw-ledger-for-an-audit)
+  - [Find the Withdrawal of a Known Record](#find-the-withdrawal-of-a-known-record)
+  - [Read One Entry by Its Identifier](#read-one-entry-by-its-identifier)
+  - [Reconcile an Aggregate Against a Locally Folded Raw Read](#reconcile-an-aggregate-against-a-locally-folded-raw-read)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
-  - [Attribution & PDP Authorization (Read Path)](#attribution--pdp-authorization-read-path)
-  - [UsageType Existence & Op-Kind Validation (Aggregated Path)](#usagetype-existence--op-kind-validation-aggregated-path)
-  - [PDP Constraint Composition](#pdp-constraint-composition)
-  - [Plugin SPI Aggregate Dispatch](#plugin-spi-aggregate-dispatch)
-  - [Plugin SPI Raw Page Dispatch](#plugin-spi-raw-page-dispatch)
-  - [Cursor Pagination Orchestration](#cursor-pagination-orchestration)
-  - [Active & Inactive Record Visibility](#active--inactive-record-visibility)
+  - [Admit a Read Request](#admit-a-read-request)
+  - [Select Entries by Covered-Period End](#select-entries-by-covered-period-end)
+  - [Validate the Names a Caller Supplies](#validate-the-names-a-caller-supplies)
+  - [Apply the Declared Fold on the Aggregated Path](#apply-the-declared-fold-on-the-aggregated-path)
+  - [Push the Withdrawn-Pair Exclusion Down to the Plugin](#push-the-withdrawn-pair-exclusion-down-to-the-plugin)
+  - [Project a Ledger Read Without a Fold](#project-a-ledger-read-without-a-fold)
+  - [Own the Raw-Path Cursor End to End](#own-the-raw-path-cursor-end-to-end)
+  - [Resolve a Point Lookup Under the Compiled Scope](#resolve-a-point-lookup-under-the-compiled-scope)
 - [4. States (CDSL)](#4-states-cdsl)
-  - [Query Request Lifecycle State Machine](#query-request-lifecycle-state-machine)
 - [5. Definitions of Done](#5-definitions-of-done)
-  - [FR: Aggregation Rule — SUM Nets, Others Usage Only](#fr-aggregation-rule--sum-nets-others-usage-only)
-  - [FR: Query Aggregation](#fr-query-aggregation)
-  - [FR: Query Raw](#fr-query-raw)
-  - [FR: Tenant Isolation](#fr-tenant-isolation)
-  - [NFR: Query Latency](#nfr-query-latency)
-  - [NFR: Workload Isolation](#nfr-workload-isolation)
-  - [NFR: Operational Visibility (Query-Path Instruments)](#nfr-operational-visibility-query-path-instruments)
-  - [NFR: Authorization](#nfr-authorization)
-  - [Principle: PDP-Centric Authorization](#principle-pdp-centric-authorization)
-  - [Principle: Fail-Closed](#principle-fail-closed)
-  - [Constraint: No Business Logic](#constraint-no-business-logic)
-  - [Constraint: NFR Thresholds](#constraint-nfr-thresholds)
-  - [Component: Query Gateway](#component-query-gateway)
-  - [Sequence: Query Aggregated](#sequence-query-aggregated)
-  - [Sequence: Query Raw](#sequence-query-raw)
-  - [Contract: Downstream Usage Reader](#contract-downstream-usage-reader)
-  - [Entity: AggregationQuery](#entity-aggregationquery)
-  - [Entity: AggregationResult](#entity-aggregationresult)
-  - [Entity: RawQuery](#entity-rawquery)
-  - [Cursor: CursorV1 Toolkit Adoption](#cursor-cursorv1-toolkit-adoption)
-  - [Entity: PdpConstraint](#entity-pdpconstraint)
-  - [Entity: SecurityContext](#entity-securitycontext)
-  - [Entity: ResourceRef](#entity-resourceref)
-  - [API: POST /usage-collector/v1/records/aggregate](#api-post-usage-collectorv1recordsaggregate)
-  - [API: GET /usage-collector/v1/records](#api-get-usage-collectorv1records)
-  - [§2.4-item → DoD-ID Coverage Matrix](#24-item--dod-id-coverage-matrix)
+  - [Mandatory Single Meter and Time Range](#mandatory-single-meter-and-time-range)
+  - [Covered-Period End as the Sole Selection Rule](#covered-period-end-as-the-sole-selection-rule)
+  - [No Aggregation Parameter on Any Surface](#no-aggregation-parameter-on-any-surface)
+  - [Withdrawn Pairs Excluded by the Plugin, Not by the Gear](#withdrawn-pairs-excluded-by-the-plugin-not-by-the-gear)
+  - [Raw Reads Return Withdrawn Pairs as Persisted](#raw-reads-return-withdrawn-pairs-as-persisted)
+  - [Unstripped Field Set on Every Ledger Read](#unstripped-field-set-on-every-ledger-read)
+  - [Caller-Supplied Names Validated Before Dispatch](#caller-supplied-names-validated-before-dispatch)
+  - [Authorized Scope Composed Ahead of Caller Filters](#authorized-scope-composed-ahead-of-caller-filters)
+  - [Gateway-Owned Cursor on the Raw Path](#gateway-owned-cursor-on-the-raw-path)
+  - [Canonical Page on Raw, Non-Paginated Body on Aggregate](#canonical-page-on-raw-non-paginated-body-on-aggregate)
+  - [Point Lookup Returns the Exact Persisted Fact](#point-lookup-returns-the-exact-persisted-fact)
+  - [An Empty Selection Still Answers](#an-empty-selection-still-answers)
+  - [Read Paths Bound by the Published Consistency Floor](#read-paths-bound-by-the-published-consistency-floor)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
-  - [6.1 Endpoints Summary](#61-endpoints-summary)
-  - [6.2 Behavioural Criteria](#62-behavioural-criteria)
 
 <!-- /toc -->
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-featstatus-usage-query`
-
-<!-- reference to DECOMPOSITION entry -->
-
-- [ ] `p2` - `cpt-cf-usage-collector-feature-usage-query`
 
 ## 1. Feature Context
 
 ### 1.1 Overview
 
-Provides the single, PDP-authorized read path into the metering substrate through one Query Gateway that serves two paths:
+A consumer reads the Usage Collector for two different reasons, and this feature
+serves both. An auditor, a dispute handler, or a debugging engineer needs the
+entries themselves, exactly as they were accepted. A dashboard, a quota
+evaluator, or a reconciliation job needs one number per group over a period. The
+first need is the raw read path. The second is the aggregated read path. A third,
+narrower surface belongs here as well: the point lookup that returns one entry by
+its identifier.
 
-- **Aggregated** — `POST /usage-collector/v1/records/aggregate` with mandatory time range, mandatory single UsageType filter, and mandatory aggregation operator. Pushes server-side SUM / COUNT / MIN / MAX / AVG with grouping into the active storage plugin.
-- **Raw** — `GET /usage-collector/v1/records?$filter=...&$orderby=...&$top=...&cursor=...` with mandatory time range expressed as `timestamp ge X and timestamp lt Y` inside `$filter`, optional OData narrowing predicates over the `UsageRecordFilterField` enum, toolkit `CursorV1` continuation decoded and validated at the gateway, and `$top` bounded by the page-size cap.
+All three paths share a preamble. Each authorizes at the policy decision point,
+composes the returned constraints with whatever the caller asked for, resolves
+the queried usage type declaration where it carries one, and dispatches through
+the storage plugin. The aggregated and raw paths also share two mandatory
+parameters: exactly one GTS type reference — the platform identifier naming a
+registry-owned usage type declaration — and one time range.
 
-The `cpt-cf-usage-collector-component-query-gateway` accepts the caller's `SecurityContext` (resolved upstream by the ToolKit gateway on REST as `Extension<SecurityContext>` populated via `OperationBuilder::authenticated()`, or supplied verbatim by the in-process caller on the SDK trait). It authorizes every read through the per-component `access_scope_with` helper wrapping `cpt-cf-usage-collector-contract-authz-resolver` fail-closed.
+**The paths then diverge, and the divergence is the whole point of this
+feature.** The raw path is a ledger read. It returns a withdrawn record *and* the
+invalidation entry that withdraws it, both as persisted. It applies no fold. It
+marks nothing, adds no flag, and suppresses nothing. The caller reads `entry_type`
+and `invalidates` and draws its own conclusion. The aggregated path is a derived
+view. It excludes both entries of every withdrawn pair from the selected set, and
+that exclusion travels down to the storage plugin as part of the query. The gear
+never fetches rows and filters them in memory.
 
-User-supplied filters are composed with PDP-returned constraints so the authorized scope can only narrow. Both `active` and `inactive` `usage_records` within that scope are returned. The gateway fails closed on missing `SecurityContext`, PDP, or plugin unavailability. The write path lives in `cpt-cf-usage-collector-feature-usage-emission`.
+```mermaid
+flowchart TD
+    REQ[Read request naming one GTS type and one time range] --> SCOPE[Compose the authorized scope, then narrow it by caller filters]
+    SCOPE --> SPLIT{Which read path}
+    SPLIT -->|Aggregated| AGGV[Validate grouping dimensions against the declared metadata surface]
+    AGGV --> FOLD[Resolve the declared fold of the queried type]
+    FOLD --> PUSH[Dispatch the fold, the grouping and the withdrawn-pair exclusion to the plugin]
+    PUSH --> AGGR[Non-paginated grouped result in which a withdrawn pair contributed nothing]
+    SPLIT -->|Raw| RAWV[Validate filter operands and decode the caller-supplied cursor]
+    RAWV --> SCAN[Dispatch a keyset scan ordered by covered-period end then identifier]
+    SCAN --> RAWR[Canonical page of entries as persisted, with no fold and no marking]
+    RAWR --> CALLER[Caller reads the entry type and the target linkage itself]
+```
 
-**Consistency posture (read-after-write).** This feature's read surfaces (aggregated, raw, and the catalog reads they consult) inherit the gear-level consistency floor recorded in `cpt-cf-usage-collector-adr-consistency-contract` (ADR-0011) and DESIGN [§3.10](../DESIGN.md#310-consistency-contract): a record `Acknowledged` by the ingestion path MAY be invisible to a subsequent aggregated query, raw query, or catalog read for an indeterminate window.
+Everything a read needs before these rules run belongs to another feature. The
+authorization decision and the rule that a caller filter can only narrow belong
+to `cpt-cf-usage-collector-feature-attribution-authorization`. Resolving the
+queried type to its declaration — its fold and its metadata surface — belongs to
+`cpt-cf-usage-collector-feature-usage-type-resolution`. Executing the query
+belongs to `cpt-cf-usage-collector-feature-pluggable-storage`. The entries being
+read were written by
+`cpt-cf-usage-collector-feature-usage-record-ingestion`, and the entry type and
+target linkage the raw path hands back untouched were established by
+`cpt-cf-usage-collector-feature-record-invalidation`.
 
-**There is no read-your-writes guarantee against this feature**, and **no monotonic-reads-per-`(tenant_id, gts_id)` guarantee** — a record observed on one page or one aggregation MAY be missing from a later page or window against a different replica.
-
-Caller flows that need same-request outcome (admission control, post-emit summary, immediate-readback dashboards) MUST consume the ingestion ack from `cpt-cf-usage-collector-feature-usage-emission`, not this feature. Near-real-time observers poll within `cpt-cf-usage-collector-nfr-query-latency` and accept lag bounded by the active plugin's published profile (`plugin-spi.md` §"Consistency profile"); consumers that need a tighter bound consciously couple to a specific plugin's ceiling.
+The component that hosts all of it is
+`cpt-cf-usage-collector-component-query-gateway`.
 
 ### 1.2 Purpose
 
-This feature exists so that downstream consumers (billing, dashboards, quota enforcers, tenant administrators) have a single, contract-stable read surface for usage data whose authorization posture is identical to the rest of the metering substrate — the per-component `access_scope_with` helper invocation against `cpt-cf-usage-collector-contract-authz-resolver` inside `cpt-cf-usage-collector-component-query-gateway` returns the PDP decision and constraint set fail-closed on the inbound `SecurityContext`, the mandatory single-UsageType reference on the aggregated path is validated deterministically per query via a `get_usage_type` SPI dispatch against `cpt-cf-usage-collector-contract-storage-plugin`, the usage-emission-owned `usage_records` table is consumed read-only (deactivation transitions remain owned by §2.5 Event Deactivation), and aggregation and raw record retrieval are delegated through the contract-stable Plugin SPI so the read shape is uniform regardless of the operator-selected storage backend. The Query Gateway refuses to widen scope under any user-supplied filter, rejects unregistered UsageType references with an actionable error envelope before plugin aggregate / raw dispatch (owned by §2.3 Usage Emission), returns an empty result set / page (not an error) on empty matches within the authorized scope, and preserves auditable history by returning both `active` and `inactive` rows within that scope.
+The aggregated path exists so that "usage for this period" is one number per
+meter rather than a question with several defensible answers. The fold is a
+property of the declared type, never a request parameter, so two consumers
+reading one range agree by construction. The raw path exists so that a figure a
+consumer disputes can be taken apart into the entries that produced it, without
+reaching into a storage backend.
 
-**Requirements**: `cpt-cf-usage-collector-fr-query-aggregation`, `cpt-cf-usage-collector-fr-query-raw`, `cpt-cf-usage-collector-fr-tenant-isolation`, `cpt-cf-usage-collector-nfr-query-latency`, `cpt-cf-usage-collector-nfr-query-freshness`, `cpt-cf-usage-collector-nfr-workload-isolation`
+The asymmetry between them is deliberate and is the rule this feature guards
+most carefully. A ledger read that silently dropped a withdrawn pair would make
+correction history unreconstructible: a reader could no longer see what was
+withdrawn, or that anything was. A fold that admitted a withdrawn pair would
+double-count, because an invalidation echoes its target's quantity rather than
+negating it. Each path therefore gets the treatment its purpose demands, and
+`cpt-cf-usage-collector-principle-aggregate-asymmetry` names the resulting shape
+difference: raw reads are cursor-paginated list reads under the canonical page
+envelope, while the aggregate is a body-shaped call returning a non-paginated
+typed result bounded by grouping cardinality rather than by row volume.
 
-**Principles**: `cpt-cf-usage-collector-principle-pdp-centric-authorization`, `cpt-cf-usage-collector-principle-fail-closed`
+Pushing the exclusion down to the plugin rather than applying it after the fact
+is what makes the aggregate affordable. A plugin that pre-aggregates a meter
+serves a range by reading its own rollups, which it can only do if it knows,
+while it folds, which entries to leave out. An exclusion applied in the gear
+would oblige every aggregate to stream rows.
+
+**Requirements**: `cpt-cf-usage-collector-fr-query-aggregation`,
+`cpt-cf-usage-collector-fr-query-raw`,
+`cpt-cf-usage-collector-fr-billing-fields-on-read`
+
+**Principles**: `cpt-cf-usage-collector-principle-aggregate-asymmetry`,
+`cpt-cf-usage-collector-principle-canonical-page`,
+`cpt-cf-usage-collector-principle-cursor-gateway-ownership`
+
+`cpt-cf-usage-collector-principle-cursor-gateway-ownership` is shared with
+`cpt-cf-usage-collector-feature-usage-feed`. This feature covers the raw-query
+half of it: the gateway mints, decodes and validates the wire cursor, and the
+plugin receives a structured keyset instead. The feed half of the same principle
+belongs to that feature and is not restated here.
+
+**Constraints**: none of its own. This feature inherits every constraint from
+the features it depends on — the authorization gate, the declaration binding,
+and the plugin dispatch seam — and adds no design constraint that applies
+uniquely to reading.
+
+**Component**: `cpt-cf-usage-collector-component-query-gateway`
+
+**Sequences**: `cpt-cf-usage-collector-seq-query-aggregated`,
+`cpt-cf-usage-collector-seq-query-raw`. DESIGN owns both and fixes the call order
+across the gateway, the policy decision point, the Type Resolver and the Plugin
+Host. This feature defines the behavior of the steps that belong to it and
+restates neither sequence.
+
+**Use cases**: `cpt-cf-usage-collector-usecase-query-aggregated`,
+`cpt-cf-usage-collector-usecase-query-raw`
+
+**API**: three routes defined in DESIGN §3.3, none of them introduced here.
+
+- `GET /usage-collector/v1/records`, operation
+  `usage_collector.list_usage_records` — the raw ledger read.
+- `GET /usage-collector/v1/records/{id}`, operation
+  `usage_collector.get_usage_record` — the point lookup.
+- `POST /usage-collector/v1/records/aggregate`, operation
+  `usage_collector.query_aggregated_usage_records` — the aggregated read. It is
+  a body-shaped call because its grouping and metadata predicates do not fit a
+  query string, not because it changes state.
+- SDK: `cpt-cf-usage-collector-interface-sdk-client` carries the in-process
+  counterparts of all three, under the same operation names.
+
+**ADRs**: `cpt-cf-usage-collector-adr-declared-fold`,
+`cpt-cf-usage-collector-adr-feed-aggregate-split`,
+`cpt-cf-usage-collector-adr-window-end-selection`,
+`cpt-cf-usage-collector-adr-consistency-contract`
+
+**Entities**: `UsageRecordFilterField`, `AggregationDimension`,
+`AggregationResult`, `Keyset`, `MetadataFilter`, `TimeRange`, `MeterTypeId`,
+`UsageRecord`
+
+**Data**: none. This feature declares no database or table component identifier.
+The ledger is wholly plugin-owned and reached only through the storage plugin
+interface, so no read here touches gear-owned schema.
 
 ### 1.3 Actors
 
-| Actor                                         | Role in Feature                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cpt-cf-usage-collector-actor-usage-consumer` | Any authenticated system that queries usage data through the public read surfaces (billing engines, quota enforcers, dashboards, downstream analytics) — submits aggregated reads via `POST /usage-collector/v1/records/aggregate` (a `QueryAggregatedUsageRecordsRequest` body carrying `op` + `group_by`, plus the mandatory `gts_id` and the optional `$filter` / `metadata.<key>` query parameters) or `SdkClient` aggregated-read operations, and raw reads via `GET /usage-collector/v1/records` with the mandatory `gts_id`, the optional `metadata.<key>` filters, and OData query parameters (`$filter`, `$orderby`, `$top` / `limit`, `cursor`) or `SdkClient` raw-read operations through the Query Gateway; subject to PDP authorization on every call, with the PDP-returned `PdpConstraint` set composed into the parsed `FilterNode<UsageRecordFilterField>` under intersection-only (narrowing) semantics; the SDK trait deliberately excludes UsageType catalog management per `sdk-trait.md` §Out of scope, so UsageType existence validation on the aggregated path dispatches `get_usage_type` directly against `cpt-cf-usage-collector-contract-storage-plugin` rather than through a separate SDK call |
-| `cpt-cf-usage-collector-actor-tenant-admin`   | Tenant administrator who queries raw and aggregated usage data scoped to their own tenant via the same `POST /usage-collector/v1/records/aggregate` (body) and `GET /usage-collector/v1/records` (OData) paths (or the SDK equivalents); tenant isolation is enforced once by the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`) and surfaced into the Query Gateway as a `PdpConstraint` set that narrows the authorized scope to the operator's tenant; cross-tenant reads are possible only when the platform PDP explicitly permits them (e.g., parent → subtenant hierarchies)                                                                                                                                                                                                                                                                                           |
+| Actor | Role in Feature |
+|-------|-----------------|
+| `cpt-cf-usage-collector-actor-usage-consumer` | Issues aggregated reads for dashboards and quota evaluation, and raw reads for audit and dispute handling. Folds raw entries itself where it needs a shape the aggregate does not serve, and excludes withdrawn pairs when it does so. |
+| `cpt-cf-usage-collector-actor-tenant-admin` | Reads raw and aggregated usage for the administered tenant, narrowed by resource, subject and declared metadata, and never beyond the authorized scope. |
+| `cpt-cf-usage-collector-actor-platform-developer` | Integrates a calling gear against the in-process read methods, threads an opaque cursor back unchanged, and reads one entry by identifier to confirm what was persisted. |
+| `cpt-cf-usage-collector-actor-storage-backend` | Executes the dispatched query. Applies the fold, the grouping and the withdrawn-pair exclusion for the aggregate, and serves the keyset scan for the raw path without widening either result. |
+| `cpt-cf-usage-collector-actor-types-registry` | Holds the declaration whose fold the aggregate serves and whose metadata surface both paths validate grouping and filter names against. |
+| `cpt-cf-usage-collector-actor-platform-operator` | Reads the same surfaces while diagnosing a deployment, and configures the storage plugin whose lag the read paths inherit. Operator-only reconciliation counters are a different read path and are not served here. |
+| `cpt-cf-usage-collector-actor-usage-source` | Reads back an entry it emitted, by identifier or by raw query, to recover the caller-supplied fields a later withdrawal must copy. |
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md) -- Aggregated Usage Query §5.5, Raw Usage Query §5.5, Tenant Isolation §5.3, Data Ownership and Stewardship §5.8, Data Lifecycle Delegation §5.8 (active-and-inactive visibility), UsageType Existence and Semantics Enforcement §5.7 (aggregated-path UsageType validation), Query Latency §6.1, Batch and Report Timing §6.1, Workload Isolation §6.1, Authorization Enforcement §6.1, Actor catalog §2 (Usage Consumer, Tenant Administrator)
-- **Design**: [DESIGN.md](../DESIGN.md) -- Query Gateway component (§3) `cpt-cf-usage-collector-component-query-gateway`, Cursor & Pagination policy (§3.3) `cpt-cf-usage-collector-principle-cursor-gateway-ownership`, canonical-errors policy (§3.3) `cpt-cf-usage-collector-principle-canonical-errors`, Query Aggregated sequence (§3.6) `cpt-cf-usage-collector-seq-query-aggregated`, Query Raw sequence (§3.6) `cpt-cf-usage-collector-seq-query-raw`, `corrects_id` as the structural discriminator on every persisted usage record (`plugin-spi.md` §"Cross-entity invariants honored by the Plugin SPI"; read-only consumer; write surface declared by §2.3 Usage Emission), Correction posture two-primitive taxonomy and SUM-nets aggregation rule (`cpt-cf-usage-collector-adr-monotonic-deactivation` + `cpt-cf-usage-collector-adr-usage-compensation` — `SUM` is the signed net total; `COUNT`/`MIN`/`MAX`/`AVG` operate over active rows WHERE `corrects_id IS NULL`), Domain Model entities `AggregationQuery` / `AggregationResult` / `RawQuery` / `UsageRecordFilterField` / `Keyset` / `PdpConstraint` / `SecurityContext` / `ResourceRef` (§3.1) — raw paging is now expressed via `toolkit_odata::Page<UsageRecord>` plus the toolkit-internal `CursorV1`, PRD→DESIGN realization rows for `fr-query-aggregation`, `fr-query-raw`, `fr-tenant-isolation`, `fr-data-ownership`, `fr-usage-compensation` (read-side `SUM`-nets surface), `nfr-query-latency`, `nfr-batch-and-report-timing`, `nfr-workload-isolation`, `nfr-authorization`, `fr-data-lifecycle` (active-and-inactive visibility) (§5.3)
-- **ADR**: [ADR/0008-usage-compensation.md](../ADR/0008-usage-compensation.md) -- `cpt-cf-usage-collector-adr-usage-compensation` — counter value-reversal primitive; the rationale for the `SUM`-nets / `COUNT`-`MIN`-`MAX`-`AVG`-over-`corrects_id IS NULL` aggregation contract surfaced by this feature; complemented by [ADR/0005-monotonic-deactivation.md](../ADR/0005-monotonic-deactivation.md) (`cpt-cf-usage-collector-adr-monotonic-deactivation`) for the uniform retraction primitive that applies regardless of `corrects_id` presence (deactivated rows are excluded from all five aggregations before netting); [ADR/0011-consistency-contract.md](../ADR/0011-consistency-contract.md) (`cpt-cf-usage-collector-adr-consistency-contract`) — floor-and-ceiling consistency contract that governs queryability lag on this feature's surfaces; the no-read-your-writes constraint surfaced in §1.1 above and the per-plugin ceiling discoverable through `plugin-spi.md` §"Consistency profile"
-- **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) -- §2.4 Usage Query
-- **Foundation feature**: [foundation.md](./foundation.md) -- SecurityContext acceptance at the surface boundaries (REST `Extension<SecurityContext>` from ToolKit gateway middleware via `OperationBuilder::authenticated()`; SDK trait methods accepting `ctx: &SecurityContext` as the first parameter), PDP enforcement via the per-component `access_scope_with` helper (`cpt-cf-usage-collector-flow-foundation-pdp-authorize`) returning the `(PdpDecision, PdpConstraint set)` envelope, plugin host binding, audit-correlation propagation, tenant isolation, fail-closed posture (reused, not re-defined)
-- **UsageType Lifecycle feature**: [usage-type-lifecycle.md](./usage-type-lifecycle.md) -- platform-global usage-type catalog persisted in the plugin's `usage_type_catalog` table; the aggregated-path UsageType existence validation dispatches `get_usage_type` against `cpt-cf-usage-collector-contract-storage-plugin` per query- **Usage Emission feature**: [usage-emission.md](./usage-emission.md) -- write surface for usage records; the Query Gateway consumes the same records read-only via the Plugin SPI query capabilities and does not redefine ingestion semantics or the SPI dedup composite (reused, not re-defined)
-- **Plugin SPI reference**: [plugin-spi.md](../plugin-spi.md) -- aggregated query capability (server-side SUM / COUNT / MIN / MAX / AVG with grouping push-down) and raw page retrieval capability invoked with a structured tuple `(filter_ast: FilterNode<UsageRecordFilterField>, order_keys: OrderKeys, page_after: Option<Keyset>, limit: u32)` returning `(rows: Vec<UsageRecord>, last_keyset: Option<Keyset>)`; the gateway dispatches both reads through these SPI capabilities and the plugin is opaque to the OData/cursor wire encoding
-- **SDK trait reference**: [sdk-trait.md](../sdk-trait.md) -- aggregated and raw read operations routed through the Query Gateway (UsageType catalog management deliberately excluded per §Out of scope); `list_usage_records` returns `toolkit_odata::Page<UsageRecord>`
-- **REST contract**: [usage-collector-v1.yaml](../usage-collector-v1.yaml) -- `POST /usage-collector/v1/records/aggregate` (typed body) and `GET /usage-collector/v1/records` (OData `$filter`, `$orderby`, `$top`, `cursor`) paths, the canonical `toolkit_canonical_errors::Problem` envelope, mandatory time-range (expressed as `timestamp ge X and timestamp lt Y` inside `$filter`) and (aggregated) mandatory single-UsageType filter validation, toolkit `CursorV1` continuation token, and `$top` bounded page size
-- **Dependencies**: `cpt-cf-usage-collector-feature-foundation`, `cpt-cf-usage-collector-feature-usage-type-lifecycle`, `cpt-cf-usage-collector-feature-usage-emission`
+- **PRD**: [PRD.md](../PRD.md) — §5 aggregated usage query, raw usage query, and
+  billing fields on read paths; §7 the aggregated-query and raw-query use cases
+  and the downstream reader contract.
+- **Design**: [DESIGN.md](../DESIGN.md) — §2.1 the aggregate asymmetry, canonical
+  page and cursor gateway ownership principles; §3.1 the entity table with the
+  admissible filter field set, the admissible grouping set, the keyset and the
+  aggregation result, plus the order admissibility and scope intersection
+  invariants; §3.2 the Query Gateway; §3.3 the endpoint list, the cursor and
+  pagination rules, and the plugin obligations on an empty selection; §3.6 the
+  aggregated-query and raw-query sequences; §3.10 the consistency contract.
+- **ADRs**:
+  [0009](../ADR/0009-cpt-cf-usage-collector-adr-declared-fold.md),
+  [0011](../ADR/0011-cpt-cf-usage-collector-adr-feed-aggregate-split.md),
+  [0014](../ADR/0014-cpt-cf-usage-collector-adr-window-end-selection.md),
+  [0006](../ADR/0006-cpt-cf-usage-collector-adr-consistency-contract.md)
+- **Dependencies**:
+  `cpt-cf-usage-collector-feature-usage-record-ingestion`,
+  `cpt-cf-usage-collector-feature-record-invalidation`,
+  `cpt-cf-usage-collector-feature-attribution-authorization`,
+  `cpt-cf-usage-collector-feature-usage-type-resolution`, and
+  `cpt-cf-usage-collector-feature-pluggable-storage`. This feature is in turn
+  consumed by `cpt-cf-usage-collector-feature-rate-limiting-reconciliation`,
+  `cpt-cf-usage-collector-feature-throughput-latency-availability`,
+  `cpt-cf-usage-collector-feature-operational-visibility`,
+  `cpt-cf-usage-collector-feature-consistency-freshness-contract`, and
+  `cpt-cf-usage-collector-feature-contract-stability`.
 
-### 1.5 Explicit Non-Applicability
+**Owned elsewhere, referenced here.** Four seams are worth naming precisely,
+because each is easy to absorb into this feature by mistake.
 
-- **UX** (`UX-FDESIGN-001` user journey, `UX-FDESIGN-002` accessibility): Not applicable because the usage-query feature is a backend read surface (`POST /usage-collector/v1/records/aggregate` and `GET /usage-collector/v1/records` plus the in-process SDK aggregated and raw read operations routed through the same Query Gateway); there is no human-facing UI in this gear, the only direct consumers are authenticated downstream systems (`cpt-cf-usage-collector-actor-usage-consumer`) and tenant administrators traversing the public read surfaces (`cpt-cf-usage-collector-actor-tenant-admin`), and any UI surfacing of usage data is delivered downstream by billing engines, dashboards, and analytics products outside this feature's scope. Developer experience on the read contract is encoded through the canonical `toolkit_canonical_errors::Problem` error envelopes, the toolkit `CursorV1` opaque continuation token (decoded and validated at the gateway via `toolkit_odata::validate_cursor_against`), and the `$top` bounded page size published by `usage-collector-v1.yaml` and `sdk-trait.md`.
-
-### 1.6 Implementation Status
-
-This subsection records the current state on both read paths
-(`GET /usage-collector/v1/records` / `UsageCollectorClientV1::list_usage_records`
-and `POST /usage-collector/v1/records/aggregate` /
-`UsageCollectorClientV1::query_aggregated_usage_records`). Both surfaces
-are wired end-to-end; the legacy aggregation-request body shape described
-below in §§2-5 (with mandatory `time_range`, single-UsageType arity check,
-typed `aggregation` operator on the wire) is **not** the shape actually
-implemented. Treat those sections as forward-looking intent that has
-since been superseded by the SDK-aligned shape described here.
-
-The implemented body is `QueryAggregatedUsageRecordsRequest`, carrying
-only `op` and `group_by`; `gts_id`, the OData `$filter`, and the
-`metadata.<key>` filters are query parameters on the operation. The
-schema names that once appeared in these sections — `AggregationRequest`,
-`AggregationSpec`, `MetadataFilter` — no longer exist in
-`usage-collector-v1.yaml`.
-
-**Naming reconciliation.** Older spec passages reference a `(timestamp, id)` cursor keyset; the actual SDK field names are `created_at` and `id` and the implementation uses those throughout. Treat the spec's `timestamp` as a legacy synonym for `created_at` until the spec is fully refreshed.
-
-**Implemented**:
-
-- Raw-read SDK signature `UsageCollectorClientV1::list_usage_records(ctx, gts_id, query, metadata_filter)` is wired through `Service::list_usage_records` (see `gears/system/usage-collector/usage-collector/src/domain/service.rs`) and exposed at `GET /usage-collector/v1/records` (see `gears/system/usage-collector/usage-collector/src/api/rest/{routes,handlers}/usage_records.rs`).
-- Aggregated-read SDK signature `UsageCollectorClientV1::query_aggregated_usage_records(ctx, gts_id, query, metadata_filter, aggregation)` is wired through `Service::query_aggregated_usage_records` (same file) and exposed at `POST /usage-collector/v1/records/aggregate`. The handler accepts `gts_id` and the `metadata.<key>` typed side-channel as query parameters (mirroring the raw path), the `[from, to)` time window flows through `$filter` as a `created_at` predicate (a bounded window is **mandatory** — the service requires both a lower (`created_at ge|gt …`) and an upper (`created_at le|lt …`) bound as top-level `$filter` conjuncts and rejects an absent or one-sided window with `400 InvalidArgument` / `MISSING_TIME_WINDOW`; the aggregate path has no `$top` ceiling, so the window is its only scan bound), and the JSON body is `QueryAggregatedUsageRecordsRequest`, carrying only `op` + `group_by` (the handler converts it into the SDK `AggregationSpec`). `$orderby`, `$top` / `limit`, and `cursor` are NOT accepted on the aggregate path — aggregation is not paginated.
-- The `TimeWindow` typed parameter has been **removed** from both the SDK trait and the plugin SPI; the `[from, to)` time window flows through `query.filter` as an ordinary `created_at ge … and created_at lt …` OData predicate. `UsageRecordQuery` now exposes `created_at` (`DateTimeUtc`) and `id` (`Uuid`) on its filterable schema for exactly that purpose. The gateway **requires** a bounded `created_at` window (a lower and an upper bound as top-level `$filter` conjuncts) on both the raw and aggregated read paths and rejects an absent or one-sided window with `400 InvalidArgument` / `MISSING_TIME_WINDOW` (`Service::{list,query_aggregated}_usage_records` → `domain::query::require_bounded_time_window`), so a caller cannot drive an unbounded full-table scan / aggregation. Only top-level conjuncts count — a `created_at` bound nested under `or` / `not` does not satisfy the requirement.
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize` is invoked through the per-component `access_scope_with` helper (`PolicyEnforcer::access_scope_with`) against the `usage_record` resource with the `list` action verb. The PEP request is pre-row (no per-record attribution attributes) and uses `require_constraints(true)`: the returned `AccessScope` is projected to an OData filter (`domain::authz::scope_to_odata_filter`) and AND-merged with the caller's `$filter` under intersection-only semantics, and an unconstrained (`allow_all`) / empty-constraint permit fails closed (routed to the `denied` state, `context.reason="AUTHZ"`) rather than being treated as a happy path. The same `authorize_list_usage_records` helper authorizes both the raw and the aggregated read paths — the `list` action verb is shared because the read attribution tuple is identical at this stage (the aggregator's compute is downstream of authorization).
-- `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` is realized in `domain::service::compose_query_with_scope` + `domain::authz::scope_to_odata_filter`: every `AccessScope` constraint is projected to an `OData` filter expression over the `UsageRecordFilterField` surface (`OWNER_TENANT_ID` → `tenant_id`, `OWNER_ID` → `subject_id`, `PROP_RESOURCE_TYPE` → `resource_type`, `PROP_RESOURCE_ID` → `resource_id`, `PROP_SUBJECT_TYPE` → `subject_type`) and AND-merged into the caller's `$filter` under intersection-only semantics. The composer is shared by both `Service::list_usage_records` and `Service::query_aggregated_usage_records`. Tree predicates (`InGroup` / `InGroupSubtree` / `InTenantSubtree`), unknown PEP properties, and value-type mismatches surface as fail-closed `AuthorizationDenied` — the gear refuses to widen scope under a policy shape it cannot compile against a flat resource.
-- `gts_id` is the only mandatory non-OData query parameter on the REST surface. `$filter` / `$orderby` / `$top` (= `limit`) / `cursor` flow through the standard toolkit `OData` extractor.
-- The `MetadataFilter` side-channel ships as repeated `metadata.<key>=<value>` query parameters: values for the same `<key>` collapse into a single `MetadataFilter` whose value set is OR-ed; distinct `<key>`s become independent filters AND-ed at the plugin. An empty key (`metadata.=…`) is a fail-closed canonical `InvalidArgument`. The handler also rejects any query parameter outside the declared set (`gts_id`, the OData parameters, and `metadata.<key>` entries) so a typo cannot silently widen the result set — mirroring `account-management::reject_non_odata_params`.
-- Gateway-side guards on the parsed `ODataQuery` (handler `prepare_list_query`):
-    - **`$top` bound** — per `cpt-cf-usage-collector-dod-usage-query-constraint-nfr-thresholds` and `prepare_list_query`, an **absent** `$top` defaults to `MAX_PAGE_SIZE = 1000`, while a present `$top > MAX_PAGE_SIZE` is **rejected** with `400 InvalidArgument` (`field_violations[0].field="$top"`, `.reason="VALIDATION"`) — it is NOT silently clamped, so a caller cannot misread a truncated page as complete.
-    - **`$orderby` normalization (unique keyset tiebreaker)** — on every non-cursor request the gateway appends the canonical `(created_at, id)` suffix to the effective order via `toolkit_odata::ODataOrderBy::ensure_tiebreaker`, so the order always ends in a globally-unique key. When the caller omits `$orderby` this yields the canonical `(created_at asc, id asc)` keyset; when the caller supplies an `$orderby` that lacks a unique final key (e.g. `$orderby=created_at`, `$orderby=resource_id desc`), the missing `created_at` / `id` key(s) are appended so the effective order remains gap-free. The gateway — **not** the caller — owns the tiebreaker: a non-unique final sort key would let the plugin's keyset predicate silently drop rows sharing the boundary value that did not fit on the previous page (data loss across page boundaries). The tiebreaker is appended in the order's existing sort direction because this plugin's keyset supports only uniform-direction tuples; a descending `$orderby` therefore gets a descending suffix (never a mixed-direction tuple, which the plugin rejects). `ensure_tiebreaker` is a no-op for a key the order already names, so an order already ending in `id` is untouched. The plugin mints the next-page cursor's signed sort tokens from this normalized order, so cursor-continuation pages reconstruct the same suffix and page-to-page validation stays consistent. Realized in `prepare_list_query` (`gears/system/usage-collector/usage-collector/src/api/rest/handlers/usage_records.rs`). The plugin-owned catalog list (`GET /usage-collector/v1/usage-types`) is unaffected: it ignores `query.order` and paginates on the intrinsically-unique `gts_id` key.
-    - **Cursor validation** — when `cursor` is present, the gateway calls `toolkit_odata::validate_cursor_against(&cursor, effective_order, filter_hash)` before plugin dispatch. All failures lift (via `toolkit_odata`'s `CanonicalError::from`) to `InvalidArgument` (HTTP 400) carrying a `field_violations[0]` on the `cursor` field: a malformed cursor → `reason="INVALID_CURSOR"`, `OrderMismatch` → `"ORDER_MISMATCH"`, `FilterMismatch` → `"FILTER_MISMATCH"` (and a malformed signed-token order → `"INVALID_ORDERBY_FIELD"` on `$orderby`). The validated `ODataQuery` (cursor included) is forwarded to the plugin unchanged; `@nextLink` minting is the plugin's responsibility via `Page::page_info.next_cursor`.
-- The handler for `POST /usage-collector/v1/records/aggregate` reuses the raw path's `parse_required_gts_id` and `parse_metadata_filters` helpers, and rejects any query parameter outside `{gts_id, $filter, metadata.<key>}` via the aggregate-specific `reject_unknown_aggregate_params` (the aggregate path doesn't accept `$orderby`, `$top` / `limit`, or `cursor`; `$select` is rejected on both record paths because no code applies the projection); such pre-service parameter rejections surface as `400 InvalidArgument` with `field_violations[].reason="VALIDATION"` (the SDK `ValidationReason` catch-all) before the query pipeline runs. No metric is emitted here today — query telemetry is unwired (see Deferred).
-
-**Deferred**:
-
-- `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` is honoured by construction (the gateway never filters on `status` or overrides it) but is not asserted as an explicit post-pass at the gateway.
-- **Query operational telemetry is specified but NOT yet wired in gear source.** No meter instrument, no `QueryGuard`, and no telemetry emit exists yet for `uc_query_requests_total`, `uc_query_duration_seconds`, `uc_query_inflight`, or `uc_query_result_rows` (the successful-completion result-size observation — raw `items` length or aggregated `buckets` length — specified by `inst-raw-result-rows-observe` / `inst-aggregated-result-rows-observe`). The whole surface is owned by `cpt-cf-usage-collector-dod-usage-query-nfr-operational-visibility` and unchecked until the emit points land. When wired, `uc_query_inflight` is incremented *once authorization composes* per DESIGN §3.11.5 (not at bare service entry), and the completion counter/duration attach at the service boundary.
-- **Pre-pipeline handler-boundary rejections are not counted.** Rejections that never enter the query pipeline — missing `Extension<SecurityContext>`, cursor decode/validate failures (`cursor_decode` / `order_mismatch` / `filter_mismatch` from `validate_cursor_against`), and the generic request-shape rejections carrying the `VALIDATION` `field_violations[].reason` (`$top` over `MAX_PAGE_SIZE`, unknown query parameters, malformed `gts_id` → `INVALID_BASE_GTS_ID`, unparseable `$filter` / `$orderby`, metadata-filter errors) — are refused at the REST handler before the service pipeline. DESIGN §3.11.5's closed `uc_query_requests_total` `error_category` set carries no generic `validation` category, so — mirroring the ingestion sibling's `inst-emit-batch-cap-check` treatment in `usage-emission.md` — these structural rejections are NOT recorded on the counter. (`cursor_decode` / `order_mismatch` / `filter_mismatch` and `missing_security_context` ARE in the closed set and would be recorded once handler-boundary telemetry is added; the SDK surface passes typed params and a required `ctx`, so it does not reach these rejections.) The one validation rejection that IS a recorded completion is the service-level missing / one-sided bounded-time-window guard (`require_bounded_time_window` → `MISSING_TIME_WINDOW`), recorded as `error_category="query_budget"` — the mandatory window is the query's scan-scope budget guard.
-- The aggregated path resolves UsageType existence and the op-per-kind restriction pre-dispatch via `cpt-cf-usage-collector-algo-usage-query-usage-type-existence-on-aggregated-filter`: PDP authorize → enforce the mandatory bounded time window (`require_bounded_time_window`; missing → `InvalidArgument`, `field_violations[0].reason="MISSING_TIME_WINDOW"`) → resolve the usage type with a pre-dispatch `get_usage_type` (an unregistered `gts_id` → canonical `NotFound`, 404) → op-kind check (a mismatched `(op, kind)` → `InvalidArgument`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`, 400) → compose scope → dispatch. What remains absent is the richer arity/semantics validator design: there is no arity check (the single `gts_id` is a typed required parameter, malformed → `INVALID_BASE_GTS_ID`), no `semantics_violation`, and no `unknown_usage_type` `context.reason` discriminator (the unregistered-type outcome is plain canonical `NotFound`, not a bespoke reason code). The `aggregation` operator is a closed enum (absent / unsupported → `InvalidArgument` at body deserialization).
+- The authorized scope is compiled and composed by
+  `cpt-cf-usage-collector-algo-read-scope-composition`, owned by
+  `cpt-cf-usage-collector-feature-attribution-authorization`. Every flow below
+  treats that composition as a single step. This feature owns only the
+  validation of the names a caller supplies, which that routine deliberately
+  leaves to the read path.
+- The declared fold and the declared metadata surface are resolved by
+  `cpt-cf-usage-collector-algo-resolve-declaration`, owned by
+  `cpt-cf-usage-collector-feature-usage-type-resolution`, and reach this feature
+  through `cpt-cf-usage-collector-flow-resolve-for-read`.
+- Dispatch and plugin-error classification belong to
+  `cpt-cf-usage-collector-algo-plugin-dispatch` and
+  `cpt-cf-usage-collector-algo-plugin-error-classification`, owned by
+  `cpt-cf-usage-collector-feature-pluggable-storage`.
+- **Reconciliation metadata is the Query Gateway's fourth read path and is not
+  this feature.** It is operator-only, carries no filter, no grouping and no
+  paging, and belongs to
+  `cpt-cf-usage-collector-feature-rate-limiting-reconciliation`, which depends on
+  this feature. This document states the seam and specifies nothing about that
+  path.
+- The staleness floor and the per-plugin ceiling that bound how stale a read may
+  be belong to `cpt-cf-usage-collector-feature-consistency-freshness-contract`,
+  which also depends on this feature. This document states that every read path
+  here is bound by that contract and names no number of its own.
 
 ## 2. Actor Flows (CDSL)
 
-User-facing interactions that start with an actor (human or external system) and describe the end-to-end flow of a use case. Each flow has a triggering actor and shows how the system responds to actor actions.
+Each flow enters through one of the three read routes and reaches this feature's
+rules only after authorization and scope composition have run. Those steps appear
+as single steps, because the features that own them define their behavior.
 
-### Query Aggregated
+### Aggregate One Meter Over a Closed Period
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-
-**Actor**: `cpt-cf-usage-collector-actor-usage-consumer`
-
-**Success Scenarios**:
-
-- An authenticated usage consumer submits an aggregated read (via `POST /usage-collector/v1/records/aggregate` with an `AggregationRequest` body, or via the SDK `query_aggregated_usage_records` operation routed through `cpt-cf-usage-collector-component-query-gateway`) carrying a mandatory `time_range`, a mandatory single UsageType filter (`gts_id`), a mandatory `aggregation` operator (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG` per the `AggregationOp` enum in `usage-collector-v1.yaml`), and optional `group_by` keys; `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` resolves the caller into a `SecurityContext` and binds the `(PdpDecision, PdpConstraint set)` envelope to the request (the single `gts_id` is a typed required parameter — no arity check — and its existence is resolved by a pre-dispatch `get_usage_type` (Method 7) call, an unregistered `gts_id` surfacing as canonical `NotFound` (404) before dispatch; that resolution also yields the usage `kind`, which feeds a pre-dispatch op-kind check that rejects a mismatched `(op, kind)` pair — `SUM` on a gauge, or `MIN` / `MAX` / `AVG` on a counter — with `InvalidArgument` (`400`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`; counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}`)), `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` intersects the PDP constraint set with the user-supplied filters under intersection-only (narrowing) semantics, `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` invokes the Plugin SPI `query_aggregated_usage_records` capability so the storage plugin executes the chosen aggregation and any `group_by` dimensions server-side, `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` enforces that both `active` and `inactive` rows within the authorized scope contribute to the result, and the gateway returns a `AggregationResult` (`gts_id`, `aggregation`, `buckets`) per `usage-collector-v1.yaml`.
-- A tenant administrator (`cpt-cf-usage-collector-actor-tenant-admin`) submits the same aggregated read scoped to their own tenant; the PDP-returned `PdpConstraint` set narrows the authorized scope to the operator's tenant via `cpt-cf-usage-collector-fr-tenant-isolation`, no cross-tenant rows are aggregated absent an explicit platform PDP permit, and the gateway returns the `AggregationResult` over that narrowed scope.
-- An empty match within the authorized scope returns an `AggregationResult` with an empty `buckets` list per the Plugin SPI Method 3 contract — not an error envelope.
-
-**Error Scenarios**:
-
-- Request arrives without a resolved `SecurityContext` (REST handler did not receive `Extension<SecurityContext>` from ToolKit gateway middleware, or the SDK trait was invoked without a `ctx` argument) — whole-request rejection via the canonical `Unauthenticated` `Problem` envelope per `usage-collector-v1.yaml`; the collector never synthesizes identity and no plugin dispatch occurs.
-- PDP denies the read attribution tuple — whole-request rejection via the propagated platform-authorization `Problem` envelope (`PermissionDenied`, `context.reason="AUTHZ"`) from `cpt-cf-usage-collector-flow-foundation-pdp-authorize`; no plugin dispatch occurs.
-- The mandatory bounded `timestamp ge X and timestamp lt Y` window is missing from `$filter` — `InvalidArgument` (`field_violations[0].field="$filter"`, `.reason="MISSING_TIME_WINDOW"`) via the same `require_bounded_time_window` guard the raw path uses; no plugin dispatch occurs.
-- The `gts_id` is malformed — `InvalidArgument` (`field_violations[0].field="gts_id"`, `.reason="INVALID_BASE_GTS_ID"`) at the `UsageTypeGtsId::new` boundary. There is no arity check (`gts_id` is a single typed required parameter). An unregistered `gts_id` is resolved pre-dispatch by a `get_usage_type` (Method 7) call and surfaces as canonical `NotFound` (404) — lifting the plugin's `UsageTypeNotFound` — before any aggregate dispatch.
-- The `aggregation` operator is absent or not one of `{SUM, COUNT, MIN, MAX, AVG}` — rejected at request-body deserialization (the wire `op` is a closed enum) as `InvalidArgument` (HTTP `400`); no plugin dispatch occurs.
-- The `aggregation` operator is not admitted by the resolved usage `kind` — `SUM` on a gauge, or `MIN` / `MAX` / `AVG` on a counter — `InvalidArgument` (HTTP `400`, `field_violations[0].field="aggregation.op"`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`); the gateway resolves the `kind` via the pre-dispatch `get_usage_type` call and rejects the mismatch (counter admits `{SUM, COUNT}`; gauge admits `{MIN, MAX, AVG, COUNT}`) before any plugin aggregate dispatch.
-- Plugin SPI `query_aggregated_usage_records` returns host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal` — fail-closed `Problem` envelope per `usage-collector-v1.yaml`; the gateway never synthesizes a partial aggregation result and never caches a prior decision.
-
-**Steps**:
-
-1. [x] - `p1` - Caller submits an aggregated read — on REST through `POST /usage-collector/v1/records/aggregate` with an `AggregationRequest` body; the REST handler receives `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`) and W3C audit-correlation headers — or on the SDK through `UsageCollectorClientV1::query_aggregated_usage_records(ctx, ...)` with `ctx: &SecurityContext` as the first parameter per `sdk-trait.md` Method 3; the request carries mandatory `time_range`, mandatory single UsageType filter (`gts_id`), mandatory `aggregation` operator (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG` per the `AggregationOp` enum in `usage-collector-v1.yaml`), optional `group_by` keys, and optional secondary filters (`tenant_id` / `resource_ref` / `subject_ref` / `status`) - `inst-aggregated-request-received`
-2. [x] - `p1` - **IF** the REST handler receives no `Extension<SecurityContext>` (gateway middleware rejected the call upstream) or the SDK trait is invoked without a `ctx` argument **RETURN** the canonical `Unauthenticated` `Problem` envelope per `usage-collector-v1.yaml` default response; the collector never synthesizes identity - `inst-aggregated-missing-ctx`
-3. [x] - `p1` - Delegate PDP authorization to `cpt-cf-usage-collector-flow-foundation-pdp-authorize` via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`) for the read attribution tuple, receiving the `(PdpDecision, PdpConstraint set)` envelope - `inst-aggregated-pdp-delegate`
-4. [ ] - `p1` - **IF** the PDP decision is `deny` - `inst-aggregated-pdp-deny-branch`
-   1. [x] - `p1` - **RETURN** the fail-closed platform-authorization `Problem` envelope (`PermissionDenied`, `context.reason="AUTHZ"`) per `usage-collector-v1.yaml` without any plugin dispatch (no cached decision) - `inst-aggregated-pdp-deny-return`
-5. [x] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` to bind the inbound `SecurityContext` and the `PdpConstraint` set to the validated request payload - `inst-aggregated-attribution`
-   1. [ ] - `p1` - **IF** the algorithm returns a fail-closed `Problem` envelope (missing SecurityContext, missing PDP envelope, or empty PdpConstraint set per `inst-attribution-fail-closed-check`), **RETURN** that envelope verbatim without any further processing - `inst-aggregated-attribution-fail-return`
-6. [x] - `p2` - Increment the `uc_query_inflight{query_kind="aggregated"}` gauge on query-gateway entry once authorization composes (the attribution binding above has bound the `SecurityContext` and the `PdpConstraint` set) per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002); the gauge feeds the workload-isolation alert in DESIGN [§3.11.6](../DESIGN.md#3116-alerting-and-error-budget-architecture-ops-design-005) and is decremented by `inst-aggregated-telemetry-complete` on every exit path that follows this increment - `inst-aggregated-inflight-increment`
-7. [ ] - `p1` - The `aggregation` operator is rejected at request-body deserialization when absent or outside `{SUM, COUNT, MIN, MAX, AVG}` (the wire `op` is a closed enum), surfacing as `InvalidArgument` (HTTP `400`) before this flow runs; the typed `gts_id` parameter is likewise validated at `UsageTypeGtsId::new` (malformed → `InvalidArgument`, `.reason="INVALID_BASE_GTS_ID"`) before dispatch - `inst-aggregated-structural-check`
-8. [ ] - `p1` - **IF** the `$filter` lacks the mandatory bounded `timestamp ge X and timestamp lt Y` window (`require_bounded_time_window`) **RETURN** `InvalidArgument` (`field_violations[0].field="$filter"`, `.reason="MISSING_TIME_WINDOW"`) without any plugin dispatch - `inst-aggregated-time-window-check`
-9. [ ] - `p1` - Resolve the queried usage type via `cpt-cf-usage-collector-algo-usage-query-usage-type-existence-on-aggregated-filter` with a pre-dispatch `get_usage_type` (Method 7) Plugin SPI call — an unregistered `gts_id` lifts the plugin's `UsageTypeNotFound` to canonical `NotFound` (404) here, before the aggregate dispatch — then invoke `require_op_allowed_for_kind(aggregation.op, usage_type.kind, gts_id)`: reject a mismatched `(op, kind)` pair (`SUM` on a gauge, or `MIN` / `MAX` / `AVG` on a counter) with `InvalidArgument` (HTTP `400`, `field_violations[0].field="aggregation.op"`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`; counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}`) so the plugin never receives a mismatched pair (mirrors `inst-aggregated-existence-resolve` and `inst-aggregated-op-kind-check`) - `inst-aggregated-existence-and-op-kind-check`
-10. [x] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` to intersect the `PdpConstraint` set with the user-supplied filters (`group_by`, optional secondary filters) under intersection-only semantics; constraints can only narrow the authorized scope and MUST NOT widen it under any user-supplied input - `inst-aggregated-constraint-composition`
-11. [x] - `p1` - **TRY** invoke `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` to dispatch the composed filter set, the bounded time window, the typed `gts_id`, the chosen aggregation operator, and any `group_by` keys to the Plugin SPI `query_aggregated_usage_records` capability over the persisted usage records (records originate from `cpt-cf-usage-collector-component-ingestion-gateway` and are consumed read-only here; ingestion semantics are owned by §2.3 Usage Emission); the plugin executes SUM/COUNT/MIN/MAX/AVG and any `group_by` dimensions server-side per `plugin-spi.md` Method 3 - `inst-aggregated-plugin-dispatch`
-12. [x] - `p1` - **CATCH** the Plugin SPI error from the aggregate dispatch: transport / readiness errors (`Transient`, no scoped client, `types-registry` unavailable) lift to `ServiceUnavailable`; other backend errors lift to `Internal`; **RETURN** the lifted `Problem` envelope (no synthesized partial result). An unregistered `gts_id` never reaches this dispatch — it is caught by the pre-dispatch `get_usage_type` resolution (step 9) and lifted to canonical `NotFound` (404) there - `inst-aggregated-plugin-catch`
-    1. [x] - `p1` - **RETURN** the lifted `Problem` envelope (no synthesized partial result) per `usage-collector-v1.yaml` - `inst-aggregated-plugin-catch-return`
-13. [ ] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` to confirm both `active` and `inactive` rows within the authorized scope contribute to the result (deactivation of `inactive` is owned by §2.5 Event Deactivation, not this feature) - `inst-aggregated-visibility-rule`
-14. [ ] - `p1` - Assemble the `AggregationResult` (`gts_id`, `aggregation`, `buckets`) per `usage-collector-v1.yaml` - `inst-aggregated-result-assemble`
-15. [x] - `p2` - Record the `uc_query_result_rows{query_kind="aggregated"}` histogram with the aggregated group count (the `buckets` length of the assembled `AggregationResult`, capped at 100,000 per `usage-collector-v1.yaml`) — recorded only when the query completes successfully, so that, read together with `uc_query_duration_seconds`, operators separate "slow because large" from "slow because degraded" per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) - `inst-aggregated-result-rows-observe`
-16. [x] - `p2` - Record completion telemetry for the query attempt per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) (specified; **not yet wired** — no meter instrument exists today, see §1.6) through a completion guard established when the attempt is admitted at the query-gateway service boundary: on the guard's completion it observes the attempt's wall-clock seconds on `uc_query_duration_seconds{query_kind="aggregated"}` and increments `uc_query_requests_total{query_kind="aggregated", outcome, error_category}` on every terminal outcome at or after admission — including the `inst-aggregated-pdp-deny-return` (step 4.1) and `inst-aggregated-attribution-fail-return` (step 5.1) exits that return before the step-6 gauge increment — and it decrements `uc_query_inflight{query_kind="aggregated"}` only on exits that followed the `inst-aggregated-inflight-increment` bump (so the gauge never leaks under an early return and is never drained without a prior bump). The feature-owned exit→`(outcome, error_category)` mapping (DESIGN §3.11.5 supplies the closed value sets, not this projection) draws every category from the closed §3.11.5 `uc_query_requests_total` vocabulary: successful return → `(success, none)`; PDP `deny` (step 4.1) → `(denied, authz)`; the read path invokes PDP with `require_constraints(true)` per §1.6, so the attribution fail-closed (step 5.1) splits by branch — a permit whose returned `PdpConstraint` set is absent or empty is denied fail-closed → `(denied, authz)`, while a missing-`SecurityContext` / missing-`PdpDecision` substrate-unreachable exit → `(error, authz)`; missing / one-sided bounded time window (`inst-aggregated-time-window-check`, the service-level `require_bounded_time_window` guard) → `(error, query_budget)` — the mandatory window is the query's scan-scope budget guard; unregistered UsageType surfaced from the plugin as `NotFound` → `(error, unknown_usage_type)`; Plugin SPI transport / readiness / backend failure (`inst-aggregated-plugin-catch`) → `(error, plugin_error)`. The pre-pipeline rejections that run before the service guard is admitted are NOT recorded by this guard. The `inst-aggregated-missing-ctx` boundary check maps to the closed-set category `missing_security_context` and would be recorded only once REST-handler-boundary telemetry lands (deferred per §1.6; unreachable on the SDK surface, which passes a required `ctx`). The generic `inst-aggregated-structural-check` request-shape rejections (malformed `gts_id`, absent / unsupported `aggregation` operator, unknown query parameters) surface as `400 InvalidArgument` with `field_violations[].reason="VALIDATION"`, for which §3.11.5's closed set carries no category, so they are not recorded at all (mirroring the ingestion sibling's `inst-emit-batch-cap-check`, see §1.6 Deferred) - `inst-aggregated-telemetry-complete`
-17. [x] - `p1` - **RETURN** the `AggregationResult` (with an empty `buckets` list when no rows match within the authorized scope — not an error) per `usage-collector-v1.yaml` - `inst-aggregated-return`
-
-### Query Raw
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-flow-usage-query-query-raw`
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-flow-query-aggregated-usage`
 
 **Actor**: `cpt-cf-usage-collector-actor-usage-consumer`
 
 **Success Scenarios**:
-
-- An authenticated usage consumer submits a raw read (via `GET /usage-collector/v1/records?gts_id=…&$filter=...&$orderby=...&$top=...&cursor=...` — the mandatory typed `gts_id`, optional repeated `metadata.<key>` filters, and the OData query parameters, with `$top` also accepted under its `limit` alias — or via the SDK `list_usage_records` operation routed through `cpt-cf-usage-collector-component-query-gateway`) where `$filter` is an OData predicate over `UsageRecordFilterField` carrying the mandatory `timestamp ge X and timestamp lt Y` time window plus optional narrowing predicates (`tenant_id` / `subject_id` / `subject_type` / `resource_id` / `resource_type` / `status`), `$orderby` is optional and normalized by the gateway to end in the canonical unique `(created_at, id)` suffix (an omitted `$orderby` becomes `created_at asc, id asc`), `$top` is bounded by the page-size cap, and `cursor` is an optional toolkit `CursorV1` continuation token; the gateway decodes and validates the cursor against the parsed `$filter` AST and `$orderby` projection via `toolkit_odata::validate_cursor_against` before any PDP or plugin work, enforces the semantic mandatoriness of the `timestamp ge X and timestamp lt Y` time-range window after OData parsing and before plugin dispatch, `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` resolves the caller into a `SecurityContext` and binds the `(PdpDecision, PdpConstraint set)` envelope to the request, `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` AND-merges the PDP constraint set into the parsed `FilterNode<UsageRecordFilterField>` under intersection-only (narrowing) semantics, `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2` projects the validated cursor to the plugin keyset `(created_at, id)`, `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` invokes the Plugin SPI `list_usage_records` capability with the structured tuple `(filter_ast, order_keys, page_after, limit)` bounded by `$top`, `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` enforces that both `active` and `inactive` rows within the authorized scope are returned, and the gateway mints the next `CursorV1` from `last_keyset` (when present) bound to the current `$filter` / `$orderby` and returns a `toolkit_odata::Page<UsageRecord>` envelope with `@nextLink` cursor URL per `usage-collector-v1.yaml`.
-- Pagination continues across multiple calls by passing the prior response's `@nextLink` cursor token verbatim into the next request's `cursor` query parameter; the gateway decodes the cursor on every subsequent call, validates it against the current `$filter` / `$orderby`, and re-issues a fresh `CursorV1` from the next `last_keyset`; the plugin SPI is opaque to the cursor wire format and never decodes the token; the gateway omits `@nextLink` on the final page.
-- A tenant administrator (`cpt-cf-usage-collector-actor-tenant-admin`) submits the same raw read scoped to their own tenant; the PDP-returned `PdpConstraint` set narrows the authorized scope to the operator's tenant via `cpt-cf-usage-collector-fr-tenant-isolation`, no cross-tenant rows are returned absent an explicit platform PDP permit, and the gateway returns the `toolkit_odata::Page<UsageRecord>` envelope over that narrowed scope.
-- An empty match within the authorized scope returns a `toolkit_odata::Page<UsageRecord>` with an empty `items` list (and no `@nextLink`) per the Plugin SPI Method 4 contract — not an error envelope.
+- A consumer names one meter and one closed range, groups by tenant and
+  resource, and receives one folded quantity per group, with every withdrawn
+  pair having contributed nothing.
+- A consumer groups by a metadata property the queried type declares, and the
+  grouping is admitted because the resolved declaration names that property.
+- A consumer narrows by origin to separate imported history from live
+  consumption, issuing one call per origin value, because origin is filterable
+  and not groupable.
+- A range in which every selected entry is part of a withdrawn pair returns the
+  ungrouped bucket with a zero total under an accruing fold, and an absent value
+  under an observation fold.
 
 **Error Scenarios**:
-
-- Request arrives without a resolved `SecurityContext` (REST handler did not receive `Extension<SecurityContext>` from ToolKit gateway middleware, or the SDK trait was invoked without a `ctx` argument) — whole-request rejection via the canonical `Unauthenticated` `toolkit_canonical_errors::Problem` envelope per `usage-collector-v1.yaml`; the collector never synthesizes identity and no plugin dispatch occurs.
-- PDP denies the read attribution tuple — whole-request rejection via the propagated platform-authorization `Problem` envelope (`PermissionDenied`, `context.reason="AUTHZ"`) from `cpt-cf-usage-collector-flow-foundation-pdp-authorize`; no plugin dispatch occurs.
-- The supplied `cursor` fails `CursorV1` decode (malformed payload or version tag) — `InvalidArgument` (`field_violations[0].field="cursor"`, `.reason="INVALID_CURSOR"`); no plugin dispatch occurs.
-- The supplied `cursor` was minted against a different `$orderby` projection — `InvalidArgument` (`field_violations[0].field="cursor"`, `.reason="ORDER_MISMATCH"`); a `$orderby` that mixes `asc` and `desc` across keys, or names an optional (nullable) field, surfaces `.reason="VALIDATION"` on `$orderby` — both are keyset-soundness rejections raised in `prepare_list_query`, not `$orderby` parse failures (an unparseable `$orderby` is the toolkit's `.reason="INVALID_ORDERBY_FIELD"`); no plugin dispatch occurs.
-- The supplied `cursor` was minted against a different `$filter` AST — `InvalidArgument` (`field_violations[0].field="cursor"`, `.reason="FILTER_MISMATCH"`). A missing mandatory `timestamp ge X and timestamp lt Y` window surfaces separately as `.reason="MISSING_TIME_WINDOW"` on `$filter`. No plugin dispatch occurs.
-- `$top` exceeds the bounded cap of 1,000 records per page declared in `usage-collector-v1.yaml` — rejected gateway-side (`prepare_list_query`) with the canonical `InvalidArgument` `Problem` (`field_violations[0].field="$top"`, `.reason="VALIDATION"`), never clamped; an absent `$top` defaults to the cap. No plugin dispatch happens with an out-of-cap limit.
-- Plugin SPI `list_usage_records` returns host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal` — fail-closed `Problem` envelope per `usage-collector-v1.yaml`; the gateway never synthesizes a partial page and never caches a prior decision.
+- The request carries no time range, or names more than one meter. It is
+  rejected before authorization runs.
+- The request carries an aggregation parameter of its own. It is rejected with a
+  validation error, because the fold is declared rather than chosen.
+- The queried type does not resolve. The read is rejected and never reaches the
+  storage plugin.
+- A grouping dimension names neither a fixed dimension nor a property the
+  resolved declaration declares. It is rejected before dispatch rather than
+  silently yielding an absent dimension.
+- The caller holds no read permission for the meter, or the decision point
+  returns an empty constraint set. The read fails closed.
+- The result would exceed the aggregation result limit the public contract
+  fixes. The request is rejected rather than truncated.
 
 **Steps**:
+1. [x] - `p1` - Usage consumer submits an aggregated read naming one GTS type reference, one time range, optional filters and an optional grouping list - `inst-agg-submit`
+2. [ ] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-query-request-admission` over the request - `inst-agg-admit`
+3. [ ] - `p1` - **IF** the request names no range, more than one meter, or an aggregation parameter - `inst-agg-admit-bad`
+   1. [ ] - `p1` - **RETURN** a validation rejection naming the offending parameter, with nothing dispatched - `inst-agg-admit-return`
+4. [x] - `p1` - Gateway authorizes the read and composes the returned constraints with the caller filters through `cpt-cf-usage-collector-algo-read-scope-composition` - `inst-agg-scope`
+5. [x] - `p1` - **IF** the decision denies, or the composed scope is empty - `inst-agg-denied`
+   1. [ ] - `p1` - **RETURN** the fail-closed outcome that gate produced, with nothing dispatched - `inst-agg-denied-return`
+6. [ ] - `p1` - Gateway resolves the queried type through `cpt-cf-usage-collector-flow-resolve-for-read`, obtaining the declared fold and the declared metadata surface - `inst-agg-resolve`
+7. [ ] - `p1` - **IF** the type does not resolve - `inst-agg-unresolved`
+   1. [ ] - `p1` - **RETURN** the resolution failure, with nothing dispatched to the storage plugin - `inst-agg-unresolved-return`
+8. [ ] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-query-field-validation` over every filter operand, metadata predicate key and grouping dimension - `inst-agg-fields`
+9. [ ] - `p1` - **IF** any name lies outside the set its surface admits - `inst-agg-fields-bad`
+   1. [ ] - `p1` - **RETURN** a validation rejection naming that single name, before dispatch - `inst-agg-fields-return`
+10. [ ] - `p1` - Gateway applies `cpt-cf-usage-collector-algo-period-end-selection` to turn the range into the selection predicate - `inst-agg-range`
+11. [ ] - `p1` - Gateway assembles the dispatch through `cpt-cf-usage-collector-algo-query-fold-application` and `cpt-cf-usage-collector-algo-withdrawn-pair-exclusion-pushdown` - `inst-agg-assemble`
+12. [x] - `p1` - Gateway dispatches the assembled query through `cpt-cf-usage-collector-algo-plugin-dispatch` - `inst-agg-dispatch`
+13. [ ] - `p1` - Storage backend folds the selected entries per group and returns the grouped buckets - `inst-agg-fold`
+14. [x] - `p1` - **RETURN** the non-paginated grouped result, each bucket carrying its dimension values in the requested order and one folded quantity - `inst-agg-return`
 
-1. [x] - `p1` - Caller submits a raw read — on REST through `GET /usage-collector/v1/records?gts_id=…&$filter=...&$orderby=...&$top=...&cursor=...` with the mandatory typed `gts_id`, optional repeated `metadata.<key>` filters, and the OData query parameters (`$top` or its `limit` alias); the REST handler receives `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`) and W3C audit-correlation headers — or on the SDK through `UsageCollectorClientV1::list_usage_records(ctx, ...)` with `ctx: &SecurityContext` as the first parameter per `sdk-trait.md` Method 4; the request carries the `$filter` predicate over `UsageRecordFilterField` (mandatory `timestamp ge X and timestamp lt Y` window plus optional narrowing predicates over `tenant_id` / `subject_id` / `subject_type` / `resource_id` / `resource_type` / `status` per `usage-collector-v1.yaml`), an optional `$orderby` the gateway normalizes to end in the canonical unique `(created_at, id)` suffix, `$top` bounded by the page-size cap, and an optional `cursor` (toolkit `CursorV1`) - `inst-raw-request-received`
-2. [x] - `p1` - **IF** the REST handler receives no `Extension<SecurityContext>` (gateway middleware rejected the call upstream) or the SDK trait is invoked without a `ctx` argument **RETURN** the canonical `Unauthenticated` `Problem` envelope per `usage-collector-v1.yaml` default response; the collector never synthesizes identity - `inst-raw-missing-ctx`
-3. [x] - `p1` - Delegate PDP authorization to `cpt-cf-usage-collector-flow-foundation-pdp-authorize` via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`) for the read attribution tuple, receiving the `(PdpDecision, PdpConstraint set)` envelope - `inst-raw-pdp-delegate`
-4. [ ] - `p1` - **IF** the PDP decision is `deny` - `inst-raw-pdp-deny-branch`
-   1. [x] - `p1` - **RETURN** the fail-closed platform-authorization `Problem` envelope (`context.reason="AUTHZ"`) per `usage-collector-v1.yaml` without any plugin dispatch (no cached decision) - `inst-raw-pdp-deny-return`
-5. [x] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` to bind the inbound `SecurityContext` and the `PdpConstraint` set to the validated request payload - `inst-raw-attribution`
-   1. [ ] - `p1` - **IF** the algorithm returns a fail-closed `Problem` envelope (missing SecurityContext, missing PDP envelope, or empty PdpConstraint set per `inst-attribution-fail-closed-check`), **RETURN** that envelope verbatim without any further processing - `inst-raw-attribution-fail-return`
-6. [x] - `p2` - Increment the `uc_query_inflight{query_kind="raw"}` gauge on query-gateway entry once authorization composes (the attribution binding above has bound the `SecurityContext` and the `PdpConstraint` set) per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002); the gauge feeds the workload-isolation alert in DESIGN [§3.11.6](../DESIGN.md#3116-alerting-and-error-budget-architecture-ops-design-005) and is decremented by `inst-raw-telemetry-complete` on every exit path that follows this increment - `inst-raw-inflight-increment`
-7. [x] - `p1` - Parse `$filter`, `$orderby`, and `$top` via toolkit-odata; in `prepare_list_query` an absent `$top` defaults to `MAX_PAGE_SIZE = 1000` while a present `$top > MAX_PAGE_SIZE` is **rejected** gateway-side with the canonical `InvalidArgument` `Problem` (HTTP `400`, `field_violations[0].field="$top"`, `.reason="VALIDATION"`) — never silently clamped; on unparseable OData expressions return the canonical `Problem` envelope (HTTP `400`) per `usage-collector-v1.yaml` without any plugin dispatch - `inst-raw-odata-parse`
-    1. [x] - `p1` - Parse the `metadata.<key>` query parameters into the typed `MetadataFilter` set (an empty key is rejected as a canonical `InvalidArgument` `Problem`; an empty value is admitted verbatim) - `inst-raw-metadata-filter-parse`
-8. [ ] - `p1` - **IF** the parsed `$filter` AST does NOT contain the mandatory `timestamp ge X and timestamp lt Y` time-range window (semantic mandatoriness enforced by the usage-query algorithm at the gateway after OData parsing and before plugin dispatch — NOT by toolkit-odata) - `inst-raw-time-range-mandatory-check`
-   1. [ ] - `p1` - **RETURN** the canonical `InvalidArgument` `Problem` (`field_violations[0].field="$filter"`, `.reason="MISSING_TIME_WINDOW"`) per `usage-collector-v1.yaml` without any plugin dispatch - `inst-raw-time-range-mandatory-return`
-9. [ ] - `p1` - **IF** the request carries a `cursor` query parameter - `inst-raw-cursor-validate-branch`
-   1. [x] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2` to decode the `cursor` as a toolkit `CursorV1` value and validate it via `toolkit_odata::validate_cursor_against` against the parsed `$filter` AST and `$orderby` projection; every failure lifts to `InvalidArgument` with a `field_violations[0]` on `cursor` — malformed → `.reason="INVALID_CURSOR"`, `OrderMismatch` → `"ORDER_MISMATCH"`, `FilterMismatch` → `"FILTER_MISMATCH"`; no plugin dispatch in any of these branches - `inst-raw-cursor-validate`
-10. [x] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` to AND-merge the `PdpConstraint` set into the parsed `FilterNode<UsageRecordFilterField>` AST under intersection-only semantics; PDP constraints can only narrow the authorized scope and MUST NOT widen it under any user-supplied input; the resulting AST is the single source of truth handed to the plugin SPI (no separate constraint envelope is forwarded) - `inst-raw-constraint-composition`
-11. [x] - `p1` - **TRY** invoke `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` to dispatch the structured tuple `(filter_ast: FilterNode<UsageRecordFilterField>, order_keys: OrderKeys, page_after: Option<Keyset>, limit: u32)` to the Plugin SPI `list_usage_records` capability over the persisted usage records (records originate from `cpt-cf-usage-collector-component-ingestion-gateway` and are consumed read-only here; ingestion semantics are owned by §2.3 Usage Emission) — the cursor wire format is NEVER forwarded to the plugin; the plugin returns `(rows: Vec<UsageRecord>, last_keyset: Option<Keyset>)` - `inst-raw-plugin-dispatch`
-12. [x] - `p1` - **CATCH** Plugin SPI transport, readiness, or contract error (host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal`) - `inst-raw-plugin-catch`
-    1. [ ] - `p1` - **RETURN** the fail-closed `Problem` envelope per `usage-collector-v1.yaml` (no synthesized partial page) - `inst-raw-plugin-catch-return`
-13. [ ] - `p1` - Invoke `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` to confirm both `active` and `inactive` rows within the authorized scope are included in the returned page (deactivation of `inactive` is owned by §2.5 Event Deactivation, not this feature) - `inst-raw-visibility-rule`
-14. [ ] - `p1` - Mint the next `CursorV1` from the plugin-returned `last_keyset` (when present) bound to the current parsed `$filter` AST and `$orderby` projection; assemble the `toolkit_odata::Page<UsageRecord>` envelope (`items`, optional `@nextLink` containing the minted cursor token) per `usage-collector-v1.yaml`; omit `@nextLink` when the plugin signaled the last page (`last_keyset` absent) - `inst-raw-page-assemble`
-15. [x] - `p2` - Record the `uc_query_result_rows{query_kind="raw"}` histogram with the raw page size (the `items` length of the assembled `toolkit_odata::Page<UsageRecord>`, ≤ 1,000 by the `$top` bound) — recorded only when the query completes successfully, so that, read together with `uc_query_duration_seconds`, operators separate "slow because large" from "slow because degraded" per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) - `inst-raw-result-rows-observe`
-16. [x] - `p2` - Record completion telemetry for the query attempt per DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) (specified; **not yet wired** — no meter instrument exists today, see §1.6) through a completion guard established when the attempt is admitted at the query-gateway service boundary: on the guard's completion it observes the attempt's wall-clock seconds on `uc_query_duration_seconds{query_kind="raw"}` and increments `uc_query_requests_total{query_kind="raw", outcome, error_category}` on every terminal outcome at or after admission — including the `inst-raw-pdp-deny-return` (step 4.1) and `inst-raw-attribution-fail-return` (step 5.1) exits that return before the step-6 gauge increment — and it decrements `uc_query_inflight{query_kind="raw"}` only on exits that followed the `inst-raw-inflight-increment` bump (so the gauge never leaks under an early return and is never drained without a prior bump). The feature-owned exit→`(outcome, error_category)` mapping (DESIGN §3.11.5 supplies the closed value sets, not this projection) draws every category from the closed §3.11.5 `uc_query_requests_total` vocabulary: successful return → `(success, none)`; PDP `deny` (step 4.1) → `(denied, authz)`; the read path invokes PDP with `require_constraints(true)` per §1.6, so the attribution fail-closed (step 5.1) splits by branch — a permit whose returned `PdpConstraint` set is absent or empty is denied fail-closed → `(denied, authz)`, while a missing-`SecurityContext` / missing-`PdpDecision` substrate-unreachable exit → `(error, authz)`; missing / one-sided bounded time window (`inst-raw-time-range-mandatory-check`, the service-level `require_bounded_time_window` guard) → `(error, query_budget)` — the mandatory window is the query's scan-scope budget guard; unregistered UsageType surfaced from the plugin as `NotFound` → `(error, unknown_usage_type)`; Plugin SPI transport / readiness / backend failure (`inst-raw-plugin-catch`) → `(error, plugin_error)`. The pre-pipeline handler rejections that run before the service guard is admitted are NOT recorded by this guard: the cursor decode / validation failures (`inst-raw-cursor-validate`; `INVALID_CURSOR` / `ORDER_MISMATCH` / `FILTER_MISMATCH`) and the missing-`SecurityContext` boundary check map to the closed-set categories `cursor_decode` / `order_mismatch` / `filter_mismatch` / `missing_security_context` and would be captured only once REST-handler-boundary telemetry lands (deferred per §1.6; unreachable on the SDK surface, which passes a required `ctx` and typed params); the generic request-shape rejections — unparseable `$filter` / `$orderby` (`inst-raw-odata-parse`), `$top` above the bounded cap, unknown query parameters, malformed `gts_id` — surface as `400 InvalidArgument` with `field_violations[].reason="VALIDATION"` for which §3.11.5's closed set carries no category, so they are not recorded at all (mirroring the ingestion sibling's `inst-emit-batch-cap-check`) - `inst-raw-telemetry-complete`
-17. [x] - `p1` - **RETURN** the `toolkit_odata::Page<UsageRecord>` envelope (with an empty `items` list and no `@nextLink` when no rows match within the authorized scope — not an error) per `usage-collector-v1.yaml` - `inst-raw-return`
+### Page the Raw Ledger for an Audit
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-flow-query-raw-ledger-page`
+
+**Actor**: `cpt-cf-usage-collector-actor-tenant-admin`
+
+**Success Scenarios**:
+- An administrator reads a closed month for one meter and walks it page by page,
+  threading back the opaque cursor each page returns until no further page
+  remains.
+- A page holding a withdrawn record also holds the invalidation that withdraws
+  it, because both entries carry one covered period and one page boundary rule
+  applies to both.
+- Every returned entry carries the full unstripped field set, so the
+  administrator can rebuild a target's identity offline without a second call.
+- An administrator supplies an order of its own on the first page, and later
+  pages keep that order because the cursor carries it.
+
+**Error Scenarios**:
+- The request carries no time range, or names more than one meter. It is
+  rejected before authorization runs.
+- The cursor is malformed, was minted under a different filter, or arrives
+  alongside a fresh order. Each case is rejected with its own actionable reason
+  naming the cursor.
+- A filter operand names a field outside the fixed filter set, or a metadata
+  predicate names a property the resolved declaration does not declare. The
+  request is rejected before dispatch.
+- A caller asks for an offset instead of threading the cursor. No such parameter
+  exists on the surface, so the request does not parse.
+- The storage plugin is unavailable. The read surfaces a retryable
+  unavailability outcome rather than a partial page.
+
+**Steps**:
+1. [x] - `p1` - Tenant administrator submits a raw read naming one GTS type reference, one time range, optional filters, an optional order and an optional cursor - `inst-raw-submit`
+2. [ ] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-query-request-admission` over the request - `inst-raw-admit`
+3. [ ] - `p1` - **IF** admission rejects the request - `inst-raw-admit-bad`
+   1. [ ] - `p1` - **RETURN** the validation rejection naming the offending parameter - `inst-raw-admit-return`
+4. [x] - `p1` - Gateway authorizes the read and composes the constraints with the caller filters through `cpt-cf-usage-collector-algo-read-scope-composition` - `inst-raw-scope`
+5. [x] - `p1` - **IF** the decision denies, or the composed scope is empty - `inst-raw-denied`
+   1. [ ] - `p1` - **RETURN** the fail-closed outcome, with nothing dispatched - `inst-raw-denied-return`
+6. [ ] - `p1` - Gateway resolves the queried type through `cpt-cf-usage-collector-flow-resolve-for-read`, obtaining the declared metadata surface - `inst-raw-resolve`
+7. [ ] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-query-field-validation` over the filter operands and metadata predicate keys - `inst-raw-fields`
+8. [x] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-query-cursor-lifecycle` to decode and validate the supplied cursor, or to establish the first page - `inst-raw-cursor-in`
+9. [ ] - `p1` - **IF** the cursor is malformed, bound to a different filter, or accompanied by a fresh order - `inst-raw-cursor-bad`
+   1. [ ] - `p1` - **RETURN** a validation rejection carrying the cursor reason, with nothing dispatched - `inst-raw-cursor-return`
+10. [ ] - `p1` - Gateway applies `cpt-cf-usage-collector-algo-period-end-selection` to turn the range into the selection predicate - `inst-raw-range`
+11. [x] - `p1` - Gateway dispatches a keyset scan through `cpt-cf-usage-collector-algo-plugin-dispatch`, passing the structured keyset rather than any wire token - `inst-raw-dispatch`
+12. [ ] - `p1` - Gateway projects the returned entries through `cpt-cf-usage-collector-algo-raw-ledger-projection`, applying no fold and marking nothing - `inst-raw-project`
+13. [ ] - `p1` - Gateway mints the next cursor from the last row's keyset through `cpt-cf-usage-collector-algo-query-cursor-lifecycle` - `inst-raw-cursor-out`
+14. [x] - `p1` - **RETURN** the canonical page holding the entries as persisted and the next cursor where one exists - `inst-raw-return`
+
+### Find the Withdrawal of a Known Record
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-flow-find-withdrawal-of-record`
+
+**Actor**: `cpt-cf-usage-collector-actor-usage-consumer`
+
+**Success Scenarios**:
+- A consumer holding a record narrows a raw read on the target-reference field
+  over the period that record covers, and finds the invalidation withdrawing it
+  where one exists.
+- The same read over a record never withdrawn returns an empty page, which the
+  consumer reads as the absence of a withdrawal rather than as an error.
+- The consumer reaches the answer in one call, because the invalidation copies
+  the target's covered period and therefore falls in the same range.
+
+**Error Scenarios**:
+- The consumer expects a reverse link on the record itself. No read path carries
+  one, so the search is the only available route.
+- The consumer searches a range that excludes the target's covered-period end.
+  The read returns nothing, because selection reads the period end and not the
+  period start.
+- The consumer narrows on the target reference but omits the mandatory range.
+  The request is rejected on admission.
+- The withdrawal lies outside the consumer's authorized scope. It is absent from
+  the page, and the composed scope, not the filter, is what excluded it.
+
+**Steps**:
+1. [ ] - `p1` - Usage consumer takes the identifier and the covered period of the record it holds - `inst-find-take`
+2. [ ] - `p1` - Usage consumer issues a raw read over that record's meter, with a range holding the record's covered-period end - `inst-find-range`
+3. [ ] - `p1` - Usage consumer narrows the read on the target-reference filter field, set to the record's identifier - `inst-find-filter`
+4. [ ] - `p1` - Gateway serves the read through `cpt-cf-usage-collector-flow-query-raw-ledger-page`, unchanged - `inst-find-serve`
+5. [ ] - `p1` - **IF** the page holds an entry - `inst-find-hit`
+   1. [ ] - `p1` - **RETURN** that invalidation entry with its reason code, naming the record it withdraws - `inst-find-hit-return`
+6. [ ] - `p1` - **ELSE** - `inst-find-miss`
+   1. [ ] - `p1` - **RETURN** an empty page, which states that no withdrawal of that record is readable in the caller's scope - `inst-find-miss-return`
+
+### Read One Entry by Its Identifier
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-flow-lookup-entry-by-identifier`
+
+**Actor**: `cpt-cf-usage-collector-actor-platform-developer`
+
+**Success Scenarios**:
+- A developer reads back an entry it emitted and receives the exact persisted
+  fact, with every server-assigned field as stored.
+- The lookup carries neither a meter nor a range, so the composed authorized
+  scope is the whole filter applied to it.
+- A withdrawn record and the invalidation that withdraws it are each readable by
+  their own identifier, and neither read reveals anything about the other beyond
+  the linkage the entries already carry.
+
+**Error Scenarios**:
+- The identifier names no entry. The read answers not found.
+- The identifier names an entry outside the caller's authorized scope. The read
+  answers not found in exactly the same way, so the surface is no oracle for the
+  existence of entries a caller may not read.
+- The caller expects the lookup to reflect an acknowledgement issued moments
+  earlier. The consistency contract makes no such promise on any read path here.
+
+**Steps**:
+1. [ ] - `p1` - Platform developer submits a point lookup carrying one entry identifier - `inst-point-submit`
+2. [x] - `p1` - Gateway authorizes the read and compiles the scope through `cpt-cf-usage-collector-algo-read-scope-composition`, with no caller filter to compose - `inst-point-scope`
+3. [x] - `p1` - Gateway runs `cpt-cf-usage-collector-algo-point-lookup-resolution` under that scope - `inst-point-resolve`
+4. [ ] - `p1` - **IF** no entry is readable under that scope for the identifier - `inst-point-miss`
+   1. [ ] - `p1` - **RETURN** a not-found outcome that is identical whether the entry is absent or merely unauthorized - `inst-point-miss-return`
+5. [x] - `p1` - Gateway projects the entry through `cpt-cf-usage-collector-algo-raw-ledger-projection` - `inst-point-project`
+6. [x] - `p1` - **RETURN** the exact persisted fact, with the unstripped field set intact - `inst-point-return`
+
+### Reconcile an Aggregate Against a Locally Folded Raw Read
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-flow-reconcile-aggregate-against-raw`
+
+**Task 11 traceability note.** Unticked and unmarked. Every step below is
+phrased "Usage consumer does X" — aggregates, pages, reads the entry type,
+discards, folds — with no "Gateway does X" step at all, unlike
+`flow-find-withdrawal-of-record`'s explicit "Gateway serves the read ...
+unchanged" reuse. This flow is enabled by `flow-query-aggregated-usage` and
+`flow-query-raw-ledger-page` (both ticked) but is not itself realized by any
+gear code; it is a client-side composition pattern the gear's two read paths
+make possible, with no distinct implementation to mark.
+
+**Actor**: `cpt-cf-usage-collector-actor-usage-consumer`
+
+**Success Scenarios**:
+- A consumer aggregates a closed range, then pages the same range raw, discards
+  every withdrawn pair itself, folds the remainder, and the two figures agree.
+- The consumer identifies a withdrawn pair from the raw page alone, by reading
+  the entry type of one entry and the target reference it carries.
+- A consumer needing a per-period series pages the range raw and folds each
+  sub-period itself, because the aggregate divides a range into no sub-periods.
+
+**Error Scenarios**:
+- The consumer folds the raw page without discarding withdrawn pairs. Its total
+  exceeds the aggregate, because an invalidation echoes its target's quantity
+  rather than negating it, so each withdrawn measurement is counted twice.
+- The consumer expects the raw page to mark a withdrawn entry. Nothing on the
+  page is marked, and the entry type together with the target reference is the
+  whole signal available.
+- The consumer compares the two figures over an open-ended or very recent range.
+  They may differ because the paths can observe different replicas, and the
+  consistency contract permits that.
+- The consumer pages the raw read as though it were a change feed and treats a
+  late arrival as a defect. Raw tailing is best-effort, and a consumer that must
+  miss nothing reads the feed instead.
+
+**Steps**:
+1. [ ] - `p1` - Usage consumer aggregates a closed range through `cpt-cf-usage-collector-flow-query-aggregated-usage` and records the returned figure - `inst-recon-agg`
+2. [ ] - `p1` - Usage consumer pages the identical meter, range and filters through `cpt-cf-usage-collector-flow-query-raw-ledger-page` - `inst-recon-raw`
+3. [ ] - `p1` - **FOR EACH** entry on the returned pages - `inst-recon-loop`
+   1. [ ] - `p1` - Usage consumer reads the entry type, and the target reference where the entry declares the invalidation type - `inst-recon-read-type`
+   2. [ ] - `p1` - **IF** the entry declares the invalidation type - `inst-recon-is-inval`
+      1. [ ] - `p1` - Usage consumer discards that entry and the entry its target reference names - `inst-recon-discard`
+4. [ ] - `p1` - Usage consumer folds the surviving quantities with the fold the queried meter declares - `inst-recon-fold`
+5. [ ] - `p1` - **RETURN** the locally folded figure, which equals the aggregate over the same closed range once both reads observe the same converged entries - `inst-recon-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
-Internal system functions and procedures that do not interact with actors directly. These are reusable building blocks called by Actor Flows or other processes.
+### Admit a Read Request
 
-### Attribution & PDP Authorization (Read Path)
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-query-request-admission`
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
+**Input**: an aggregated or raw read request, before any authorization runs
 
-**Input**: The inbound `SecurityContext` received at the `cpt-cf-usage-collector-component-query-gateway` boundary (on REST as `Extension<SecurityContext>` from ToolKit gateway middleware, on SDK as the `ctx: &SecurityContext` first argument), the `(PdpDecision, PdpConstraint set)` envelope from `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked via the per-component `access_scope_with` helper inside the query gateway), and the read request payload (aggregated or raw).
-
-**Output**: An attributed read request that binds the resolved `SecurityContext` and the `PdpConstraint` set to the validated request payload, ready for downstream filter composition. The algorithm discriminates fail-closed outcomes by branch so the calling flow surfaces the correct §4 state and `Problem` envelope category: (a) missing resolved `SecurityContext` OR missing `PdpDecision` envelope (substrate unreachable / no decision available) yields a fail-closed `Problem` envelope routed to the `unavailable` state per `usage-collector-v1.yaml`; (b) substrate returned `permit` without an accompanying `PdpConstraint` set OR an empty constraint set (no permitted rows in any dimension) yields a fail-closed `Problem` envelope (`context.reason="AUTHZ"`) routed to the `denied` state per `usage-collector-v1.yaml`. In every fail-closed branch: no synthesized identity, no cached decision, no inferred result.
+**Output**: an admitted request, or one deterministic validation rejection
 
 **Steps**:
+1. [ ] - `p1` - Require exactly one GTS type reference on the request, supplied as the typed parameter and never as a filter conjunct - `inst-adm-one-type`
+2. [ ] - `p1` - **IF** the type reference is absent, or more than one is named - `inst-adm-type-bad`
+   1. [ ] - `p1` - **RETURN** a validation rejection naming the type parameter - `inst-adm-type-return`
+3. [ ] - `p1` - Require a time range as a typed parameter, and reject a range expressed as a filter conjunct - `inst-adm-range`
+4. [ ] - `p1` - **IF** the range is absent, or its start is later than its end - `inst-adm-range-bad`
+   1. [ ] - `p1` - **RETURN** a validation rejection naming the range parameter - `inst-adm-range-return`
+5. [ ] - `p1` - **IF** the request supplies any parameter that would select an aggregation of its own - `inst-adm-fold-param`
+   1. [ ] - `p1` - **RETURN** a validation rejection stating that the fold is declared by the queried type and cannot be chosen - `inst-adm-fold-return`
+6. [ ] - `p1` - Reject any request carrying a numeric row offset, since neither paginated path admits an offset scan - `inst-adm-no-offset`
+7. [ ] - `p1` - **RETURN** the admitted request - `inst-adm-return`
 
-1. [ ] - `p1` - Receive the inbound `SecurityContext` at the `cpt-cf-usage-collector-component-query-gateway` boundary — on REST as `Extension<SecurityContext>` from ToolKit gateway middleware, on SDK as the `ctx: &SecurityContext` first argument (the calling flow already exited fail-closed if `Extension<SecurityContext>` was absent on REST or `ctx` was absent on SDK) - `inst-attribution-receive-secctx`
-2. [ ] - `p1` - Receive the `(PdpDecision, PdpConstraint set)` envelope from `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked via the per-component `access_scope_with` helper inside the query gateway; the calling flow already exited fail-closed on PDP `deny`) - `inst-attribution-receive-pdp`
-3. [ ] - `p1` - **IF** the resolved `SecurityContext` is missing, OR the `PdpDecision` envelope is missing, OR the substrate returned `permit` without an accompanying `PdpConstraint` set, OR the accompanying `PdpConstraint` set is empty (no permitted rows in any dimension) - `inst-attribution-fail-closed-check`
-   1. [ ] - `p1` - **IF** the resolved `SecurityContext` is missing OR the `PdpDecision` envelope is missing (substrate unreachable / no decision available) — **RETURN** the fail-closed `Problem` envelope routed to the `unavailable` state per `usage-collector-v1.yaml` (no synthesized identity, no cached decision) - `inst-attribution-fail-closed-substrate-return`
-   2. [ ] - `p1` - **ELSE** (substrate returned `permit` without an accompanying `PdpConstraint` set OR the constraint set is empty) — **RETURN** the fail-closed `Problem` envelope (`context.reason="AUTHZ"`) routed to the `denied` state per `usage-collector-v1.yaml` (PDP authorized no rows in the requested scope; no inferred result) - `inst-attribution-fail-closed-return`
-4. [ ] - `p1` - Bind the resolved `SecurityContext` and the `PdpConstraint` set to the validated request payload as an attributed read request, preserving the foundation-resolved tenant scope - `inst-attribution-bind`
-5. [ ] - `p1` - **RETURN** the attributed read request to the caller - `inst-attribution-return`
+### Select Entries by Covered-Period End
 
-### UsageType Existence & Op-Kind Validation (Aggregated Path)
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-period-end-selection`
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-usage-type-existence-on-aggregated-filter`
+**Input**: an admitted time range
 
-**Input**: The typed `gts_id: UsageTypeGtsId` (parsed at the `UsageTypeGtsId::new` boundary — a malformed value is rejected as `InvalidArgument`, `.reason="INVALID_BASE_GTS_ID"`) and the requested `aggregation.op`.
-
-**Output**: The resolved `UsageType` (carrying `kind`) on success, or a fail-closed rejection: an unregistered `gts_id` surfaces as canonical `NotFound` (`404`), and an `(op, kind)` pair the kind does not admit surfaces as `InvalidArgument` (`400`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`). Both are produced BEFORE any Plugin SPI aggregate dispatch.
-
-**Steps**:
-
-1. [ ] - `p1` - After PDP authorization and the bounded-time-window check, resolve the usage type with a per-query `get_usage_type` Plugin SPI dispatch — an unregistered `gts_id` lifts the plugin's `UsageTypeNotFound` to canonical `NotFound` (`404`) here, before the aggregate dispatch - `inst-aggregated-existence-resolve`
-2. [ ] - `p1` - Reject the request with `InvalidArgument` (`400`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`) when `aggregation.op` is not admitted by the resolved `UsageType.kind` — counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}` (the matrix is owned by `AggregationOp::is_allowed_for`); the plugin stays pure-persistence and never receives a mismatched pair - `inst-aggregated-op-kind-check`
-
-### PDP Constraint Composition
-
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-
-**Input**: The `PdpConstraint` set from `cpt-cf-usage-collector-flow-foundation-pdp-authorize`, the parsed `FilterNode<UsageRecordFilterField>` AST from the raw read (or the typed user-supplied filters from the legacy aggregated request body — `gts_id`, `tenant_id`, `resource_ref`, `subject_ref`, `status`, plus optional `group_by`), and the resolved `SecurityContext` for tenant anchoring.
-
-**Output**: A composed filter expression whose authorized scope is the intersection of the `PdpConstraint` set and the user-supplied filters. Composition is intersection-only: the gateway AND-merges PDP constraint predicates into the client filter AST (or the aggregated typed filter map). The resulting AST is the single source of truth handed to the plugin SPI — no separate constraint envelope is forwarded. Any user-supplied attempt to widen scope beyond a PDP constraint is clamped back to the constraint bound. No widening, no scope expansion under any user-supplied input.
+**Output**: the single selection predicate every read path uses
 
 **Steps**:
+1. [ ] - `p1` - Take the range start as inclusive and the range end as exclusive - `inst-sel-bounds`
+2. [ ] - `p1` - Select an entry when the end of its covered period falls at or after the range start and strictly before the range end - `inst-sel-predicate`
+3. [ ] - `p1` - Read the covered-period end alone, and read the covered-period start for no selection purpose - `inst-sel-one-column`
+4. [ ] - `p1` - Apply no separate case for a zero-length covered period, since such an entry has one instant that the same predicate reads - `inst-sel-point-event`
+5. [ ] - `p1` - Apply the identical predicate on the aggregated path and the raw path, so two consumers reading one range select one set of entries - `inst-sel-uniform`
+6. [ ] - `p1` - Apply no predicate at all on the point lookup, which carries no range - `inst-sel-point-lookup`
+7. [ ] - `p1` - **RETURN** the selection predicate for dispatch - `inst-sel-return`
 
-1. [ ] - `p1` - Receive the parsed `FilterNode<UsageRecordFilterField>` AST from the raw-read OData parser (or the typed user-supplied filter map from the legacy aggregated request body) - `inst-constraint-composition-parse-user`
-2. [ ] - `p1` - Parse the `PdpConstraint` set from the `(PdpDecision, PdpConstraint set)` envelope returned by `cpt-cf-usage-collector-flow-foundation-pdp-authorize` - `inst-constraint-composition-parse-pdp`
-3. [ ] - `p1` - **FOR EACH** constraint in the `PdpConstraint` set - `inst-constraint-composition-iterate`
-   1. [ ] - `p1` - AND-merge the constraint predicate with the matching dimension in the parsed `FilterNode<UsageRecordFilterField>` AST (or the aggregated typed filter map for `tenant_id`, `resource_ref`, `subject_ref`, `gts_id`, `status`); when no matching user-supplied predicate exists for that dimension, append the constraint predicate as-is so the authorized scope is narrowed by the constraint alone; when a user-supplied predicate exists on a dimension that has NO matching PDP constraint, the user-supplied predicate is preserved as-is (PDP imposed no bound on that dimension) - `inst-constraint-composition-intersect`
-4. [ ] - `p1` - **IF** any user-supplied predicate attempts to widen scope beyond a `PdpConstraint` bound (e.g. requesting a tenant outside the PDP-permitted tenants, or a UsageType outside a PDP-permitted UsageType set) - `inst-constraint-composition-widen-check`
-   1. [ ] - `p1` - Narrow the user-supplied predicate back to the `PdpConstraint` bound (no widening permitted under any user-supplied input; the clamp is silent on the wire and observable only in the narrowed result scope, never as a `Problem` envelope) - `inst-constraint-composition-clamp`
-5. [ ] - `p1` - **RETURN** the composed `FilterNode<UsageRecordFilterField>` AST (or the composed aggregated typed filter map) anchored on the resolved `SecurityContext` for downstream Plugin SPI dispatch (`cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` or `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`) — the AST is the single source of truth; no separate constraint envelope is forwarded - `inst-constraint-composition-return`
+### Validate the Names a Caller Supplies
 
-### Plugin SPI Aggregate Dispatch
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-query-field-validation`
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
+**Input**: the caller's filter operands, metadata predicate keys and grouping
+dimensions, plus the resolved declaration
 
-**Input**: The composed filter set from `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`, the mandatory bounded time window, the typed `gts_id: UsageTypeGtsId` (parsed at the `UsageTypeGtsId::new` boundary; existence AND `kind` resolved by a pre-dispatch `get_usage_type` (an unregistered `gts_id` surfaces as `NotFound` before this dispatch; an `(op, kind)` pair the kind does not admit surfaces as `InvalidArgument`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`, before this dispatch)), the chosen aggregation operator (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG`), and any optional `group_by` keys.
-
-**Output**: A `AggregationResult` (`gts_id`, `aggregation`, `buckets`) returned by the Plugin SPI `query_aggregated_usage_records` capability per `plugin-spi.md` Method 3 — the plugin executes the chosen aggregation and any `group_by` dimensions server-side using its native acceleration structures, bounded by the wire-level caps declared in `usage-collector-v1.yaml` (≤ 100,000 rows over a 90-day single-tenant window with ≤ 2 groupings). On host-resolution `PluginUnavailable` / plugin-side `Transient` / `Internal`, a fail-closed `Problem` envelope per `usage-collector-v1.yaml`. The `-v2` suffix denotes the canonical aggregation contract anchored on `corrects_id` presence.
-
-**Aggregation rule (locked; encoded in the dispatch request and honoured by the plugin per `plugin-spi.md` Method 3)** — `SUM(value)` is computed across active rows regardless of `corrects_id` presence, treating `value` as a signed quantity, so `SUM` is the **signed net total** per `(tenant_id, gts_id)` group: rows with `corrects_id IS NOT NULL` (counter compensations) carry a strictly-negative `value` and reduce the running counter total. `COUNT`, `MIN`, `MAX`, and `AVG` operate over active rows WHERE `corrects_id IS NULL` — rows with `corrects_id IS NOT NULL` are excluded from these four aggregations before they are computed. **Compensation entries adjust SUM; they are not events.** Counting a compensation as an event would double-count the original usage event (the row referenced by `corrects_id` is already counted); including a compensation's strictly-negative `value` in `MIN` / `MAX` / `AVG` would corrupt extremes (a refund would always become the new `MIN`) and corrupt means (the arithmetic mean would drift below the observed usage range). Status filtering applies before aggregation — deactivated rows are excluded from every aggregation regardless of `corrects_id` presence; the `active`-status filter and the `corrects_id`-presence filter are orthogonal. A negative `SUM(value)` is an ordinary aggregation outcome — the Usage Collector does NOT validate non-negative net and does NOT emit a negative-net detection signal per the un-policed-net stance in `cpt-cf-usage-collector-adr-usage-compensation`; downstream consumers own any "net can't be negative" policy.
+**Output**: a validated name set, or one rejection naming a single offending name
 
 **Steps**:
+1. [ ] - `p1` - **FOR EACH** filter operand the caller supplied - `inst-fld-filter-loop`
+   1. [ ] - `p1` - **IF** the operand is not a member of the fixed filter field set the public contract defines - `inst-fld-filter-bad`
+      1. [ ] - `p1` - **RETURN** a validation rejection naming that operand - `inst-fld-filter-return`
+2. [ ] - `p1` - **FOR EACH** metadata predicate key the caller supplied on the side channel - `inst-fld-meta-loop`
+   1. [ ] - `p1` - **IF** the resolved declaration declares no property under that key - `inst-fld-meta-bad`
+      1. [ ] - `p1` - **RETURN** a validation rejection naming that key - `inst-fld-meta-return`
+3. [ ] - `p1` - **FOR EACH** grouping dimension the caller supplied, on the aggregated path only - `inst-fld-group-loop`
+   1. [ ] - `p1` - **IF** the dimension is neither one of the five fixed dimensions nor a property the resolved declaration declares - `inst-fld-group-bad`
+      1. [ ] - `p1` - **RETURN** a validation rejection naming that dimension - `inst-fld-group-return`
+   2. [ ] - `p1` - **IF** the same dimension already appears in the list - `inst-fld-group-dup`
+      1. [ ] - `p1` - **RETURN** a validation rejection naming the repeated dimension - `inst-fld-group-dup-return`
+4. [ ] - `p1` - Admit any combination of admissible dimensions in any order, and impose no ceiling on how many one request carries - `inst-fld-arity`
+5. [ ] - `p1` - Validate every caller order key on the raw path against the order key set the public contract defines, and admit one sort direction across the whole order - `inst-fld-order`
+6. [ ] - `p1` - Perform all of the above before dispatch, so the storage plugin never receives an unrecognized name - `inst-fld-before-dispatch`
+7. [ ] - `p1` - **RETURN** the validated name set - `inst-fld-return`
 
-1. [ ] - `p1` - Assemble the Plugin SPI `query_aggregated_usage_records` request (composed filter set, mandatory `time_range`, validated UsageType handle, aggregation operator, optional `group_by` keys) per the contract published in `plugin-spi.md` Method 3; encode the aggregation rule (`SUM` nets across active rows regardless of `corrects_id` presence; `COUNT` / `MIN` / `MAX` / `AVG` filter to active rows WHERE `corrects_id IS NULL` before aggregating) so the plugin executes the `corrects_id`-aware operator server-side — the rule is part of the operator contract, not a post-filter applied at the gateway - `inst-aggregate-dispatch-assemble-v2`
-2. [ ] - `p1` - **TRY** invoke the storage-plugin `query_aggregated_usage_records` capability via `cpt-cf-usage-collector-component-plugin-host` over the persisted usage records — the plugin treats every filter as authoritative and MUST NOT widen the result set beyond the supplied filters, MUST honour the `corrects_id`-aware aggregation rule (`SUM` nets signed values across active rows regardless of `corrects_id` presence; `COUNT` / `MIN` / `MAX` / `AVG` over active rows WHERE `corrects_id IS NULL`), and executes the chosen operator plus any `group_by` dimensions server-side (fanning out per-row reads to the core is forbidden per `plugin-spi.md` Method 3) - `inst-aggregate-dispatch-try-v2`
-3. [ ] - `p1` - **CATCH** Plugin SPI error (host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal` per `plugin-spi.md` Method 3) - `inst-aggregate-dispatch-catch-v2`
-   1. [ ] - `p1` - **RETURN** the fail-closed `Problem` envelope per `usage-collector-v1.yaml` (no synthesized partial result) - `inst-aggregate-dispatch-catch-return-v2`
-4. [ ] - `p1` - **RETURN** the `AggregationResult` (with an empty `buckets` list when no rows match within the authorized scope — not an error per `plugin-spi.md` Method 3); a negative `SUM(value)` bucket is an ordinary aggregation outcome and MUST NOT be rewritten or rejected by the gateway per the un-policed-net stance in `cpt-cf-usage-collector-adr-usage-compensation` - `inst-aggregate-dispatch-return-v2`
+### Apply the Declared Fold on the Aggregated Path
 
-### Plugin SPI Raw Page Dispatch
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-query-fold-application`
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`
+**Input**: the resolved declaration, the composed filter set, the selection
+predicate and the validated grouping list
 
-**Input**: The validated `gts_id: UsageTypeGtsId` (parsed at the `UsageTypeGtsId::new` boundary and threaded as the typed named parameter on the Plugin SPI signature), the composed `FilterNode<UsageRecordFilterField>` AST from `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` (carrying the mandatory bounded `created_at` `[from, to)` window as `created_at ge … and created_at lt …` conjuncts, plus optional narrowing predicates over `tenant_id` / `subject_id` / `subject_type` / `resource_id` / `resource_type` / `status` — `gts_id` is deliberately absent from `UsageRecordFilterField`, so a `gts_id`-touching `$filter` is rejected at parse time as `FilterError::UnknownField` and can never reach this AST), the normalized `OrderKeys` projection (the caller's `$orderby`, if any, ending in the canonical unique `(created_at, id)` suffix), the optional `page_after: Option<Keyset>` projected from the validated `CursorV1` by `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`, and the `limit: u32` resolved from the `$top` query parameter or its `limit` alias — the toolkit extractor folds both spellings onto one slot and rejects a request carrying both — ≤ 1,000 records per page (absent → 1,000; a present value above the cap is rejected before dispatch, not clamped).
-
-**Output**: A `(rows: Vec<UsageRecord>, last_keyset: Option<Keyset>)` tuple returned by the Plugin SPI `list_usage_records` capability per `plugin-spi.md` Method 4 — the plugin emits a `last_keyset` (the `(created_at, id)` tuple of the final row of the page) when more pages remain, and omits it on the final page. The cursor wire format is NEVER forwarded to the plugin SPI; the plugin is opaque to the OData/cursor encoding. On host-resolution `PluginUnavailable` / plugin-side `Transient` / `Internal`, a fail-closed canonical `Problem` envelope per `usage-collector-v1.yaml`.
-
-**Steps**:
-
-1. [ ] - `p1` - Assemble the Plugin SPI `list_usage_records` request as the structured tuple `(gts_id: UsageTypeGtsId, filter_ast: FilterNode<UsageRecordFilterField>, order_keys: OrderKeys, page_after: Option<Keyset>, limit: u32)` per the contract published in `plugin-spi.md` Method 4 (the bounded `created_at` window rides `filter_ast`) (NEVER include the cursor wire format; the plugin is opaque to OData/cursor encoding) - `inst-raw-dispatch-assemble`
-2. [ ] - `p1` - **TRY** invoke the storage-plugin `list_usage_records` capability via `cpt-cf-usage-collector-component-plugin-host` over the persisted usage records — the composed `FilterNode<UsageRecordFilterField>` AST is authoritative; the plugin MUST honor every predicate without widening and MUST emit rows in the requested `OrderKeys` projection - `inst-raw-dispatch-try`
-3. [ ] - `p1` - **CATCH** Plugin SPI transport, readiness, or contract error (host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal` per `plugin-spi.md` Method 4) - `inst-raw-dispatch-catch`
-   1. [ ] - `p1` - **RETURN** the fail-closed canonical `Problem` envelope per `usage-collector-v1.yaml` (no synthesized partial page) - `inst-raw-dispatch-catch-return`
-4. [ ] - `p1` - **RETURN** the `(rows: Vec<UsageRecord>, last_keyset: Option<Keyset>)` tuple to the gateway for cursor minting and envelope assembly (with an empty `rows` list and `last_keyset = None` when no rows match within the authorized scope — not an error per `plugin-spi.md` Method 4) - `inst-raw-dispatch-return`
-
-### Cursor Pagination Orchestration
-
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-
-**Input**: The optional `cursor` query parameter from `GET /usage-collector/v1/records` (toolkit `CursorV1` opaque token, base64url-encoded), the parsed `$filter` AST (`FilterNode<UsageRecordFilterField>`), the parsed `$orderby` projection (`OrderKeys` over the canonical keyset `(created_at, id)`), the bounded `$top` limit (≤ 1,000; over-cap rejected, not clamped), and the `(rows, last_keyset)` tuple returned by `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`.
-
-**Output**: A two-phase cursor-pagination decision owned end-to-end by the gateway. Phase 1 (decode + validate): the gateway decodes the inbound `cursor` query parameter as a toolkit `CursorV1` value, then calls `toolkit_odata::validate_cursor_against($filter, $orderby)` to ensure the cursor was minted against the exact same parsed filter AST and order-key projection as the current request. Every cursor failure lifts to `InvalidArgument` with a `field_violations[0]` on `cursor` and transitions to `rejected-validation`: malformed → `.reason="INVALID_CURSOR"`, `OrderMismatch` → `"ORDER_MISMATCH"`, `FilterMismatch` → `"FILTER_MISMATCH"`; the gateway also enforces the semantic mandatoriness of `timestamp ge X and timestamp lt Y` after OData parsing and before plugin dispatch and rejects a missing time-range window as `InvalidArgument` (`field_violations[0].field="$filter"`, `.reason="MISSING_TIME_WINDOW"`). On success the gateway projects the cursor to the plugin keyset `(created_at, id)` and forwards a typed `page_after: Option<Keyset>` to the plugin SPI. Phase 2 (mint + emit): on a successful page return, the gateway mints the next `CursorV1` from the plugin-returned `last_keyset` (bound to the current `$filter` AST and `$orderby` projection) and embeds it in the `toolkit_odata::Page<UsageRecord>` `@nextLink` URL; when `last_keyset = None`, the gateway omits `@nextLink` to signal the last page. The cursor is NEVER forwarded verbatim to the plugin SPI — the plugin is opaque to the OData/cursor wire encoding.
+**Output**: an aggregated query carrying exactly one fold, ready for dispatch
 
 **Steps**:
+1. [ ] - `p1` - Read the fold from the resolved declaration of the queried type, and from nowhere else - `inst-fold-read`
+2. [ ] - `p1` - Attach that fold to the dispatched query, so the storage backend folds rather than the gear - `inst-fold-pushdown`
+3. [ ] - `p1` - Attach the validated grouping list in the order the caller gave, so each returned bucket carries its dimension values in that order - `inst-fold-grouping`
+4. [ ] - `p1` - Exclude an entry that carries no value at a selected grouping dimension, rather than collecting it under an absent value - `inst-fold-absent-dimension`
+5. [ ] - `p1` - Divide the range into no sub-periods, since one range yields one value per group - `inst-fold-no-buckets`
+6. [ ] - `p1` - Expect an accruing fold and a counting fold to answer over an empty selection with a zero, and an observation fold to answer with an absent value - `inst-fold-empty`
+7. [ ] - `p1` - Expect no bucket at all for a group in which no entry survived - `inst-fold-empty-group`
+8. [ ] - `p1` - Carry neither the fold nor the queried type onto the returned result, both being inputs to the call - `inst-fold-not-on-result`
+9. [ ] - `p1` - **RETURN** the assembled aggregated query - `inst-fold-return`
 
-1. [ ] - `p1` - **IF** the request carries a `cursor` query parameter - `inst-cursor-orchestration-incoming-check`
-   1. [ ] - `p1` - Decode the `cursor` as a toolkit `CursorV1` value; on a malformed payload or version-tag mismatch **RETURN** the canonical `InvalidArgument` `Problem` (`field_violations[0].field="cursor"`, `.reason="INVALID_CURSOR"`) per `usage-collector-v1.yaml` without any plugin dispatch - `inst-cursor-orchestration-decode`
-   2. [ ] - `p1` - Invoke `toolkit_odata::validate_cursor_against($filter, $orderby)` to confirm the cursor was minted against the exact same parsed filter AST and order-key projection as the current request; on `OrderMismatch` **RETURN** `InvalidArgument` (`field_violations[0].field="cursor"`, `.reason="ORDER_MISMATCH"`); on `FilterMismatch` **RETURN** `InvalidArgument` (`.reason="FILTER_MISMATCH"`); no plugin dispatch in either branch - `inst-cursor-orchestration-validate`
-   3. [ ] - `p1` - Project the validated cursor to the plugin keyset `(created_at, id)` as a typed `page_after: Option<Keyset>` value - `inst-cursor-orchestration-project`
-2. [ ] - `p1` - **ELSE** - `inst-cursor-orchestration-no-cursor-branch`
-   1. [ ] - `p1` - Dispatch with `page_after = None`, so the plugin starts from the first page of the authorized scope per `plugin-spi.md` Method 4 - `inst-cursor-orchestration-first-page`
-3. [ ] - `p1` - Forward the typed `page_after` (or `None`) to `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` (the cursor wire format is NEVER forwarded to the plugin SPI) and receive the `(rows, last_keyset)` tuple - `inst-cursor-orchestration-dispatch`
-4. [ ] - `p1` - **IF** the plugin returned a `last_keyset` (`Some(Keyset)`) - `inst-cursor-orchestration-next-check`
-   1. [ ] - `p1` - Mint the next `CursorV1` from `last_keyset` bound to the current parsed `$filter` AST and `$orderby` projection per the toolkit-odata `CursorV1` contract; embed the minted cursor token in the `toolkit_odata::Page<UsageRecord>` `@nextLink` URL so the next caller forwards it back into the same request shape (cursor is gateway-owned state minted on each page; cross-binding cursors are rejected by `toolkit_odata::validate_cursor_against` as `FilterMismatch` / `OrderMismatch` on the next call) - `inst-cursor-orchestration-mint-next`
-5. [ ] - `p1` - **ELSE** (`last_keyset = None`) - `inst-cursor-orchestration-no-next-branch`
-   1. [ ] - `p1` - Omit `@nextLink` from the response — the plugin signaled the last page per `plugin-spi.md` Method 4 - `inst-cursor-orchestration-omit-next`
-6. [ ] - `p1` - **RETURN** the `toolkit_odata::Page<UsageRecord>` envelope (`items`, optional `@nextLink` containing the freshly minted gateway-owned `CursorV1`) - `inst-cursor-orchestration-return`
+### Push the Withdrawn-Pair Exclusion Down to the Plugin
 
-### Active & Inactive Record Visibility
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-algo-withdrawn-pair-exclusion-pushdown`
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility`
+**Task 11 traceability note.** Unticked and unmarked. Owner: the bound
+storage plugin, under `cpt-cf-usage-collector-feature-pluggable-storage`'s
+Plugin SPI contract. There is no explicit "exclusion" field or flag on the
+`query_aggregated_usage_records(gts_type_id, time_range, fold, query,
+metadata_filter, group_by)` dispatch (`usage-collector-sdk/src/plugin_api.rs`)
+— the gear attaches nothing beyond the fold and the composed filter, and the
+SPI method's own doc states the obligation plainly: *"This is a read-path
+obligation. The gear does not enforce it — it dispatches this call and
+returns what the plugin computes."* The `invalidation-excluded-from-fold`
+plugin contract test (DESIGN §3.3) is what binds a conforming plugin to it,
+not gear code.
 
-**Input**: The PDP-authorized scope (the composed filter set from `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` anchored on the resolved `SecurityContext`) and the candidate record set returned by the storage plugin (`cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` for the aggregated path or `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` for the raw path) over the persisted usage records.
+**Input**: an assembled aggregated query
 
-**Output**: A visible row set in which both `active` and `inactive` rows within the PDP-authorized scope are returned (raw path: each `UsageRecord` carries its `status` field per `plugin-spi.md` Method 4 and `usage-collector-v1.yaml`; aggregated path: both `active` and `inactive` rows contribute to the `AggregationResult` `buckets`). An empty match within the authorized scope returns an empty result set / page — never a `Problem` envelope. Deactivation of `active` → `inactive` is owned by §2.5 Event Deactivation and is NOT performed here.
+**Output**: the same query, carrying the exclusion the storage backend applies
 
 **Steps**:
+1. [ ] - `p1` - Attach the withdrawn-pair exclusion to the aggregated query itself, as part of what the storage backend receives - `inst-excl-attach`
+2. [ ] - `p1` - Exclude both entries of the pair: the withdrawn record and the invalidation entry that withdraws it - `inst-excl-both`
+3. [ ] - `p1` - Rely on the two entries sharing one covered period, so no requested range selects one of the pair without the other - `inst-excl-shared-period`
+4. [ ] - `p1` - Fetch no entry into the gear for the purpose of excluding it, and filter no returned bucket after the fact - `inst-excl-no-in-memory`
+5. [ ] - `p1` - Oblige a storage backend holding a pre-computed aggregate to recompute over the affected range when an invalidation is accepted, rather than adding a further contribution to it - `inst-excl-recompute`
+6. [ ] - `p1` - Leave the ungrouped bucket present but empty where every selected entry belongs to a withdrawn pair, since the exclusion empties a selection rather than removing a bucket - `inst-excl-empty-bucket`
+7. [ ] - `p1` - Apply this exclusion on the aggregated path only, and on no ledger read path - `inst-excl-aggregate-only`
+8. [ ] - `p1` - **RETURN** the query carrying the exclusion - `inst-excl-return`
 
-1. [ ] - `p1` - Receive the candidate row set returned by the storage plugin from `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` or `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` - `inst-visibility-receive`
-2. [ ] - `p1` - **FOR EACH** row in the candidate row set - `inst-visibility-iterate`
-   1. [ ] - `p1` - Include the row when its lifecycle state is `active` OR `inactive` within the PDP-authorized scope (auditable history is preserved by surfacing both states; deactivation transitions remain owned by §2.5 Event Deactivation and are NOT performed in this feature) - `inst-visibility-include`
-3. [ ] - `p1` - **IF** the visible row set is empty (no `active` or `inactive` rows matched within the PDP-authorized scope) - `inst-visibility-empty-check`
-   1. [ ] - `p1` - **RETURN** an empty visible row set so the calling flow surfaces an empty `AggregationResult` `buckets` list or an empty `toolkit_odata::Page<UsageRecord>` `items` list per `usage-collector-v1.yaml` — empty match within the authorized scope is never a `Problem` envelope per `plugin-spi.md` Method 3 and Method 4 - `inst-visibility-empty-return`
-4. [ ] - `p1` - **RETURN** the visible row set (both `active` and `inactive` rows within the PDP-authorized scope) to the calling flow for downstream assembly - `inst-visibility-return`
+### Project a Ledger Read Without a Fold
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-raw-ledger-projection`
+
+**Input**: the entries the storage backend returned for a raw page or a point
+lookup
+
+**Output**: the same entries as persisted, ready to serve
+
+**Steps**:
+1. [ ] - `p1` - Return a withdrawn record and the invalidation entry that withdraws it exactly as each was persisted - `inst-proj-both`
+2. [ ] - `p1` - Apply no fold, since a ledger read derives nothing and therefore has nothing to correct - `inst-proj-no-fold`
+3. [ ] - `p1` - Add no marker, flag or derived field that states an entry has been withdrawn - `inst-proj-no-marking`
+4. [ ] - `p1` - Suppress neither entry of a pair, and reorder neither relative to the page's keyset order - `inst-proj-no-suppression`
+5. [ ] - `p1` - Carry the entry type on every entry, and the target reference with its reason code on every entry declaring the invalidation type - `inst-proj-linkage`
+6. [ ] - `p1` - Carry the identifier, the idempotency key, the type reference, the covered period, the acceptance instant, the declared metadata, the signed quantity and the origin marker on every entry, unstripped - `inst-proj-fields`
+7. [ ] - `p1` - Carry no reverse link from a record to a withdrawal of it, since such a link would depend on entries accepted later - `inst-proj-no-reverse`
+8. [ ] - `p1` - Carry neither the metering unit nor the fold per entry, both being resolved from the declaration - `inst-proj-no-type-attrs`
+9. [ ] - `p1` - Leave the interpretation of the entry type and the target reference to the caller - `inst-proj-caller-interprets`
+10. [ ] - `p1` - **RETURN** the projected entries - `inst-proj-return`
+
+### Own the Raw-Path Cursor End to End
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-query-cursor-lifecycle`
+
+**Input**: an optional caller-supplied cursor, the validated filter set and
+order, and the last row of a served page
+
+**Output**: a structured keyset for dispatch, and the next opaque cursor
+
+**Steps**:
+1. [ ] - `p1` - **IF** the request carries no cursor - `inst-cur-first`
+   1. [ ] - `p1` - Begin at the first page of the composed selection, in the effective order - `inst-cur-first-page`
+2. [ ] - `p1` - **ELSE** - `inst-cur-resume`
+   1. [ ] - `p1` - Decode the opaque token in the gateway, and reject a token that does not decode - `inst-cur-decode`
+   2. [ ] - `p1` - Compare the filter binding the token carries against the request's filter set, and reject a mismatch - `inst-cur-filter-check`
+   3. [ ] - `p1` - Reject a request that supplies an order alongside a cursor, and a request whose order contradicts the one the token binds - `inst-cur-order-check`
+3. [ ] - `p1` - Append the covered-period end and the entry identifier to the caller's order, in the caller's direction, so the effective order is gap-free, uniform in direction and never absent a value - `inst-cur-keyset`
+4. [ ] - `p1` - Treat that appended pair as the whole order where the caller supplied none - `inst-cur-default-order`
+5. [ ] - `p1` - Pass the storage backend a structured keyset of the last row's sort values, never the wire token - `inst-cur-structured`
+6. [ ] - `p1` - Mint the next token from the last row of the served page, binding the effective order and a digest of the filter set it was minted under - `inst-cur-mint`
+7. [ ] - `p1` - Bind no part of the authorized scope into the token, since the scope is platform state evaluated per request - `inst-cur-no-scope`
+8. [ ] - `p1` - Keep the token inside the length bound the public contract states - `inst-cur-bounded`
+9. [ ] - `p1` - **RETURN** the structured keyset and the next opaque cursor - `inst-cur-return`
+
+### Resolve a Point Lookup Under the Compiled Scope
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-algo-point-lookup-resolution`
+
+**Input**: one entry identifier and the compiled authorized scope
+
+**Output**: the exact persisted entry, or a not-found outcome
+
+**Steps**:
+1. [ ] - `p1` - Accept the identifier as the whole request, with no type reference, no range, no filter and no paging - `inst-pt-input`
+2. [ ] - `p1` - Treat the compiled scope as the entire filter of the read, there being no caller filter to narrow it - `inst-pt-scope-is-filter`
+3. [ ] - `p1` - Dispatch the lookup to the storage backend under that scope - `inst-pt-dispatch`
+4. [ ] - `p1` - **IF** the backend holds no entry under the identifier - `inst-pt-absent`
+   1. [ ] - `p1` - **RETURN** a not-found outcome - `inst-pt-absent-return`
+5. [ ] - `p1` - **IF** the entry exists but lies outside the compiled scope - `inst-pt-unauthorized`
+   1. [ ] - `p1` - **RETURN** the identical not-found outcome, distinguishable from the absent case in no observable way - `inst-pt-unauthorized-return`
+6. [ ] - `p1` - Resolve a withdrawn record and an invalidation entry alike, since the lookup filters on no entry type - `inst-pt-either-kind`
+7. [ ] - `p1` - **RETURN** the entry exactly as persisted - `inst-pt-return`
 
 ## 4. States (CDSL)
 
-### Query Request Lifecycle State Machine
+**Not applicable.** This feature introduces no lifecycle, for three structural
+reasons.
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-state-usage-query-query-request-lifecycle`
+A read performs no transition. Every path here is a pure read over an
+append-only ledger with no status field and no lifecycle flag, so there is no
+entity whose state a query could advance.
 
-**States**: `received`, `ctx-accepted`, `pdp-authorized`, `filter-validated`, `plugin-dispatched`, `result-returned`, `rejected-validation`, `denied`, `unavailable`
+Withdrawal, which is the one condition these paths treat differently, is a
+property of a pair of entries as read, not a state either entry occupies. The
+aggregated path excludes the pair and the raw path returns it; neither changes
+anything about either entry.
 
-**Initial State**: `received`
-
-**Final States**: `result-returned`, `rejected-validation`, `denied`, `unavailable`
-
-**Transitions**:
-
-1. [ ] - `p1` - **FROM** `received` **TO** `ctx-accepted` **WHEN** the inbound `SecurityContext` is present at the `cpt-cf-usage-collector-component-query-gateway` boundary — on REST as `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`) for the inbound aggregated read or the inbound raw read, on SDK as the `ctx: &SecurityContext` first argument to `UsageCollectorClientV1::query_aggregated_usage_records(ctx, ...)` or `UsageCollectorClientV1::list_usage_records(ctx, ...)` per `sdk-trait.md` Methods 3 and 4 — and the gateway proceeds with the read (the calling flow already exited fail-closed via `inst-aggregated-missing-ctx` / `inst-raw-missing-ctx` if the SecurityContext was absent) - `inst-state-query-ctx-accepted`
-2. [ ] - `p1` - **FROM** `ctx-accepted` **TO** `pdp-authorized` **WHEN** `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` against `cpt-cf-usage-collector-contract-authz-resolver`) returns a `permit` `PdpDecision` paired with a non-empty `PdpConstraint` set, and `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` binds both to the request payload (mirrors `inst-aggregated-pdp-delegate` + `inst-aggregated-attribution` and `inst-raw-pdp-delegate` + `inst-raw-attribution`) - `inst-state-query-pdp-authorized`
-3. [ ] - `p1` - **FROM** `pdp-authorized` **TO** `filter-validated` **WHEN** the request passes structural OData parsing and post-parse validation AND — for the aggregated path only — the mandatory `aggregation` operator is present and supported (closed enum, validated at body deserialization) AND the typed `gts_id` is well-formed AND the mandatory bounded time window is present (`require_bounded_time_window`) AND the `gts_id`'s existence is resolved by a pre-dispatch `get_usage_type` call — an unregistered one surfacing as `NotFound` (404) before dispatch — and the resolved usage `kind` gates a pre-dispatch op-kind check that rejects a mismatched `(op, kind)` pair (`SUM` on a gauge, or `MIN` / `MAX` / `AVG` on a counter) with `InvalidArgument` (`400`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`; counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}`) AND — for the raw path only — `$top` is within the bounded cap declared in `usage-collector-v1.yaml` (an absent `$top` defaulted to the cap, a present `$top` above it already rejected before this transition) AND the parsed `$filter` AST contains the mandatory `timestamp ge X and timestamp lt Y` window (semantic mandatoriness enforced by the usage-query algorithm at the gateway after OData parsing, NOT by toolkit-odata) AND the optional `cursor` (when present) decoded as toolkit `CursorV1` AND was validated by `toolkit_odata::validate_cursor_against($filter, $orderby)` via `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2` AND `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` has AND-merged the PDP constraint set into the parsed `FilterNode<UsageRecordFilterField>` under intersection-only semantics (mirrors `inst-aggregated-structural-check`, `inst-aggregated-time-window-check`, `inst-aggregated-existence-and-op-kind-check`, `inst-aggregated-constraint-composition`, `inst-raw-odata-parse`, `inst-raw-time-range-mandatory-check`, `inst-raw-cursor-validate`, and `inst-raw-constraint-composition`) - `inst-state-query-filter-validated`
-4. [ ] - `p1` - **FROM** `filter-validated` **TO** `plugin-dispatched` **WHEN** the Plugin SPI capability accepts the composed request — `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` invokes `query_aggregated_usage_records` for the aggregated path (mirrors `inst-aggregated-plugin-dispatch`) or `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` invokes `list_usage_records` for the raw path with the structured tuple `(filter_ast, order_keys, page_after, limit)` projected by `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2` (mirrors `inst-raw-plugin-dispatch`; the cursor wire format is NEVER forwarded to the plugin SPI) — and returns the candidate row set per `plugin-spi.md` Method 3 and Method 4 - `inst-state-query-plugin-dispatched`
-5. [ ] - `p1` - **FROM** `plugin-dispatched` **TO** `result-returned` **WHEN** `cpt-cf-usage-collector-algo-usage-query-active-and-inactive-record-visibility` confirms both `active` and `inactive` rows within the PDP-authorized scope contribute to the result AND the gateway assembles either the `AggregationResult` (mirrors `inst-aggregated-visibility-rule` → `inst-aggregated-result-assemble` → `inst-aggregated-return`) or the `toolkit_odata::Page<UsageRecord>` envelope (mirrors `inst-raw-visibility-rule` → `inst-raw-page-assemble` → `inst-raw-return`); an empty match within the authorized scope still transitions here and returns an empty `buckets` list or an empty `items` list with no `next_cursor` — never a `Problem` envelope per `plugin-spi.md` Method 3 and Method 4; the `inst-aggregated-result-rows-observe` / `inst-raw-result-rows-observe` and `inst-aggregated-telemetry-complete` / `inst-raw-telemetry-complete` steps now interleaved into those flow chains emit operational metrics (per DESIGN §3.11.5) as a side-effect of reaching this state and are orthogonal to the transition itself — they neither gate it nor introduce a new state, so the mirror chains above track only the state-bearing steps - `inst-state-query-result-returned`
-6. [ ] - `p1` - **FROM** `pdp-authorized` **TO** `rejected-validation` **WHEN** the request fails structural pre-checks after attribution binding — the aggregated path's mandatory bounded time window missing (mirrors `inst-aggregated-time-window-check`; → `MISSING_TIME_WINDOW`), the aggregated path's mandatory `aggregation` operator missing or unsupported (closed enum, rejected at body deserialization; mirrors `inst-aggregated-structural-check`), the aggregated path's `(op, kind)` pair not admitted by the resolved usage `kind` (`SUM` on a gauge, or `MIN` / `MAX` / `AVG` on a counter — rejected by the pre-dispatch op-kind check as `field_violations[0].reason="OP_NOT_ALLOWED_FOR_KIND"` on `aggregation.op`; mirrors `inst-aggregated-existence-and-op-kind-check`) — an unregistered `gts_id` is a separate pre-dispatch outcome, canonical `NotFound` (404) from the `get_usage_type` resolution rather than a `rejected-validation` transition — OR — for the raw path only — the OData `$filter` / `$orderby` / `$top` strings fail to parse (mirrors `inst-raw-odata-parse`), the parsed `$filter` AST is missing the mandatory `timestamp ge X and timestamp lt Y` window (mirrors `inst-raw-time-range-mandatory-check` — surfaced as `field_violations[0].reason="MISSING_TIME_WINDOW"` on `$filter`), or the optional `cursor` query parameter fails decode (`INVALID_CURSOR`) / `OrderMismatch` (`ORDER_MISMATCH`) / `FilterMismatch` (`FILTER_MISMATCH`), each a `field_violations[0]` on `cursor`, when validated by `toolkit_odata::validate_cursor_against` (mirrors `inst-raw-cursor-validate`); the gateway surfaces the canonical `toolkit_canonical_errors::Problem` `InvalidArgument` envelope (HTTP `400`) — the aggregated path's mandatory-aggregation-operator check (closed enum at body deserialization), its single-UsageType existence resolution (pre-dispatch `get_usage_type` → canonical `NotFound`, 404), and its op-kind check (pre-dispatch → `OP_NOT_ALLOWED_FOR_KIND`, 400) are all enforced before any Plugin SPI aggregate dispatch — and no Plugin SPI dispatch occurs for the realized raw-path checks (structural pre-checks run after PDP delegation per the flow ordering — there is no path from `received` directly to `rejected-validation`); a present `$top` above the bounded cap is rejected gateway-side in `prepare_list_query` with the canonical `toolkit_canonical_errors::Problem` envelope (`Problem.type` = `InvalidArgument`, HTTP `400`) carrying a `field_violations[0]` on `$top` with `.reason="VALIDATION"` (the gear handler produces this before any plugin dispatch — it is NOT clamped; an absent `$top` instead defaults to the 1,000 cap) - `inst-state-query-rejected-validation`
-7. [ ] - `p1` - **FROM** `pdp-authorized` **TO** `rejected-validation` **WHEN** the inbound `cursor` query parameter on the raw path fails one of the three toolkit-cursor validation gates — `Malformed` (`field_violations[0].reason="INVALID_CURSOR"`), `OrderMismatch` (`"ORDER_MISMATCH"`), or `FilterMismatch` (`"FILTER_MISMATCH"`), each on the `cursor` field — and the toolkit `CursorV1` adoption DoD; the gateway rejects the request with the canonical `toolkit_canonical_errors::Problem` envelope before any Plugin SPI dispatch (cursor decode + validate is gateway-owned; the plugin SPI is opaque to the OData/cursor wire format and never receives an invalid cursor) - `inst-state-query-rejected-validation-cursor`
-8. [ ] - `p1` - **FROM** `ctx-accepted` **TO** `denied` **WHEN** `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` against `cpt-cf-usage-collector-contract-authz-resolver`) returns a `PdpDecision` of `deny` (mirrors `inst-aggregated-pdp-deny-branch` → `inst-aggregated-pdp-deny-return` and `inst-raw-pdp-deny-branch` → `inst-raw-pdp-deny-return`); the gateway surfaces the propagated platform-authorization `Problem` envelope (`context.reason="AUTHZ"`) per `usage-collector-v1.yaml` without any plugin dispatch and never caches the decision - `inst-state-query-denied`
-9. [ ] - `p1` - **FROM** `ctx-accepted` **TO** `denied` **WHEN** `cpt-cf-usage-collector-flow-foundation-pdp-authorize` returned `permit` but the `PdpConstraint` set is missing or empty (denying every row in the authorized scope) — `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` short-circuits before binding (i.e. before `pdp-authorized` is reached, since transition 2 requires a non-empty `PdpConstraint` set to enter `pdp-authorized`) and surfaces this as the same fail-closed `Problem` envelope (`context.reason="AUTHZ"`), with no synthesized identity and no inferred result (mirrors `inst-attribution-fail-closed-check` → `inst-attribution-fail-closed-return` inside `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`) - `inst-state-query-denied-empty-constraints`
-10. [ ] - `p1` - **FROM** `received` **TO** `unavailable` **WHEN** the inbound `SecurityContext` is absent at the handler boundary — on REST the ToolKit gateway middleware did not populate `Extension<SecurityContext>` (mirrors `inst-aggregated-missing-ctx` and `inst-raw-missing-ctx`); on SDK the trait method was invoked without a `ctx` argument; the gateway surfaces the canonical `Unauthenticated` `Problem` envelope per `usage-collector-v1.yaml` without any further processing and never synthesizes identity - `inst-state-query-unavailable-missing-ctx`
-11. [ ] - `p1` - **FROM** `ctx-accepted` **TO** `unavailable` **WHEN** `cpt-cf-usage-collector-flow-foundation-pdp-authorize` is unreachable so neither a `permit` nor a `deny` `PdpDecision` is available; `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read` discriminates this as the substrate-unreachable branch and returns the fail-closed `Problem` envelope routed to the `unavailable` state (mirrors `inst-attribution-fail-closed-check` → `inst-attribution-fail-closed-substrate-return`) with no cached decision - `inst-state-query-unavailable-pdp`
-12. [ ] - `p1` - **FROM** `filter-validated` **TO** `unavailable` **WHEN** `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` or `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` surfaces a Plugin SPI transport / readiness / contract error (host-resolution `PluginUnavailable`, plugin-side `Transient`, or `Internal` per `plugin-spi.md` Method 3 and Method 4; mirrors `inst-aggregated-plugin-catch` → `inst-aggregated-plugin-catch-return` and `inst-raw-plugin-catch` → `inst-raw-plugin-catch-return`); the gateway surfaces the fail-closed `Problem` envelope per `usage-collector-v1.yaml`, never synthesizes a partial aggregation / page, and never caches a prior decision - `inst-state-query-unavailable-plugin`
+The cursor is not state either. It is an opaque token the caller holds between
+requests, carrying an order binding, a filter digest and a keyset. The gateway
+retains nothing between two pages, so there is no session to model. The one
+lifecycle these paths depend on is the dedup identity convergence already
+modelled in `cpt-cf-usage-collector-state-dedup-identity`, owned by
+`cpt-cf-usage-collector-feature-usage-record-ingestion`.
 
 ## 5. Definitions of Done
 
-### FR: Aggregation Rule — SUM Nets, Others Usage Only
+### Mandatory Single Meter and Time Range
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-aggregation-sum-nets`
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-mandatory-type-and-range`
 
-The system **MUST** surface the locked aggregation contract on the read path so downstream consumers can reason about counter totals with compensation applied: `SUM(value)` aggregates across active rows regardless of `corrects_id` presence, treating `value` as a signed quantity, so `SUM` is the **signed net total** per group (rows with `corrects_id IS NOT NULL` carry a strictly-negative `value` and reduce the running counter total); `COUNT`, `MIN`, `MAX`, and `AVG` filter to active rows WHERE `corrects_id IS NULL` before aggregating. Aggregation ops are restricted per usage `kind` — counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}` — and a mismatched `(op, kind)` pair is rejected at the gateway with `InvalidArgument` (`.reason="OP_NOT_ALLOWED_FOR_KIND"`) before plugin dispatch. **Compensation entries adjust SUM; they are not events.** Counting a compensation as an event would double-count the original usage event (the row its `corrects_id` references is already counted); including a strictly-negative compensation `value` in `MIN` / `MAX` / `AVG` would corrupt extremes and means. Status filtering applies before aggregation — deactivated rows are excluded from every aggregation regardless of `corrects_id` presence; the `active`-status filter and the `corrects_id`-presence filter are orthogonal. A negative `SUM(value)` is an ordinary aggregation outcome — the Usage Collector does NOT validate non-negative net and does NOT emit negative-net detection per the un-policed-net stance recorded in `cpt-cf-usage-collector-adr-usage-compensation`; downstream consumers (billing, quota, FinOps) own any "net can't be negative" policy. The rule is encoded in `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` and honoured server-side by the storage plugin per `plugin-spi.md` Method 3.
+The system **MUST** require exactly one GTS type reference and one time range on
+the aggregated read path and on the raw read path. Both **MUST** arrive as typed
+parameters, and the range **MUST NOT** be expressible as a filter conjunct. A
+request omitting either, or naming more than one meter, **MUST** be rejected with
+an actionable validation error naming the parameter, before authorization runs
+and before any dispatch. The point lookup **MUST** carry neither parameter. A
+request naming a meter whose declaration does not resolve **MUST** be rejected
+rather than dispatched to the storage plugin.
 
 **Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
-
-**Constraints**: `cpt-cf-usage-collector-fr-usage-compensation`
+- `cpt-cf-usage-collector-algo-query-request-admission`
+- `cpt-cf-usage-collector-flow-query-aggregated-usage`
+- `cpt-cf-usage-collector-flow-query-raw-ledger-page`
 
 **Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `MeterTypeId`, `TimeRange`
 
+### Covered-Period End as the Sole Selection Rule
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-period-end-selection`
+
+The system **MUST** select an entry for a requested range when the end of its
+covered period falls at or after the range start and strictly before the range
+end. This **MUST** be the only comparison of a covered period against a range on
+every read path this feature owns. The implementation **MUST NOT** offer interval
+overlap, containment of the whole period, or selection on the period start, and
+**MUST NOT** carry a separate case for a zero-length covered period. The
+aggregated and raw paths **MUST** apply the identical predicate, so two
+consumers reading one range select one set of entries.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-period-end-selection`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `TimeRange`
+
+### No Aggregation Parameter on Any Surface
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-no-aggregation-parameter`
+
+The system **MUST** serve the aggregated path with the fold declared by the
+queried GTS type and with no other. No public surface — REST, in-process trait,
+or storage plugin interface — **MUST** accept a parameter by which a caller
+selects a fold. A request carrying one **MUST** be rejected with an actionable
+validation error stating that the fold is a property of the meter. The fold
+**MUST** be read from the resolved declaration on every request and **MUST NOT**
+be inferred from the shape of a type identifier, pinned at acceptance, or carried
+on an entry. Neither the fold nor the queried type **MUST** appear on the
+returned result, both being inputs to the call.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-query-fold-application`
+- `cpt-cf-usage-collector-flow-query-aggregated-usage`
+
+**Touches**:
 - API: `POST /usage-collector/v1/records/aggregate`
-- Entities: `AggregationQuery`, `AggregationResult`, `UsageRecord`
-
-### FR: Query Aggregation
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-fr-query-aggregation`
-
-The system **MUST** expose `POST /usage-collector/v1/records/aggregate` (and the SDK `query_aggregated_usage_records` operation per `sdk-trait.md`) as the single contract-first aggregated read path, accept an `AggregationRequest` carrying a mandatory `time_range`, a mandatory single-UsageType filter (`gts_id`), a mandatory `aggregation` operator (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG` per the `AggregationOp` enum in `usage-collector-v1.yaml`), and optional narrowing filters / `group_by` keys per `usage-collector-v1.yaml`, route every submission through `cpt-cf-usage-collector-component-query-gateway`, and end the synchronous path with a server-side aggregation executed by the storage plugin through the Plugin SPI `query_aggregated_usage_records` capability over the persisted usage records — surfacing a `AggregationResult` (`gts_id`, `aggregation`, `buckets`) anchored on the PDP-narrowed scope of the resolved `SecurityContext`, with an empty `buckets` list when no rows match (never a `Problem` envelope). Aggregation ops are restricted per usage `kind` — counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}` — and a mismatched `(op, kind)` pair is rejected at the gateway with `InvalidArgument` (`.reason="OP_NOT_ALLOWED_FOR_KIND"`) before plugin dispatch. The `corrects_id`-aware aggregation contract — `SUM` nets signed values across active rows regardless of `corrects_id` presence; `COUNT`/`MIN`/`MAX`/`AVG` over active rows WHERE `corrects_id IS NULL` ("compensation entries adjust SUM; they are not events") — is governed by `cpt-cf-usage-collector-dod-usage-query-aggregation-sum-nets`.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
-- `cpt-cf-usage-collector-seq-query-aggregated`
-
-**Constraints**: `cpt-cf-usage-collector-fr-query-aggregation`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`
-- Entities: `AggregationQuery`, `AggregationResult`
-
-### FR: Query Raw
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-fr-query-raw`
-
-The system **MUST** expose `GET /usage-collector/v1/records` with the mandatory typed `gts_id` query parameter, optional repeated `metadata.<key>` filters, and the OData query parameters (`$filter`, `$orderby`, `$top` / `limit`, `cursor`) — and the SDK `list_usage_records` operation per `sdk-trait.md` — as the single contract-first raw read path; accept `$filter` as an OData predicate over `UsageRecordFilterField` that MUST include the mandatory `timestamp ge X and timestamp lt Y` window (semantic mandatoriness enforced at the gateway after OData parsing and before plugin dispatch; missing window → canonical `InvalidArgument` `Problem`, `field_violations[0].reason="MISSING_TIME_WINDOW"` on `$filter`), `$orderby` is optional and normalized gateway-side to end in the canonical unique `(created_at, id)` suffix (appended in the caller order's direction; an omitted `$orderby` becomes `created_at asc, id asc`), while a caller order mixing `asc` and `desc` or naming an optional (nullable) field is rejected `400` with `field_violations[0].reason="VALIDATION"` on `$orderby` because keyset pagination requires a uniform-direction, never-null keyset, `$top` is bounded at 1,000 records per page (absent → defaults to the cap; a present value over the cap → rejected gateway-side with `field_violations[0].reason="VALIDATION"` on `$top`, never clamped), and `cursor` is a toolkit `CursorV1` opaque token decoded and validated at the gateway via `toolkit_odata::validate_cursor_against` (decode failure → `INVALID_CURSOR`; cursor minted against a different `$filter` → `FILTER_MISMATCH`; against a different `$orderby` → `ORDER_MISMATCH`; each a `field_violations[0]` on `cursor`); route every submission through `cpt-cf-usage-collector-component-query-gateway` and end the synchronous path with a cursor-paginated page returned by the storage plugin through the Plugin SPI `list_usage_records` capability invoked with the structured tuple `(filter_ast: FilterNode<UsageRecordFilterField>, order_keys: OrderKeys, page_after: Option<Keyset>, limit: u32)` over the persisted usage records — surfacing a `toolkit_odata::Page<UsageRecord>` envelope (`items`, optional `@nextLink` containing the freshly minted gateway-owned `CursorV1` bound to the current `$filter` AST and `$orderby` projection) anchored on the PDP-narrowed scope, with an empty `items` list (and no `@nextLink`) when no rows match (never a `Problem` envelope) and a freshly minted `CursorV1` in `@nextLink` only when more pages remain.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-- `cpt-cf-usage-collector-seq-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-fr-query-raw`
-
-**Touches**:
-
-- API: `GET /usage-collector/v1/records`
-- Entities: `RawQuery`, `UsageRecordFilterField`, `Keyset`, `toolkit_odata::Page<UsageRecord>`, `CursorV1`
-
-### FR: Tenant Isolation
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-fr-tenant-isolation`
-
-The system **MUST** derive tenant scope on every aggregated and raw read solely from the inbound `SecurityContext` and the `PdpConstraint` set returned by `cpt-cf-usage-collector-flow-foundation-pdp-authorize` through the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`), refuse any caller-supplied filter that attempts to widen the authorized tenant scope (clamped silently to the PDP bound — no widening permitted under any user-supplied input), and never return cross-tenant rows absent an explicit platform PDP permit —.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-- `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-
-**Constraints**: `cpt-cf-usage-collector-principle-pdp-centric-authorization`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
 - Component: `cpt-cf-usage-collector-component-query-gateway`
-- Entities: `SecurityContext`, `PdpConstraint`
-
-### NFR: Query Latency
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-nfr-query-latency`
-
-The system **MUST** meet the `cpt-cf-usage-collector-nfr-query-latency` budget on both read paths — p95 latency under the documented canonical load envelope (30-day single-tenant aggregated query bracketed by the `uc_query_duration_seconds` histogram per DESIGN §3.11) — by pushing aggregation and pagination into the storage plugin via the Plugin SPI (no per-row fan-out into the core per `plugin-spi.md` Method 3 and Method 4), gating every read with the per-component `access_scope_with` helper invocation against `cpt-cf-usage-collector-contract-authz-resolver` on the critical path without a results cache, and surfacing query timing metrics for SLO monitoring.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`
-
-**Constraints**: `cpt-cf-usage-collector-nfr-query-latency`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### NFR: Workload Isolation
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-nfr-workload-isolation`
-
-The system **MUST** isolate the read workload from the ingestion workload — `cpt-cf-usage-collector-component-query-gateway` is the only read-side dispatch component and remains structurally separate from `cpt-cf-usage-collector-component-ingestion-gateway`, so a read-side load spike or plugin slowdown MUST NOT degrade ingestion throughput; query in-flight and outcome telemetry (`uc_query_inflight`, `uc_query_requests_total` per DESIGN §3.11) are surfaced separately from the ingestion telemetry families.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-nfr-workload-isolation`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### NFR: Operational Visibility (Query-Path Instruments)
-
-- [x] `p2` - **ID**: `cpt-cf-usage-collector-dod-usage-query-nfr-operational-visibility`
-
-The system **MUST** emit the four query-path operational instruments owned by `cpt-cf-usage-collector-component-query-gateway` per the authoritative inventory rows in DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002), constructed on the gear's scoped `Meter` and pushed via OTLP through ToolKit's `SdkMeterProvider` per DESIGN [§3.11.4](../DESIGN.md#3114-observability-architecture-applicability-ops-design-002) (no gear-local `/metrics` scrape endpoint) — instrument names, label vocabularies, and bucket layouts are owned by the inventory and cited here, not redefined — realized on both read paths (REST and SDK alike) at the flow emit-point steps `inst-aggregated-inflight-increment` / `inst-raw-inflight-increment`, `inst-aggregated-result-rows-observe` / `inst-raw-result-rows-observe`, and `inst-aggregated-telemetry-complete` / `inst-raw-telemetry-complete`. **This entire surface is specified but not yet wired in gear source** (no meter instrument exists today — see §1.6 Deferred):
-
-- `uc_query_requests_total` (counter, labels `query_kind` / `outcome` / `error_category`) **MUST** be incremented exactly once when every query attempt completes — success or failure, aggregated and raw alike — carrying the `(query_kind, outcome, error_category)` tuple projected by the feature-owned exit→category mapping in `inst-aggregated-telemetry-complete` / `inst-raw-telemetry-complete`, where `error_category="none"` **MUST** be emitted only when `outcome="success"`. The label value sets are the closed DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) `uc_query_requests_total` vocabulary and are cited, not restated, here; every emitted label **MUST** stay within those value sets, which align with the canonical `Problem` discriminators per `cpt-cf-usage-collector-principle-canonical-errors`. The closed-set REST-handler-boundary categories (`missing_security_context`, `cursor_decode`, `order_mismatch`, `filter_mismatch`) are part of this contract but are produced upstream of the service pipeline (cursor / boundary checks in the REST handler); recording them requires handler-boundary emission, deferred per §1.6. Generic request-shape rejections that carry the `VALIDATION` `field_violations[].reason` (`$top` over cap, unknown parameters, malformed `gts_id`, unparseable OData) have **no** member in the closed §3.11.5 `error_category` set and are therefore not recorded on the counter at all — mirroring the ingestion sibling's structural `inst-emit-batch-cap-check` rejection in `usage-emission.md`.
-- `uc_query_duration_seconds` (histogram, label `query_kind`) **MUST** be observed exactly once when the same attempt completes, measuring the attempt's wall-clock seconds; the bucket layout brackets the 500 ms p95 `cpt-cf-usage-collector-nfr-query-latency` budget for the canonical 30-day single-tenant aggregated query per the DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) histogram row and the latency-budget table in DESIGN [§3.11.2](../DESIGN.md#3112-latency-budgets-perf-design-003) — the layout is cited from the inventory, not redefined here; the latency-SLO obligation carried on this histogram stays with `cpt-cf-usage-collector-dod-usage-query-nfr-query-latency`, which this DoD references rather than re-owns.
-- `uc_query_inflight` (gauge, label `query_kind`) **MUST** be incremented on query-gateway entry once authorization composes and decremented on query completion or failure — every exit path that follows the increment drains it, so the gauge never leaks under an early return; it is the current-state in-flight series feeding the workload-isolation alert in DESIGN [§3.11.6](../DESIGN.md#3116-alerting-and-error-budget-architecture-ops-design-005) and traces to `cpt-cf-usage-collector-nfr-workload-isolation`; the read-side surfacing obligation is shared with `cpt-cf-usage-collector-dod-usage-query-nfr-workload-isolation`, which names this gauge and the request counter and is referenced, not re-owned, here.
-- `uc_query_result_rows` (histogram, label `query_kind`) **MUST** be recorded exactly once when a query completes successfully — the raw page size (`items` length, ≤ 1,000 by the `$top` bound) or the aggregated group count (`buckets` length, capped at 100,000 per `usage-collector-v1.yaml`) — so that, read together with `uc_query_duration_seconds`, operators separate "slow because large" from "slow because degraded" per the DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) histogram row.
-
-The PDP-shared instruments (`uc_pdp_failures_total`, `uc_pdp_duration_seconds`, `uc_authz_decisions_total`, `uc_pdp_ready`) are owned by the Foundation feature's shared `access_scope_with` helper and the plugin-host instruments (`uc_plugin_*`) by the Foundation-owned plugin host — the query gateway's PDP and Plugin SPI dispatch steps inherit them and this DoD does **NOT** respecify them. Unbounded identifiers (`tenant_id`, UsageType `gts_id`, `subject_id`, `resource_id`, `trace_id`, `request_id`, cursor tokens) **MUST NOT** appear as labels on any of the four instruments per the DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) label-cardinality rule — they belong in structured logs and traces.
-
-This DoD realizes the query-path share of `cpt-cf-usage-collector-nfr-operational-visibility` (the NFR itself is foundation-owned per DECOMPOSITION §2.1) and feeds the workload-isolation alert source in DESIGN [§3.11.6](../DESIGN.md#3116-alerting-and-error-budget-architecture-ops-design-005). The `error_category` values emitted are exactly the reachable, closed-set members projected by the exit→category mapping in `inst-aggregated-telemetry-complete` / `inst-raw-telemetry-complete` (the service-boundary members recorded now; the handler-boundary members — including `missing_security_context` — recorded once handler-boundary emission lands). No `error_category` outside the closed §3.11.5 set is ever emitted; the gear's generic `VALIDATION` request-shape rejections (which have no member in that set) are refused pre-pipeline and left unrecorded rather than mapped to an unrelated category.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-nfr-operational-visibility`, `cpt-cf-usage-collector-nfr-workload-isolation`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-- Telemetry (specified; **not yet wired** in gear source — no meter instrument exists today, see §1.6): `uc_query_requests_total` counter, `uc_query_duration_seconds` histogram, `uc_query_inflight` gauge, `uc_query_result_rows` histogram
-
-### NFR: Authorization
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-nfr-authorization`
-
-The system **MUST** accept an inbound `SecurityContext` at both query entry points — on REST as `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`), on the SDK trait as `ctx: &SecurityContext` first parameter to `UsageCollectorClientV1::query_aggregated_usage_records` / `list_usage_records` per `sdk-trait.md` Methods 3 and 4 — and obtain the `(PdpDecision, PdpConstraint set)` envelope via `cpt-cf-usage-collector-flow-foundation-pdp-authorize` invoked through the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`) on every aggregated and raw read before any Plugin SPI dispatch, never cache a prior PDP decision and never synthesize identity, and fail closed with the canonical `Unauthenticated` `Problem` envelope (missing `SecurityContext`) or the propagated platform-authorization `Problem` envelope (PDP unavailable or `deny`).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-
-**Constraints**: `cpt-cf-usage-collector-principle-fail-closed`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### Principle: PDP-Centric Authorization
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-principle-pdp-centric-authorization`
-
-The system **MUST** flow every authorization decision — including row-scope narrowing — through `cpt-cf-usage-collector-flow-foundation-pdp-authorize` invoked via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`), MUST NOT inline any authorization logic outside the helper-bound invocation site, MUST compose user-supplied filters with the returned `PdpConstraint` set under intersection-only semantics, and MUST NOT widen the PDP-authorized scope under any user-supplied input (any widening attempt is silently clamped back to the PDP bound — no widening permitted under any circumstance).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-- `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-
-**Constraints**: `cpt-cf-usage-collector-principle-pdp-centric-authorization`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-- Entities: `PdpConstraint`, `SecurityContext`
-
-### Principle: Fail-Closed
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-principle-fail-closed`
-
-The system **MUST** return the canonical `Unauthenticated` `Problem` envelope when the inbound `SecurityContext` is missing at the handler boundary (REST handler did not receive `Extension<SecurityContext>` from ToolKit gateway middleware, or the SDK trait was invoked without a `ctx` argument); and the `unavailable` outcome with the fail-closed `Problem` envelope per `usage-collector-v1.yaml` when PDP (`cpt-cf-usage-collector-flow-foundation-pdp-authorize` invoked via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` against `cpt-cf-usage-collector-contract-authz-resolver`) or the bound storage plugin (Plugin SPI host-resolution `PluginUnavailable` / plugin-side `Transient` / `Internal` per `plugin-spi.md` Method 3 and Method 4) is unreachable on either read path; the gateway MUST NOT synthesize a partial aggregation, MUST NOT synthesize a partial page, MUST NOT cache a prior PDP decision, and MUST NOT infer identity.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-
-**Constraints**: `cpt-cf-usage-collector-principle-fail-closed`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### Constraint: No Business Logic
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-constraint-no-business-logic`
-
-The system **MUST** keep `cpt-cf-usage-collector-component-query-gateway` free of pricing, rating, invoice-generation, quota-enforcement, and any other business-rule transformation — the read path surfaces raw `UsageRecord` rows (raw path) and counter / gauge `AggregationResult` `buckets` (aggregated path) verbatim from the storage plugin without unit conversion, currency conversion, or rule-based filtering; downstream rating / billing / reporting consumers own all such transformations.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-constraint-no-business-logic`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### Constraint: NFR Thresholds
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-constraint-nfr-thresholds`
-
-The system **MUST** enforce every NFR threshold relevant to the read path at `cpt-cf-usage-collector-component-query-gateway` prior to Plugin SPI dispatch — mandatory `time_range`, the raw-path `page_size` cap (≤ 1,000 records per page), the aggregated-path result cap (≤ 100,000 rows over a 90-day single-tenant window with ≤ 2 groupings), and the query-latency budget (`cpt-cf-usage-collector-nfr-query-latency`) — surfacing a request-level structural validation `Problem` envelope on cap violation per `usage-collector-v1.yaml` and never relying on the storage plugin to enforce a missing gateway-side cap.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-
-**Constraints**: `cpt-cf-usage-collector-constraint-nfr-thresholds`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-
-### Component: Query Gateway
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-component-query-gateway`
-
-The system **MUST** realize `cpt-cf-usage-collector-component-query-gateway` per DESIGN §3.2 Component Model — front the two read endpoints (`POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`) and the SDK read operations, accept the `SecurityContext` at both entry points (REST handler with `Extension<SecurityContext>` from ToolKit gateway middleware via `OperationBuilder::authenticated()`; SDK trait `query_aggregated_usage_records(ctx, ...)` / `list_usage_records(ctx, ...)` with `ctx: &SecurityContext` as the first parameter per `sdk-trait.md` Methods 3 and 4), perform structural validation (mandatory `time_range`, page-cap, aggregated-path single-UsageType filter), perform per-component PDP enforcement via the `access_scope_with` helper (`PolicyEnforcer::access_scope_with(ctx, ...)` against `cpt-cf-usage-collector-contract-authz-resolver`) realizing `cpt-cf-usage-collector-flow-foundation-pdp-authorize`, compose user-supplied filters with the returned `PdpConstraint` set under intersection-only semantics, dispatch to the bound storage plugin through `cpt-cf-usage-collector-component-plugin-host`, and serialize the result `AggregationResult` or `toolkit_odata::Page<UsageRecord>` per `usage-collector-v1.yaml` without inlining any business logic and without caching results.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-component-query-gateway`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Entities: `AggregationQuery`, `AggregationResult`, `RawQuery`, `UsageRecordFilterField`, `Keyset`, `toolkit_odata::Page<UsageRecord>`, `CursorV1`
-
-### Sequence: Query Aggregated
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-seq-query-aggregated`
-
-The system **MUST** implement `cpt-cf-usage-collector-seq-query-aggregated` end-to-end per DESIGN §3.6 — thread the caller through `cpt-cf-usage-collector-interface-rest-api` (REST handler receiving `Extension<SecurityContext>` from ToolKit gateway middleware) or `cpt-cf-usage-collector-interface-sdk-client` (SDK trait `query_aggregated_usage_records(ctx, ...)` with `ctx: &SecurityContext` first per `sdk-trait.md` Method 3), `cpt-cf-usage-collector-component-query-gateway` (which performs per-component PDP authorization via the `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver` and enforces the mandatory bounded time window via `require_bounded_time_window`), `cpt-cf-usage-collector-component-plugin-host`, and the bound storage plugin (pure-persistence) — with the gateway resolving `gts_id` existence pre-dispatch via a `get_usage_type` call (an unregistered one surfacing as canonical `NotFound`, 404, before dispatch) and enforcing the op-per-kind restriction pre-dispatch (a mismatched `(op, kind)` → `InvalidArgument`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`, 400; counter admits `{SUM, COUNT}`, gauge admits `{MIN, MAX, AVG, COUNT}`), and narrowing the user-supplied filters with the PDP-returned `PdpConstraint` set under intersection-only semantics prior to Plugin SPI `query_aggregated_usage_records` dispatch.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-
-**Constraints**: `cpt-cf-usage-collector-seq-query-aggregated`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`
-- Component: `cpt-cf-usage-collector-component-usage-type-catalog`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-plugin-host`
-
-### Sequence: Query Raw
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-seq-query-raw`
-
-The system **MUST** implement `cpt-cf-usage-collector-seq-query-raw` end-to-end per DESIGN §3.6 — thread the caller through `cpt-cf-usage-collector-interface-rest-api` (REST handler receiving `Extension<SecurityContext>` from ToolKit gateway middleware) or `cpt-cf-usage-collector-interface-sdk-client` (SDK trait `list_usage_records(ctx, ...)` with `ctx: &SecurityContext` first per `sdk-trait.md` Method 4), `cpt-cf-usage-collector-component-query-gateway` (which performs per-component PDP authorization via the `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`), `cpt-cf-usage-collector-component-plugin-host`, and the bound storage plugin — narrowing user-supplied predicates with the PDP-returned `PdpConstraint` set under intersection-only semantics, decoding and validating the optional toolkit `CursorV1` `cursor` query parameter against the parsed `$filter` AST and `$orderby` projection via `toolkit_odata::validate_cursor_against` at the gateway (the cursor wire format is NEVER forwarded to the plugin SPI; the gateway mints a fresh `CursorV1` from the plugin-returned `last_keyset` and embeds it in `@nextLink` when more pages remain), dispatching the structured tuple `(filter_ast, order_keys, page_after, limit)` to the Plugin SPI `list_usage_records` capability, and bounding `$top` prior to dispatch (absent → the 1,000 cap; a present value over the cap rejected gateway-side with `field_violations[0].reason="VALIDATION"`, never clamped).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-
-**Constraints**: `cpt-cf-usage-collector-seq-query-raw`
-
-**Touches**:
-
-- API: `GET /usage-collector/v1/records`
-- Entities: `CursorV1`, `Keyset`, `toolkit_odata::Page<UsageRecord>`
-
-
-### Contract: Downstream Usage Reader
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-contract-downstream-usage-reader`
-
-The system **MUST** honor the outbound `cpt-cf-usage-collector-contract-downstream-usage-reader` surface served by `cpt-cf-usage-collector-component-query-gateway` per DESIGN §3.5 Downstream Usage Reader Contract — downstream rating / billing / reporting / dashboard consumers depend on the documented REST and SDK request shapes (`AggregationQuery`, `RawQuery`), the documented result shapes (`AggregationResult`, `toolkit_odata::Page<UsageRecord>` for the raw read, toolkit `CursorV1` opaque continuation embedded in `@nextLink`), the PDP-narrowed scope semantics (filters can only narrow, never widen), the stable error categories (`InvalidArgument` with `field_violations[0].reason` ∈ {`MISSING_TIME_WINDOW`, `INVALID_CURSOR`, `ORDER_MISMATCH`, `FILTER_MISMATCH`, `INVALID_ORDERBY_FIELD`, and `VALIDATION` for a `$top` over the page cap}; `PermissionDenied`; `NotFound` for an unregistered usage type; `ServiceUnavailable` per `usage-collector-v1.yaml`), and the active-and-inactive record visibility rule. Business logic (pricing, rating, invoice generation, quota enforcement) MUST NOT be performed inside the Usage Collector — it is the responsibility of the downstream reader.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-contract-downstream-usage-reader`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`, `GET /usage-collector/v1/records`
-- Entities: `AggregationQuery`, `AggregationResult`, `RawQuery`, `UsageRecordFilterField`, `Keyset`, `toolkit_odata::Page<UsageRecord>`, `CursorV1`
-
-### Entity: AggregationQuery
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-query`
-
-The system **MUST** treat `AggregationQuery` per DESIGN §3.1 — accept exactly one mandatory `gts_id` as a typed required parameter (a malformed value → `InvalidArgument`, `.reason="INVALID_BASE_GTS_ID"`; an unregistered `gts_id` surfaces as `NotFound` from a pre-dispatch `get_usage_type` resolution, which also resolves the usage `kind` so an `(op, kind)` pair the kind does not admit (counter admits `{SUM, COUNT}`; gauge admits `{MIN, MAX, AVG, COUNT}`) is rejected as `InvalidArgument`, `.reason="OP_NOT_ALLOWED_FOR_KIND"`, before dispatch), one mandatory bounded time window (missing → `InvalidArgument`, `.reason="MISSING_TIME_WINDOW"`), a mandatory `aggregation` operator (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG` per the `AggregationOp` enum in `usage-collector-v1.yaml`; a missing or unsupported value is rejected at request-body deserialization as `InvalidArgument`, HTTP `400`), optional `group_by` keys, and optional caller-supplied narrowing filters (`tenant_id` / `resource_ref` / `subject_ref` / `status` per `usage-collector-v1.yaml` `AggregationRequest`) that MUST NOT widen the PDP-authorized scope under any user-supplied input (clamped silently).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-
-**Constraints**: `AggregationQuery`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`
-- Entities: `AggregationQuery`
-
-### Entity: AggregationResult
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-result`
-
-The system **MUST** treat `AggregationResult` per DESIGN §3.1 — return aggregated counter / gauge `buckets` for the resolved PDP-authorized scope (anchored on the `SecurityContext`), surface `gts_id`, the chosen `aggregation`, and the `buckets` list verbatim from the storage plugin without business-logic transformation, and surface an empty `buckets` list (never a `Problem` envelope) when no rows match within the authorized scope per `plugin-spi.md` Method 3.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
-
-**Constraints**: `AggregationResult`
-
-**Touches**:
-
-- API: `POST /usage-collector/v1/records/aggregate`
 - Entities: `AggregationResult`
 
-### Entity: RawQuery
+### Withdrawn Pairs Excluded by the Plugin, Not by the Gear
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-raw-query`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-aggregate-withdrawn-pair-exclusion`
 
-The system **MUST** treat `RawQuery` per DESIGN §3.1 — accept the mandatory `timestamp ge X and timestamp lt Y` time-range window expressed inside the `$filter` OData predicate (semantic mandatoriness enforced at the gateway after OData parsing and before plugin dispatch), an optional `cursor` query parameter (toolkit `CursorV1` opaque token decoded and validated at the gateway via `toolkit_odata::validate_cursor_against`; never decoded by the plugin SPI), the mandatory typed `gts_id` query parameter, optional repeated `metadata.<key>` filters, a bounded `$top` / `limit` (≤ 1,000 records per page), an optional `$orderby` the gateway normalizes to end in the canonical unique `(created_at, id)` suffix, and optional caller-supplied narrowing predicates over `UsageRecordFilterField` (`tenant_id` / `subject_id` / `subject_type` / `resource_id` / `resource_type` / `status` per `usage-collector-v1.yaml`) that MUST NOT widen the PDP-authorized scope under any user-supplied input (clamped silently).
+**Task 11 traceability note.** Unticked and unmarked, same owner and ground
+as `algo-withdrawn-pair-exclusion-pushdown` above: the storage plugin, bound
+by the Plugin SPI contract rather than by gear code. The title names it
+exactly — "Excluded by the Plugin, Not by the Gear" — and the measured gear
+code agrees: `Service::query_aggregated_usage_records` dispatches and
+returns what the plugin computes, with nothing in between that fetches,
+excludes or filters.
 
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-
-**Constraints**: `RawQuery`
-
-**Touches**:
-
-- API: `GET /usage-collector/v1/records`
-- Entities: `RawQuery`
-
-### Cursor: CursorV1 Toolkit Adoption
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-cursor-v1-toolkit-adoption`
-
-The system **MUST** adopt toolkit `CursorV1` as the raw-read continuation wire format and locate cursor decode + validation at the gateway:
-
-- Cursor wire format is toolkit `CursorV1` (opaque to client, base64url-encoded, contains version tag + bound filter/order digest + keyset payload).
-- The gateway decodes and validates the cursor against the current parsed `$filter` AST and `$orderby` projection via `toolkit_odata::validate_cursor_against` BEFORE any PDP or plugin work.
-- Validation failures map to canonical `InvalidArgument` `Problem` responses with a `field_violations[0]` on `cursor`: `Malformed` → `reason="INVALID_CURSOR"`; `OrderMismatch` → `"ORDER_MISMATCH"`; `FilterMismatch` → `"FILTER_MISMATCH"`.
-- The cursor is bound to the canonical keyset `(created_at, id)` and is NEVER decoded by the plugin SPI; the plugin receives only a typed `page_after: Option<Keyset>` projected from the validated cursor by the gateway.
-- Existing entity-cursor-token semantics (opaque, single-use, server-minted) are preserved; what changes is the wire format (toolkit `CursorV1`) and the validation locus (gateway, not plugin).
+The system **MUST** exclude both entries of every withdrawn pair — the withdrawn
+record and the invalidation entry that withdraws it — from the set an aggregation
+folds. That exclusion **MUST** be pushed down to the storage plugin as part of
+the dispatched query. The gear **MUST NOT** fetch entries in order to exclude
+them, and **MUST NOT** filter returned buckets after the fact. A storage plugin
+holding a pre-computed or materialised aggregate **MUST** recompute over the
+affected range when an invalidation is accepted, rather than adding a further
+contribution to it. The exclusion **MUST** apply on the aggregated path only.
 
 **Implements**:
-
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-
-**Constraints**: `cpt-cf-usage-collector-principle-cursor-gateway-ownership`
+- `cpt-cf-usage-collector-algo-withdrawn-pair-exclusion-pushdown`
+- `cpt-cf-usage-collector-flow-query-aggregated-usage`
 
 **Touches**:
-
-- API: `GET /usage-collector/v1/records`
-- Entities: `CursorV1`, `Keyset`, `UsageRecordFilterField`
-
-### Entity: PdpConstraint
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-pdp-constraint`
-
-The system **MUST** consume `PdpConstraint` per foundation DESIGN — a read-only constraint envelope returned by `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked from `cpt-cf-usage-collector-component-query-gateway` via the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`) paired with the `PdpDecision`, composed with the user-supplied filters under intersection-only semantics such that user-supplied filters MUST NOT widen the authorized scope under any user-supplied input (any widening attempt is silently clamped back to the constraint bound).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-
-**Constraints**: `PdpConstraint`
-
-**Touches**:
-
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-- Entities: `PdpConstraint`
-
-### Entity: SecurityContext
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-security-context`
-
-The system **MUST** consume `SecurityContext` per foundation DESIGN — the platform-resolved caller-identity envelope accepted at the two convention-bound entry points (on REST as `Extension<SecurityContext>` populated by ToolKit gateway middleware via `OperationBuilder::authenticated()`; on the SDK trait as `ctx: &SecurityContext` first parameter to `UsageCollectorClientV1::query_aggregated_usage_records(ctx, ...)` / `list_usage_records(ctx, ...)` per `sdk-trait.md` Methods 3 and 4) — as the SOLE source of tenant scope on both read paths; `cpt-cf-usage-collector-component-query-gateway` MUST anchor every PDP-constraint composition (via the per-component `access_scope_with` helper against `cpt-cf-usage-collector-contract-authz-resolver`) and every Plugin SPI dispatch on this inbound context, MUST NOT synthesize or infer identity, and MUST NOT widen the authorized tenant scope under any user-supplied filter.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
-- `cpt-cf-usage-collector-algo-usage-query-attribution-and-pdp-authorization-on-read`
-
-**Constraints**: `SecurityContext`
-
-**Touches**:
-
-- Component: `cpt-cf-usage-collector-component-query-gateway`
-- Entities: `SecurityContext`
-
-### Entity: ResourceRef
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-entity-resource-ref`
-
-The system **MUST** consume `ResourceRef` per DESIGN §3.1 — caller-supplied resource attribution (`resource_id` / `resource_type`) honored exclusively as a query-filter dimension intersected with the PDP-authorized scope under `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2` — never as a basis for widening the PDP-authorized scope; any user-supplied `ResourceRef` outside the `PdpConstraint` bound is silently clamped back to the constraint bound.
-
-**Implements**:
-
-- `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`
-
-**Constraints**: `ResourceRef`
-
-**Touches**:
-
-- Entities: `ResourceRef`
-
-### API: POST /usage-collector/v1/records/aggregate
-
-- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-api-post-records-aggregate`
-
-The system **MUST** expose `POST /usage-collector/v1/records/aggregate` per `usage-collector-v1.yaml` and DESIGN §3.3 — with the REST handler receiving `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`) and delegating to `UsageCollectorClientV1::query_aggregated_usage_records(ctx, ...)` per `sdk-trait.md` Method 3 — accept an `AggregationRequest` (`AggregationQuery`) carrying a typed `gts_id` (malformed → `InvalidArgument`, `.reason="INVALID_BASE_GTS_ID"`) and a closed-enum `aggregation` operator (absent / unsupported → `InvalidArgument`, HTTP `400`, at body deserialization), enforce the mandatory bounded time window via `require_bounded_time_window` (missing → `InvalidArgument`, `.reason="MISSING_TIME_WINDOW"`), perform per-component PDP authorization via the `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` realizing `cpt-cf-usage-collector-flow-foundation-pdp-authorize` against `cpt-cf-usage-collector-contract-authz-resolver`, resolve the usage type pre-dispatch via a `get_usage_type` call (an unregistered `gts_id` → canonical `NotFound`, HTTP `404`, before dispatch) and enforce the op-per-kind restriction pre-dispatch (an op the resolved `kind` does not admit — `sum` on a gauge, or `min`/`max`/`avg` on a counter — → `InvalidArgument`, HTTP `400`, `field_violations[0].reason="OP_NOT_ALLOWED_FOR_KIND"`; counter admits `{sum, count}`, gauge admits `{min, max, avg, count}`), dispatch the composed filter set + time window + typed `gts_id` + aggregation operator + `group_by` keys to the Plugin SPI `query_aggregated_usage_records` capability via `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2` (the storage plugin stays pure-persistence and only ever receives an allowed `(op, kind)` pair), and return either a `AggregationResult` or one of the stable `rejected-validation` / `denied` / `unavailable` `Problem` envelopes (missing `SecurityContext` at the handler boundary surfaces the canonical `Unauthenticated` `Problem` envelope per the yaml's `default` response).
-
-**Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-aggregated`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-aggregate-dispatch-v2`
-
-**Constraints**: `cpt-cf-usage-collector-interface-rest-api`
-
-**Touches**:
-
 - API: `POST /usage-collector/v1/records/aggregate`
-- Component: `cpt-cf-usage-collector-component-usage-type-catalog`, `cpt-cf-usage-collector-component-query-gateway`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `AggregationResult`
 
-### API: GET /usage-collector/v1/records
+### Raw Reads Return Withdrawn Pairs as Persisted
 
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-usage-query-api-post-records-query`
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-raw-returns-persisted-pair`
 
-The system **MUST** expose `GET /usage-collector/v1/records` per `usage-collector-v1.yaml` and DESIGN §3.3 with the mandatory typed `gts_id` query parameter, optional repeated `metadata.<key>` filters, and the OData query parameters `$filter`, `$orderby`, `$top` / `limit`, `cursor` (`RawQuery`) — with the REST handler receiving `Extension<SecurityContext>` populated by ToolKit gateway middleware (`OperationBuilder::authenticated()`) and delegating to `UsageCollectorClientV1::list_usage_records(ctx, ...)` per `sdk-trait.md` Method 4; parse and validate the OData expressions, enforce the semantic mandatoriness of `timestamp ge X and timestamp lt Y` inside `$filter` at the gateway after OData parsing and before plugin dispatch (missing window → canonical `InvalidArgument` `Problem`, `field_violations[0].reason="MISSING_TIME_WINDOW"` on `$filter`), normalize the optional `$orderby` to end in the canonical unique `(created_at, id)` suffix in the caller order's direction (an omitted `$orderby` becoming `created_at asc, id asc`) and reject a caller order that mixes `asc` and `desc` or names an optional (nullable) field with `field_violations[0].reason="VALIDATION"` on `$orderby`, bound `$top` to the 1,000-record page cap (absent → the cap; a present value over the cap rejected gateway-side with `field_violations[0].reason="VALIDATION"`, never clamped), decode the optional `cursor` query parameter as a toolkit `CursorV1` value and validate it via `toolkit_odata::validate_cursor_against` against the parsed `$filter` AST and `$orderby` projection (`Malformed` → `INVALID_CURSOR`; `OrderMismatch` → `ORDER_MISMATCH`; `FilterMismatch` → `FILTER_MISMATCH`, each a `field_violations[0]` on `cursor`), perform per-component PDP authorization via the `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` realizing `cpt-cf-usage-collector-flow-foundation-pdp-authorize` against `cpt-cf-usage-collector-contract-authz-resolver`, dispatch the structured tuple `(filter_ast: FilterNode<UsageRecordFilterField>, order_keys: OrderKeys, page_after: Option<Keyset>, limit: u32)` to the Plugin SPI `list_usage_records` capability via `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2` (the cursor wire format is NEVER forwarded to the plugin SPI), mint the next `CursorV1` from the plugin-returned `last_keyset` bound to the current `$filter` / `$orderby`, and return either a `toolkit_odata::Page<UsageRecord>` envelope (with an optional `@nextLink` containing the freshly minted gateway-owned `CursorV1`) or one of the stable `rejected-validation` / `denied` / `unavailable` canonical `toolkit_canonical_errors::Problem` envelopes (missing `SecurityContext` at the handler boundary surfaces the canonical `Unauthenticated` `Problem` envelope per the yaml's `default` response).
+The system **MUST** return a withdrawn record and the invalidation entry that
+withdraws it on the raw read path and on the point lookup, each exactly as
+persisted. The implementation **MUST NOT** apply a fold on either path, **MUST
+NOT** add a marker, flag or derived field indicating withdrawal, and **MUST NOT**
+suppress, reorder or merge either entry of a pair. Interpreting the entry type
+and the target reference **MUST** be left to the caller. A range-scoped raw read
+that returns a withdrawn record **MUST** also return the invalidation that
+withdraws it, and so **MUST** a read narrowed or grouped by any declared metadata
+property that selected the target, because the invalidation copies the target's
+period and metadata.
 
 **Implements**:
-
-- `cpt-cf-usage-collector-flow-usage-query-query-raw`
-- `cpt-cf-usage-collector-algo-usage-query-cursor-pagination-orchestration-v2`
-- `cpt-cf-usage-collector-algo-usage-query-plugin-spi-raw-page-dispatch-v2`
-
-**Constraints**: `cpt-cf-usage-collector-interface-rest-api`
+- `cpt-cf-usage-collector-algo-raw-ledger-projection`
+- `cpt-cf-usage-collector-flow-query-raw-ledger-page`
+- `cpt-cf-usage-collector-flow-find-withdrawal-of-record`
 
 **Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `GET /usage-collector/v1/records/{id}`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `UsageRecord`
 
-- API: `GET /usage-collector/v1/records`
+### Unstripped Field Set on Every Ledger Read
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-unstripped-ledger-fields`
+
+The system **MUST** return, unstripped, on the raw read path and the point
+lookup: the entry identifier, the idempotency key, the GTS type reference, the
+covered period, the acceptance instant, the declared metadata values, the signed
+quantity, the entry type, the origin marker, and — on an entry declaring the
+invalidation type — the identifier of the record it withdraws together with its
+reason code. No field of that set **MUST** be omitted, truncated or masked on
+either path. The metering unit and the fold **MUST NOT** be carried per entry,
+being resolved from the declaration. No read path **MUST** carry a reverse link
+from a record to a withdrawal of it; a reader finds one with a single raw read
+narrowed on the target-reference field over the period the record covers. The
+aggregated path is outside this field set and **MUST** carry no part of it.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-raw-ledger-projection`
+- `cpt-cf-usage-collector-flow-lookup-entry-by-identifier`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `GET /usage-collector/v1/records/{id}`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `UsageRecord`
+
+### Caller-Supplied Names Validated Before Dispatch
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-query-field-validation`
+
+The system **MUST** validate every name a caller supplies against the set the
+surface it arrived on admits, before dispatching anything to the storage plugin.
+A filter operand **MUST** be a member of the fixed filter field set. A metadata
+predicate key **MUST** be a property the resolved declaration declares. A
+grouping dimension **MUST** be one of the five fixed dimensions or a declared
+property, **MUST** appear at most once, and **MUST** be admitted in any
+combination and any order with no ceiling on count. An order key on the raw path
+**MUST** belong to the published order key set, and one sort direction **MUST**
+apply across the whole order. A name outside its set **MUST** draw an actionable
+validation error naming that name, rather than an empty result or an absent
+dimension.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-query-field-validation`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `UsageRecordFilterField`, `AggregationDimension`, `MetadataFilter`
+
+### Authorized Scope Composed Ahead of Caller Filters
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-scope-precedes-user-filter`
+
+**Task 11 traceability note — Step 4a / ruling G17's measurement, a stop
+(corrected in fix round 1).** Unticked and unmarked.
+`authorize_list_usage_records` has two production callers under
+`actions::LIST` (`Service::list_usage_records` and
+`Service::query_aggregated_usage_records`), so G17's "a meter-narrowed PDP
+grant can measure but cannot withdraw" finding is in the aggregate read's
+blast radius. A real, assertion-backed PDP round-trip
+(`g17_aggregate_read_measurement_tests::a_meter_narrowed_grant_on_the_aggregate_read`,
+`domain/service_tests.rs`, driving both `MeterNarrowingPermitResolver::sole`
+and `::with_tenant_only_sibling`, plus an `In [meter]` narrowing) measured the
+aggregate read **denied** on every shape driven, with `pep_property_to_field`'s
+named reason (`domain/authz.rs`): a constraint over `gts_type_id` is refused
+on every projection of the scope, not served narrowed-to-tenant.
+
+**This closes a documented route-level hole; it is not new ground at the
+gate.** The same denial is already asserted, for both resolver shapes, at
+the function the aggregate read shares with the raw list —
+`authz_tests::a_meter_constraint_beside_a_sibling_is_denied_not_silently_narrowed_on_list`
+(`authz_tests.rs:748`) and
+`authz_tests::a_scope_naming_the_meter_is_denied_by_name_on_the_list_path`
+(`:769`) — both against `authorize_list_usage_records` directly. What those
+two leave unasserted is the **route**: `domain/authz.rs`'s
+`pep_property_to_field` doc already names the gap in its own words — "Four
+actions, but five REST surfaces" — warning that an operator "reading a
+release note that enumerated only the actions would not find the aggregate
+route in it, and would then watch it 403." This test closes that documented
+route-level hole for `POST /records/aggregate`; it does not surface a new
+gate-level behaviour.
+
+**The "no silent widening" conclusion has a structural reason, and one named,
+pre-existing carve-out.** `query_aggregated_usage_records`'s SPI carries the
+scope through no channel but the composed `$filter` (unlike
+`get_usage_record` / `read_feed_page` / `get_reconciliation_metadata`, each
+of which takes a separate `scope` parameter), so a widening needs the meter
+predicate to vanish from that filter while a tenant predicate survives in
+it — and under this build it cannot, because `gts_type_id` is advertised and
+`scope_to_odata_filter`'s per-constraint `?` denies the whole projection the
+moment any constraint names it. The one known carve-out is the SDK
+compiler's **generic** drop-and-continue fail-open for a *capability-gated*
+predicate (`InGroup` is the shape on record) the enforcer never negotiated —
+already written up in this crate at
+`test_support::UncompilableSiblingPermitResolver`'s doc
+(`test_support.rs:676-696`) — not a new meter-narrowing
+finding. It stays theoretical for every shape driven here —
+`MeterNarrowingPermitResolver` emits a plain `Eq`, and the fix round 1
+review additionally confirmed an `In [meter]` narrowing denied identically;
+neither is `InGroup` — and because the test enforcer's no-capabilities
+posture matches production (`test_support.rs:1165-1176`).
+
+Surfaced, not fixed — the owner of G17's release note decides whether
+`DESIGN.md:2024`'s "Known limitation: a meter-narrowed grant can measure but
+cannot withdraw" sentence needs the aggregate route named explicitly (the
+code-level doc at `domain/authz.rs`'s `pep_property_to_field` already does).
+Per the brief's own branching: a denial here means stop, don't tick, name the
+owner.
+
+The system **MUST** authorize every read at the policy decision point and
+**MUST** apply the returned constraints as filters before any caller-supplied
+filter narrows the result. A caller filter **MUST** only intersect with that
+scope and **MUST NOT** widen it, including a filter naming a tenant the scope
+excludes. A denial, or an empty compiled constraint set, **MUST** fail closed
+with nothing dispatched. This feature **MUST** reuse
+`cpt-cf-usage-collector-algo-read-scope-composition` for the composition itself
+and **MUST NOT** implement a second composition rule; it owns only the validation
+of the names the caller supplied, which that routine leaves to the read path.
+
+**Implements**:
+- `cpt-cf-usage-collector-flow-query-aggregated-usage`
+- `cpt-cf-usage-collector-flow-query-raw-ledger-page`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `GET /usage-collector/v1/records/{id}`,
+  `POST /usage-collector/v1/records/aggregate`
 - Component: `cpt-cf-usage-collector-component-query-gateway`
 
-### §2.4-item → DoD-ID Coverage Matrix
+### Gateway-Owned Cursor on the Raw Path
 
-Coverage of every DECOMPOSITION §2.4 catalog item:
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-gateway-owned-cursor`
 
-| §2.4 Item                                                                                                            | Kind              | DoD ID                                                                       |
-| -------------------------------------------------------------------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------- |
-| `cpt-cf-usage-collector-fr-query-aggregation`                                                                        | FR                | `cpt-cf-usage-collector-dod-usage-query-fr-query-aggregation`                |
-| `cpt-cf-usage-collector-fr-query-raw`                                                                                | FR                | `cpt-cf-usage-collector-dod-usage-query-fr-query-raw`                        |
-| `cpt-cf-usage-collector-fr-tenant-isolation`                                                                         | FR                | `cpt-cf-usage-collector-dod-usage-query-fr-tenant-isolation`                 |
-| `cpt-cf-usage-collector-nfr-query-latency`                                                                           | NFR               | `cpt-cf-usage-collector-dod-usage-query-nfr-query-latency`                   |
-| `cpt-cf-usage-collector-nfr-workload-isolation`                                                                      | NFR               | `cpt-cf-usage-collector-dod-usage-query-nfr-workload-isolation`              |
-| `cpt-cf-usage-collector-principle-pdp-centric-authorization`                                                         | Principle         | `cpt-cf-usage-collector-dod-usage-query-principle-pdp-centric-authorization` |
-| `cpt-cf-usage-collector-principle-fail-closed`                                                                       | Principle         | `cpt-cf-usage-collector-dod-usage-query-principle-fail-closed`               |
-| `cpt-cf-usage-collector-constraint-no-business-logic`                                                                | Design constraint | `cpt-cf-usage-collector-dod-usage-query-constraint-no-business-logic`        |
-| `cpt-cf-usage-collector-constraint-nfr-thresholds`                                                                   | Design constraint | `cpt-cf-usage-collector-dod-usage-query-constraint-nfr-thresholds`           |
-| `cpt-cf-usage-collector-component-query-gateway`                                                                     | Design component  | `cpt-cf-usage-collector-dod-usage-query-component-query-gateway`             |
-| `cpt-cf-usage-collector-seq-query-aggregated`                                                                        | Sequence          | `cpt-cf-usage-collector-dod-usage-query-seq-query-aggregated`                |
-| `cpt-cf-usage-collector-seq-query-raw`                                                                               | Sequence          | `cpt-cf-usage-collector-dod-usage-query-seq-query-raw`                       |
-| `cpt-cf-usage-collector-contract-downstream-usage-reader`                                                            | Contract          | `cpt-cf-usage-collector-dod-usage-query-contract-downstream-usage-reader`    |
-| `AggregationQuery`                                                                    | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-query`            |
-| `AggregationResult`                                                                   | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-result`           |
-| `RawQuery`                                                                            | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-raw-query`                    |
-| `cpt-cf-usage-collector-principle-cursor-gateway-ownership`                                                          | Policy            | `cpt-cf-usage-collector-dod-usage-query-cursor-v1-toolkit-adoption`           |
-| `PdpConstraint`                                                                       | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-pdp-constraint`               |
-| `SecurityContext`                                                                     | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-security-context`             |
-| `ResourceRef`                                                                         | Entity            | `cpt-cf-usage-collector-dod-usage-query-entity-resource-ref`                 |
-| `POST /usage-collector/v1/records/aggregate`                                                                         | API               | `cpt-cf-usage-collector-dod-usage-query-api-post-records-aggregate`          |
-| `GET /usage-collector/v1/records`                                                                                    | API               | `cpt-cf-usage-collector-dod-usage-query-api-post-records-query`              |
+The system **MUST** mint, decode and validate every raw-path continuation token
+in the Query Gateway. The storage plugin **MUST** receive a structured keyset of
+the last row's sort values and **MUST NOT** mint, encode or interpret a wire
+token. The gateway **MUST** append the covered-period end and the entry
+identifier to the caller's order in the caller's direction, and that pair
+**MUST** be the whole order where the caller supplied none, so the plugin always
+receives a gap-free keyset of uniform direction whose values are always present.
+The token **MUST** bind the effective order and a digest of the filter set it was
+minted under, and **MUST NOT** bind any part of the authorized scope, which is
+evaluated per request. A malformed token, a filter mismatch, an order supplied
+alongside a token, and an order contradicting the bound one **MUST** each be
+rejected with its own actionable reason naming the cursor. The token **MUST**
+stay within the published length bound. Offset scans **MUST NOT** exist on this
+path.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-query-cursor-lifecycle`
+- `cpt-cf-usage-collector-flow-query-raw-ledger-page`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `Keyset`
+
+### Canonical Page on Raw, Non-Paginated Body on Aggregate
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-canonical-page-envelope`
+
+The system **MUST** return raw reads in the platform's canonical page envelope
+and **MUST** define no paging schema of its own. The aggregated read **MUST**
+return a non-paginated typed body, because its size is bounded by grouping
+cardinality rather than by row volume, and **MUST NOT** carry a cursor, a page
+size, or a continuation of any kind. A result that would exceed the aggregation
+result limit the public contract fixes **MUST** be refused with an actionable
+error rather than truncated silently. Errors on all three paths **MUST** use the
+platform's canonical error envelope.
+
+**Implements**:
+- `cpt-cf-usage-collector-flow-query-raw-ledger-page`
+- `cpt-cf-usage-collector-flow-query-aggregated-usage`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `AggregationResult`
+
+### Point Lookup Returns the Exact Persisted Fact
+
+- [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-point-lookup-exact-fact`
+
+The system **MUST** return the exact persisted entry for a point lookup by
+identifier, with the unstripped field set intact and no derived field added. The
+lookup **MUST** carry no type reference, no time range, no filter and no paging,
+so the compiled authorized scope is the whole filter applied to it. An entry
+outside that scope **MUST** produce the identical not-found outcome an absent
+identifier produces, with no observable difference, so the surface is no oracle
+for the existence of entries a caller may not read. The lookup **MUST** resolve a
+record and an invalidation entry alike, filtering on no entry type.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-point-lookup-resolution`
+- `cpt-cf-usage-collector-flow-lookup-entry-by-identifier`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records/{id}`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `UsageRecord`
+
+### An Empty Selection Still Answers
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-empty-selection-answer`
+
+**Task 11 traceability note.** Unticked and unmarked. Owner: the storage
+plugin. The fold's behaviour over an empty selection — zero for `SUM`/`COUNT`,
+absent for `MAX`/`MIN`/`LATEST` — is the plugin's own computation; the SDK's
+own `AggregationBucket.value` doc states "DESIGN §3.3's plugin obligations
+are normative for it" and quotes that exact split. `Service::query_aggregated_usage_records`
+has no branch for an empty result: it dispatches and returns what the plugin
+computed, modulo the bucket-count cap check (marked under
+`dod-canonical-page-envelope`).
+
+The system **MUST** answer an aggregated read whose selection is empty rather
+than failing it. An accruing fold and a counting fold **MUST** report zero, and
+an observation fold **MUST** report an absent value. This **MUST** hold both for
+a query matching no entry at all and for a range in which every selected entry
+belongs to a withdrawn pair, because the exclusion empties a selection rather
+than removing a bucket. A grouped query **MUST** yield no bucket for a group in
+which nothing survived, and an entry carrying no value at a selected dimension
+**MUST** be excluded from the grouping rather than collected under an absent
+value.
+
+**Implements**:
+- `cpt-cf-usage-collector-algo-query-fold-application`
+- `cpt-cf-usage-collector-algo-withdrawn-pair-exclusion-pushdown`
+
+**Touches**:
+- API: `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
+- Entities: `AggregationResult`
+
+### Read Paths Bound by the Published Consistency Floor
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-read-consistency-posture`
+
+**Task 11 traceability note.** Unticked and unmarked. Owner:
+`cpt-cf-usage-collector-feature-consistency-freshness-contract` (feature
+2.11, `DECOMPOSITION.md` §2.11), which this identifier's own text defers the
+numeric floor and per-plugin ceiling to and which is not scheduled in this
+programme's slice list. Measured: nothing in this gear publishes this
+posture today, so there is no site to mark. A
+`command grep -rniE 'consistency|eventually consistent|monotonic|staleness'`
+returns **nothing** over `docs/usage-collector-v1.yaml` and **17 lines**
+over `usage-collector/src/`, every one of them incidental to a different
+subject — monotonic *plugin binding* (`service_tests.rs`), the monotonic
+*clock* (`authz.rs`, `quota.rs`, `feed_tests.rs`), cache *staleness*
+(`resolver_tests.rs`), a convenience staleness computation on the
+reconciliation DTO, a metrics instrument's non-monotonic sum, and a
+cross-gate leaf-*consistency* test module. None states a read-consistency
+guarantee, which is the measurement that actually supports the
+conclusion. (The earlier wording claimed the grep "returns nothing" over
+both; it does not, and a reader re-running it would have found the
+17 lines and no way to tell the claim from a stale one.)
+
+The system **MUST** expose all three read paths under the gear's published
+consistency floor: eventually consistent relative to an ingestion
+acknowledgement, with no monotonic-reads guarantee and no ordering claim. The
+implementation **MUST NOT** add a read-after-write guarantee of its own, **MUST
+NOT** retry a read to hide replica lag, and **MUST NOT** present the raw path as
+a change feed. The documented surface **MUST** direct a consumer that must miss
+no entry to the feed instead. The numeric floor and the per-plugin ceiling
+**MUST** be taken from
+`cpt-cf-usage-collector-feature-consistency-freshness-contract`, and this feature
+**MUST** state none of its own.
+
+**Implements**:
+- `cpt-cf-usage-collector-flow-reconcile-aggregate-against-raw`
+
+**Touches**:
+- API: `GET /usage-collector/v1/records`,
+  `GET /usage-collector/v1/records/{id}`,
+  `POST /usage-collector/v1/records/aggregate`
+- Component: `cpt-cf-usage-collector-component-query-gateway`
 
 ## 6. Acceptance Criteria
 
-### 6.1 Endpoints Summary
-
-The feature's REST surface is aligned with the phase-03 OAS reference contract (`usage-collector-v1.yaml`) and the phase-04 DESIGN.md §3.3 Endpoints Overview table. The runtime OAS is emitted at runtime by `OpenApiRegistryImpl` from `OperationBuilder` calls; the YAML is the documentary reference enforced by the CI drift-check.
-
-| Operation                   | Method | Path                                    | OperationId                                      | Tag             |
-| --------------------------- | ------ | --------------------------------------- | ------------------------------------------------ | --------------- |
-| Raw read (cursor-paginated) | `GET`  | `/usage-collector/v1/records`           | `usage_collector.list_usage_records`             | `Usage Records` |
-| Aggregated read (body)      | `POST` | `/usage-collector/v1/records/aggregate` | `usage_collector.query_aggregated_usage_records` | `Usage Records` |
-
-Query parameters for the raw read: `gts_id` (mandatory typed usage-type GTS instance id; not part of the OData surface), `metadata.<key>` (optional, repeatable; OR within a key, AND across keys), `$filter` (OData predicate over `UsageRecordFilterField`; mandatory `timestamp ge X and timestamp lt Y` window), `$orderby` (optional; normalized gateway-side to end in the canonical unique `(created_at, id)` suffix — mixed directions or an optional/nullable key → `400`, `.reason="VALIDATION"`), `$top` / `limit` (both spellings fold onto one slot, and a request carrying both is rejected; absent → 1000; a present value > 1000 → `400 InvalidArgument`, `field_violations[0].reason="VALIDATION"`, not clamped), `cursor` (toolkit `CursorV1` opaque token decoded and validated at the gateway via `toolkit_odata::validate_cursor_against`).
-
-Response envelope for the raw read: `toolkit_odata::Page<UsageRecord>` (`items`, optional `@nextLink`). Response for the aggregated read: `AggregationResult` (typed body; no `@nextLink`, no pagination — see aggregate-asymmetry rationale at `cpt-cf-usage-collector-principle-aggregate-asymmetry`).
-
-### 6.2 Behavioural Criteria
-
-- [ ] `p1` - A well-formed aggregated read by an authorized caller through `POST /usage-collector/v1/records/aggregate` (or the SDK `query_aggregated_usage_records` operation per `sdk-trait.md`) carrying a structurally valid `[from, to)` `time_range`, exactly one `gts_id` filter that resolves via a per-query `get_usage_type` SPI dispatch against `cpt-cf-usage-collector-contract-storage-plugin`, and a mandatory `aggregation` operator drawn from `{SUM, COUNT, MIN, MAX, AVG}` produces a `AggregationResult` (`gts_id`, `aggregation`, `buckets`) computed server-side by the Plugin SPI `query_aggregated_usage_records` capability over the persisted usage records; aggregated queries that omit the bounded time window (→ `InvalidArgument`, `.reason="MISSING_TIME_WINDOW"`) or omit / supply an unsupported `aggregation` operator (→ `InvalidArgument`, HTTP `400`, at body deserialization) are rejected before any Plugin SPI aggregate dispatch (aggregated success and pre-dispatch validation).
-- [ ] `p1` - A well-formed raw read by an authorized caller through `GET /usage-collector/v1/records` (or the SDK `list_usage_records` operation per `sdk-trait.md`) carrying the mandatory typed `gts_id` query parameter, optional repeated `metadata.<key>` filters, and a structurally valid `$filter` over `UsageRecordFilterField` that includes the mandatory `timestamp ge X and timestamp lt Y` window, optional narrowing predicates (`tenant_id` / `subject_id` / `subject_type` / `resource_id` / `resource_type` / `status` per `usage-collector-v1.yaml`), an optional `$orderby` the gateway normalizes to end in the canonical unique `(created_at, id)` suffix, a `$top` within the 1,000-records-per-page cap, and an optional toolkit `CursorV1` continuation token in the `cursor` query parameter returns a `toolkit_odata::Page<UsageRecord>` envelope (`items`, optional `@nextLink` containing a freshly minted gateway-owned `CursorV1`) deterministically resumable across calls by forwarding the prior response's `@nextLink` cursor token back into the next request; a malformed cursor surfaces as a canonical `InvalidArgument` `Problem` with `field_violations[0].reason="INVALID_CURSOR"`, a cursor minted against a different `$orderby` with `"ORDER_MISMATCH"`, a cursor minted against a different `$filter` with `"FILTER_MISMATCH"` (each on the `cursor` field), and a missing mandatory `timestamp ge X and timestamp lt Y` window with `"MISSING_TIME_WINDOW"` on `$filter` (cursor decode + validate at the gateway via `toolkit_odata::validate_cursor_against`; the plugin SPI never receives the cursor wire format) and the request leaks no records (raw pagination success and cursor-V1 adoption, `cpt-cf-usage-collector-dod-usage-query-cursor-v1-toolkit-adoption`, and `cpt-cf-usage-collector-dod-usage-query-api-post-records-query`).
-- [ ] `p1` - Every aggregated and raw read composes the foundation-returned `PdpConstraint` set with the caller's request filters under intersection-only semantics via `cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2`; any caller-supplied filter that attempts to widen scope beyond a constraint bound (e.g., a tenant outside the PDP-permitted tenants or a UsageType outside a PDP-permitted UsageType set) is silently clamped back to the constraint bound and the effective query never broadens the PDP-authorized scope under any input — verifiable by exercising a widening attempt and observing that the returned row set is bounded by the PDP constraint, not the caller's filter (PDP narrowing).
-- [ ] `p1` - An aggregated query whose `gts_id` is absent from the plugin's `usage_type_catalog` is rejected as canonical `NotFound` (404) — a pre-dispatch `get_usage_type` (Method 7) call surfaces `Err(UsageTypeNotFound { gts_id })` before any aggregate dispatch, lifted to `UsageCollectorError::NotFound` (`resource_type="usage_type"`, `resource_name=<gts_id>`); the gateway MUST NOT return a partial result and MUST NOT reach the `query_aggregated_usage_records` dispatch (UsageType existence enforcement, `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-query`, and `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`).
-- [ ] `p1` - When the inbound `SecurityContext` is missing at the handler boundary (REST handler did not receive `Extension<SecurityContext>` from ToolKit gateway middleware, or the SDK trait was invoked without a `ctx` argument) the gateway returns the canonical `Unauthenticated` `Problem` envelope; when `cpt-cf-usage-collector-flow-foundation-pdp-authorize` (invoked via the per-component `access_scope_with` helper inside `cpt-cf-usage-collector-component-query-gateway` against `cpt-cf-usage-collector-contract-authz-resolver`) returns `deny` / yields an empty `PdpConstraint` set / is unreachable, or the Plugin SPI `query_aggregated_usage_records` / `list_usage_records` capability returns host-resolution `PluginUnavailable` / plugin-side `Transient` / `Internal`, the gateway returns the corresponding fail-closed `Problem` envelope per `usage-collector-v1.yaml`; in every case the gateway never synthesizes a partial aggregation or partial page, never caches a prior PDP decision, never synthesizes or infers identity, and surfaces zero records — verifiable by injecting each failure mode independently and observing the corresponding `Problem` envelope (fail-closed posture).
-- [ ] `p1` - Every aggregated and raw read derives `tenant_id` exclusively from the foundation-resolved `SecurityContext` and the PDP-returned `PdpConstraint` set; cross-tenant reads are impossible absent an explicit platform PDP permit, no caller-supplied `tenant_id` filter or header escapes the `SecurityContext` binding (any widening attempt is silently clamped), and a tenant-administrator caller observes only rows scoped to their own tenant — verifiable by issuing a query with a caller-supplied `tenant_id` outside the resolved `SecurityContext` and confirming the returned scope is clamped back to the PDP-permitted tenants (tenant isolation).
-- [ ] `p1` - Within the PDP-authorized scope, both `active` and `inactive` `UsageRecord` rows are visible to query callers — both states contribute to the aggregated `buckets` and each raw record surfaces its `status` field verbatim — and the Query Gateway never filters rows by activation state, never performs the `active → inactive` flip (deactivation is owned by §2.5 Event Deactivation), and never overrides the `status` value returned by the storage plugin (active-and-inactive visibility).
-- [ ] `p1` - An authorized aggregated or raw query whose filters match zero rows within the PDP-authorized scope returns an empty `AggregationResult` (`buckets` is the empty list) or an empty `toolkit_odata::Page<UsageRecord>` envelope (`items` is the empty list and `@nextLink` is omitted); zero matches MUST NOT surface as an HTTP `404`, an error envelope, a Plugin SPI error, or any non-200 outcome — verifiable by issuing a filter that is known to match nothing and confirming a `200 OK` with an empty payload (empty-match semantics, `cpt-cf-usage-collector-dod-usage-query-fr-query-raw`, `cpt-cf-usage-collector-dod-usage-query-entity-aggregation-result`, and `cpt-cf-usage-collector-dod-usage-query-cursor-v1-toolkit-adoption`).
-- [ ] `p1` - Every accepted aggregated and raw read honours the downstream usage-reader contract surface served by `cpt-cf-usage-collector-component-query-gateway` per DESIGN §3.5 Downstream Usage Reader Contract — the documented request shapes (`AggregationQuery`, `RawQuery`), the documented response shapes (`AggregationResult`, `toolkit_odata::Page<UsageRecord>`, toolkit `CursorV1`), the stable error categories (`InvalidArgument` with `field_violations[0].reason` ∈ {`MISSING_TIME_WINDOW`, `INVALID_CURSOR`, `ORDER_MISMATCH`, `FILTER_MISMATCH`, `INVALID_ORDERBY_FIELD`, and `VALIDATION` for a `$top` over the page cap}; `PermissionDenied`; `NotFound` for an unregistered usage type; `ServiceUnavailable` per `usage-collector-v1.yaml`), the gateway-owned cursor decode + validate guarantee, the PDP-narrowed scope semantics, and the active-and-inactive record visibility rule — and surfaces values verbatim from the storage plugin without business-logic transformation (no pricing, rating, invoice generation, quota enforcement, unit conversion, currency conversion, or rule-based filtering); any deviation surfaces as a contract-test failure against `usage-collector-v1.yaml` (downstream contract).
-- [ ] `p1` - `SUM` over a `(tenant_id, gts_id)` group that contains both a row with `corrects_id IS NULL` and a row with `corrects_id IS NOT NULL` MUST equal the **signed net total** — `SUM(value)` aggregates across active rows regardless of `corrects_id` presence, treating `value` as a signed quantity so rows with `corrects_id IS NOT NULL` (carrying a strictly-negative `value`) reduce the running counter total; verifiable by emitting a usage row with `value = +10` and `corrects_id IS NULL`, a compensation row with `value = -3` and `corrects_id` pointing at the usage row, and observing `SUM(value) = +7` on the aggregated read. The same construction with a single usage row and no compensations MUST yield `SUM(value) = +10` (unchanged); compensation rows whose referenced usage row has been deactivated (and which therefore cascaded to `inactive` per the depth-1 cascade owned by `cpt-cf-usage-collector-feature-event-deactivation`) MUST NOT contribute to `SUM` (`SUM` returns to `0` after the cascade) — the `active`-status filter is applied before the `corrects_id`-aware aggregation (SUM-nets contract).
-- [ ] `p1` - `COUNT` over the same `(tenant_id, gts_id)` group that contains a row with `corrects_id IS NULL` and a row with `corrects_id IS NOT NULL` MUST equal **1** — counting rows with `corrects_id IS NOT NULL` as events would double-count the original usage event because the row referenced by the compensation's `corrects_id` is already counted; `MIN(value)`, `MAX(value)`, and `AVG(value)` over the same group MUST be computed over active rows WHERE `corrects_id IS NULL` — including the strictly-negative compensation `value` would corrupt extremes (the refund would become the new `MIN`) and means (the mean would drift below the observed usage range). Verifiable by adding a compensation row with `value = -3` and `corrects_id` set to a group with a single usage row of `value = +10` and `corrects_id IS NULL`, and confirming `COUNT = 1`, `MIN = +10`, `MAX = +10`, `AVG = +10` (compensation rows excluded from all four aggregates) (usage-only aggregation).
-- [ ] `p1` - The aggregation contract is orthogonal to status filtering: deactivated rows (whether the row was directly deactivated with `corrects_id IS NULL`, deactivated with `corrects_id IS NOT NULL`, or flipped to `inactive` via the depth-1 cascade owned by `cpt-cf-usage-collector-feature-event-deactivation`) MUST be excluded from all five aggregations (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG`) before netting / counting / extremes / means are computed; verifiable by deactivating either the usage row or one of its referencing compensation rows and confirming that the post-cascade `SUM` returns to a state consistent with the remaining `active` rows in the group while `COUNT` / `MIN` / `MAX` / `AVG` likewise reflect only the remaining `active` rows WHERE `corrects_id IS NULL` (orthogonality of `active` filtering and `corrects_id`-presence filtering).
-- [ ] `p1` - Aggregation ops are restricted per usage `kind`: `SUM` against a **gauge** usage type, and `MIN` / `MAX` / `AVG` against a **counter** usage type, are each rejected with `InvalidArgument` (HTTP `400`, `field_violations[0].reason="OP_NOT_ALLOWED_FOR_KIND"`) **before** any Plugin SPI aggregate dispatch; `COUNT` is accepted on both kinds, `SUM` on a counter and `MIN` / `MAX` / `AVG` on a gauge are dispatched. The gateway resolves the `kind` via a per-query `get_usage_type` SPI dispatch (which also makes an unregistered `gts_id` a pre-dispatch `NotFound`), and the storage plugin stays pure-persistence (op-per-kind restriction).
-- [ ] `p2` - Every query attempt on either read path is observable through the four query-gateway instruments inventoried in DESIGN [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002): a completed attempt increments `uc_query_requests_total` exactly once with the correct `(query_kind, outcome, error_category)` tuple (`error_category="none"` only when `outcome="success"`) and observes `uc_query_duration_seconds{query_kind}` exactly once; the `uc_query_inflight{query_kind}` gauge rises by one once authorization composes and returns to its prior value on completion and on every failure exit that follows the increment (no gauge leak under an early return); a successful completion additionally records `uc_query_result_rows{query_kind}` exactly once with the raw page size (`items` length, ≤ 1,000) or the aggregated group count (`buckets` length, ≤ 100,000); and no label on any of the four instruments carries an unbounded identifier — verifiable by issuing, per `query_kind`, one successful, one PDP-denied, and one plugin-failure request against a test meter and asserting the exact counter deltas, histogram sample counts, gauge round-trip, and label values against the closed DESIGN §3.11.5 vocabularies (query-path telemetry, `cpt-cf-usage-collector-dod-usage-query-nfr-operational-visibility`).
+- [ ] An aggregated read naming one meter and one range returns one folded quantity per group, with each bucket carrying its dimension values in the order the request listed them.
+- [ ] An aggregated or raw read omitting the time range, or naming two meters, is rejected with a validation error naming the parameter, and the policy decision point is never called.
+- [ ] A time range supplied as a filter conjunct rather than as the typed parameter is rejected, on both the aggregated and the raw path.
+- [ ] An aggregated request carrying any parameter that would select a fold is rejected with a validation error, and no such parameter exists on the REST contract, the in-process trait, or the storage plugin interface.
+- [ ] The fold a result is computed with equals the fold the queried type's declaration carries, verified by aggregating one range against two types that differ only in their declared fold.
+- [ ] An aggregated read naming a type that does not resolve is rejected and no query reaches the storage plugin, verified by asserting the plugin recorded no call.
+- [ ] Entries are selected when the end of their covered period falls at or after the range start and strictly before the range end, verified by ranges that hold, exclude and abut a known entry's period end.
+- [ ] An entry whose covered period is zero-length is selected by exactly the same predicate, with no separate case in the implementation.
+- [ ] An aggregated read and a raw read over one range select the same entries, verified by folding the raw page locally after discarding withdrawn pairs.
+- [ ] A withdrawn record and its invalidation each contribute nothing to any aggregation that selects them, verified over ranges that hold, exclude and abut the withdrawn period.
+- [ ] The withdrawn-pair exclusion is visible in the query the storage plugin receives, and the gear performs no post-dispatch filtering, verified by a plugin test double asserting on the dispatched query and by the absence of any in-memory exclusion path.
+- [ ] A plugin that materialises an aggregate recomputes the affected range after an invalidation is accepted, and the recomputed figure matches a figure computed from entries directly.
+- [ ] A range in which every selected entry belongs to a withdrawn pair returns the ungrouped bucket with a zero under an accruing or counting fold and an absent value under an observation fold, rather than no bucket.
+- [ ] A grouped aggregation yields no bucket for a group in which no entry survived, and an entry carrying no value at a selected dimension is excluded from the grouping rather than collected under an absent value.
+- [ ] A raw read returns both entries of a withdrawn pair as persisted, and a field-by-field comparison against the persisted entries shows no added marker, no flag and no derived field.
+- [ ] A raw page holding a withdrawn record also holds the invalidation withdrawing it, and so does a page narrowed or grouped by a declared metadata property that selected the target.
+- [ ] Raw reads and the point lookup return the identifier, idempotency key, type reference, covered period, acceptance instant, declared metadata, signed quantity, entry type, origin marker, and the target reference with its reason code on an invalidation, with no field omitted or masked.
+- [ ] No read path returns a reverse link from a record to a withdrawal of it, and a single raw read narrowed on the target-reference field over the record's covered period finds the withdrawal where one exists.
+- [ ] The same raw read over a record that was never withdrawn returns an empty page rather than an error.
+- [ ] The aggregated result carries no identifier, covered period, quantity or correction linkage, and carries neither the fold nor the queried type.
+- [ ] A filter operand outside the fixed filter field set, a metadata predicate key the declaration does not declare, and a grouping dimension outside the admissible set are each rejected with a validation error naming that single name, before any dispatch.
+- [ ] A grouping list repeating one dimension is rejected, while a list naming every admissible dimension once, in an arbitrary order, is admitted.
+- [ ] A raw-path order naming a key outside the published order key set, or mixing sort directions, is rejected.
+- [ ] Policy-returned constraints are applied as filters ahead of every caller filter, verified by a caller filter naming a tenant the scope excludes returning nothing rather than that tenant's entries.
+- [ ] A denial, and a permit with an empty compiled constraint set, each fail closed on all three read paths with nothing dispatched.
+- [ ] The storage plugin never receives a wire cursor: a plugin test double asserts it received a structured keyset of sort values on every paged call.
+- [ ] Walking a stable range page by page returns each entry exactly once with no gaps and no repeats, verified across page boundaries where several entries share one covered-period end.
+- [ ] A malformed cursor, a cursor minted under a different filter set, an order supplied alongside a cursor, and an order contradicting the one a cursor binds are each rejected with their own reason naming the cursor.
+- [ ] A change to the caller's authorized scope invalidates no cursor and never surfaces as a filter mismatch, verified by editing policy between two pages of one scan.
+- [ ] Every minted cursor stays within the published length bound, including for the widest filter set the surface admits.
+- [ ] Raw reads arrive in the canonical page envelope, the aggregated read returns a non-paginated typed body carrying no cursor or page size, and no bespoke paging schema appears on any surface.
+- [ ] An aggregated result that would exceed the published aggregation result limit is refused with an actionable error rather than truncated.
+- [ ] A point lookup returns the exact persisted entry, and a lookup of an entry outside the caller's scope returns a not-found outcome byte-identical to the one an unknown identifier returns.
+- [ ] A point lookup resolves an invalidation entry by its own identifier just as it resolves a record.
+- [ ] A consumer folding a raw page without discarding withdrawn pairs obtains a figure that exceeds the aggregate by exactly twice each withdrawn quantity under an accruing fold, confirming that an invalidation echoes rather than negates.
+- [ ] No read path offers a row offset parameter, on REST or in process.
+- [ ] Reconciliation counters and watermarks are served by no route this feature defines, and the aggregated, raw and point-lookup handlers contain no counter or watermark logic.
+- [ ] No read path publishes a staleness bound of its own, and the documented posture on all three paths points at the gear's published consistency contract.

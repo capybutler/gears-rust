@@ -4,6 +4,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use toolkit::contracts::RunnableCapability;
 use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
 
 use super::TimescaleDbUsageCollectorPlugin;
@@ -22,11 +23,14 @@ impl ConfigProvider for StaticConfig {
 
 #[tokio::test]
 async fn init_aborts_before_startup_io_when_already_cancelled() {
-    // `cfg.validate()` runs before the cancel race and requires a non-empty
-    // `database_url`; the bogus DSN is never dialed because the cancelled token
+    // `cfg.validate()` runs before the cancel race, so the config must carry
+    // `database_url` or init fails validation and never reaches the race this
+    // test is about. The bogus DSN is never dialed, because the cancelled token
     // short-circuits before `build_pool`.
     let provider = Arc::new(StaticConfig(json!({
-        "config": { "database_url": "postgres://127.0.0.1:1/unused?sslmode=disable" }
+        "config": {
+            "database_url": "postgres://127.0.0.1:1/unused?sslmode=disable"
+        }
     })));
 
     let cancel = CancellationToken::new();
@@ -40,7 +44,7 @@ async fn init_aborts_before_startup_io_when_already_cancelled() {
         cancel,
     );
 
-    let err = TimescaleDbUsageCollectorPlugin
+    let err = TimescaleDbUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("a cancelled token must abort init before any startup I/O");
@@ -49,4 +53,25 @@ async fn init_aborts_before_startup_io_when_already_cancelled() {
         err.to_string().contains("init cancelled during shutdown"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn start_before_init_is_refused() {
+    let plugin = TimescaleDbUsageCollectorPlugin::default();
+    let err = plugin
+        .start(CancellationToken::new())
+        .await
+        .expect_err("start must refuse to run a sweep init never built");
+    assert!(
+        err.to_string().contains("init() must run before start()"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn stop_without_start_is_a_no_op() {
+    TimescaleDbUsageCollectorPlugin::default()
+        .stop(CancellationToken::new())
+        .await
+        .expect("stopping a plugin that never started succeeds");
 }

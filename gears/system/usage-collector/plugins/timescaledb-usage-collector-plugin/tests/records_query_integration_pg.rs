@@ -1,919 +1,1703 @@
 #![cfg(feature = "postgres")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
-//! `TimescaleDB`-backed integration tests for `PgRecordStore::list` and
-//! `PgRecordStore::aggregate`: keyset pagination (first page + cursor follow
-//! with no overlap/gap), metadata side-channel filtering, `$filter` by tenant,
-//! and pushed-down aggregation (SUM nets compensation, COUNT, GROUP BY
-//! resource/metadata, active-only). Requires Docker.
+//! `PgRecordStore::list`, `::get` and `::aggregate` against a live
+//! `TimescaleDB`. Requires Docker.
+//!
+//! The behavioural home for the read paths, exercised directly against
+//! `PgRecordStore` rather than through the SPI trait the DESIGN §3.3 contract
+//! suite dispatches against in `contract_conformance_pg.rs`. That suite's
+//! `raw-page-keyset-walk` and `raw-page-caller-order` checks cover the SPI's
+//! keyset obligations, so what stays exclusively here is the store's own API
+//! surface below that trait, plus specifics no contract-suite fixture
+//! constructs: every `KEYSET_SAFE_RECORD_FIELDS` entry as an admissible
+//! `$orderby` field, a keyset walked across a page boundary in both directions,
+//! and a page boundary falling between an invalidation and its target.
+//!
+//! Selection reads the covered period's **end** alone, `from <= window_end < to`
+//! (`cpt-cf-usage-collector-adr-window-end-selection`). The ledger paths return
+//! entries as persisted, withdrawn pairs included; the fold is the one path that
+//! excludes them, and it excludes **both halves**
+//! (`cpt-cf-usage-collector-adr-append-only-invalidation`).
 
 mod common;
+use common::StoreFixtures;
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
-use time::OffsetDateTime;
+use sqlx::AssertSqlSafe;
+use time::Duration;
 use uuid::Uuid;
 
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
-use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
+use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
 
 use usage_collector_sdk::{
-    AggregationDimension, AggregationOp, AggregationSpec, MetadataFilter, MetadataKey, UsageRecord,
+    AggregationDimension, AggregationFold, KEYSET_SAFE_RECORD_FIELDS, Keyset, MetadataFilter,
+    MetadataKey, RecordOrigin, ResourceRef, StoredUsageRecord, SubjectRef, TimeRange,
+    UsageCollectorPluginError,
 };
 
-use timescaledb_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
+use timescaledb_usage_collector_plugin::domain::ports::RecordStore;
+use timescaledb_usage_collector_plugin::infra::storage::query::translate::SqlCtx;
+use timescaledb_usage_collector_plugin::infra::storage::query::{
+    ledger_from_clause, push_meter_and_range_clauses,
+};
 use timescaledb_usage_collector_plugin::infra::storage::record_store::PgRecordStore;
 
-const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
+/// The fingerprint the gateway computes for the query a page is read under. The
+/// value is opaque to this plugin; what matters is that the same string comes
+/// back in the minted cursor's `f`.
+const FILTER_HASH: &str = "fp-7c1f9a2e";
 
-/// A fixed base instant so each record's `created_at = base + i` is distinct and
-/// the `(created_at, id)` order is observable across a page.
-const BASE_TS: i64 = 1_700_000_000;
-
-/// Bring up a container and register `VCPU_GTS` so the `usage_records.gts_id`
-/// FK is satisfied. Returns the harness and a record store.
-async fn setup_with_type(gts: &str, fields: &[&str]) -> (common::TsHarness, PgRecordStore) {
+/// A container plus a store over it.
+async fn setup() -> (common::TsHarness, PgRecordStore) {
     let h = common::bring_up()
         .await
         .expect("timescaledb container (Docker required)");
-    let catalog = common::catalog_store(&h.pool);
-    catalog
-        .create(common::fixture_usage_type(gts, "counter", fields))
-        .await
-        .expect("register usage type for FK");
-    let store = common::record_store(&h.pool);
+    let store = common::record_store(&h);
     (h, store)
 }
 
-/// Build a record for `tenant` whose `created_at` is `BASE_TS + i` (so the
-/// `(created_at, id)` order is strictly increasing across the inserted set),
-/// with a distinct id/idempotency key derived from `seq`.
-fn record_at(gts: &str, tenant: Uuid, seq: u128, i: i64) -> UsageRecord {
-    let mut rec = common::fixture_usage_record(
-        gts,
-        tenant,
-        &format!("idem-{seq}"),
-        Decimal::new(i + 1, 0),
-        seq,
-    );
-    rec.created_at =
-        OffsetDateTime::from_unix_timestamp(BASE_TS + i).expect("valid created_at instant");
-    rec
+/// An all-ascending order over `fields`.
+fn asc(fields: &[&str]) -> ODataOrderBy {
+    ODataOrderBy(
+        fields
+            .iter()
+            .map(|f| OrderKey {
+                field: (*f).to_owned(),
+                dir: SortDir::Asc,
+            })
+            .collect(),
+    )
 }
 
-/// The gateway-default record order: `(created_at asc, id asc)`.
-fn created_at_id_asc() -> ODataOrderBy {
-    ODataOrderBy(vec![
-        OrderKey {
-            field: "created_at".to_owned(),
-            dir: SortDir::Asc,
-        },
-        OrderKey {
-            field: "id".to_owned(),
-            dir: SortDir::Asc,
-        },
-    ])
+/// An all-descending order over `fields`.
+fn desc(fields: &[&str]) -> ODataOrderBy {
+    ODataOrderBy(
+        fields
+            .iter()
+            .map(|f| OrderKey {
+                field: (*f).to_owned(),
+                dir: SortDir::Desc,
+            })
+            .collect(),
+    )
 }
 
-/// The descending counterpart `(created_at desc, id desc)`. The plugin's
-/// keyset translation supports any uniform-direction order (DESC emits the
-/// `<` seek predicate); this exercises that path end-to-end against real rows.
-fn created_at_id_desc() -> ODataOrderBy {
-    ODataOrderBy(vec![
-        OrderKey {
-            field: "created_at".to_owned(),
-            dir: SortDir::Desc,
-        },
-        OrderKey {
-            field: "id".to_owned(),
-            dir: SortDir::Desc,
-        },
-    ])
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_list_first_page_returns_limit_and_next_cursor() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x2001);
-
-    for i in 0..5 {
-        let seq = 0x2001_0000 + u128::try_from(i).unwrap();
-        store
-            .create(record_at(VCPU_GTS, tenant, seq, i))
-            .await
-            .expect("create record");
+/// A dispatch the gateway would make: the given order, the fingerprint it
+/// guarantees on every `list_usage_records` call, and an optional page size.
+fn page_query(order: ODataOrderBy, limit: Option<u64>) -> ODataQuery {
+    let q = ODataQuery::new()
+        .with_order(order)
+        .with_filter_hash(FILTER_HASH.to_owned());
+    match limit {
+        Some(n) => q.with_limit(n),
+        None => q,
     }
-
-    let query = ODataQuery::new()
-        .with_limit(2)
-        .with_order(created_at_id_asc());
-
-    let page = store
-        .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
-        .await
-        .expect("list first page");
-
-    assert_eq!(page.items.len(), 2, "first page is capped at the limit");
-    assert!(
-        page.page_info.next_cursor.is_some(),
-        "a 5-record set over limit 2 must yield a next cursor"
-    );
-    assert_eq!(page.page_info.limit, 2, "page echoes the request limit");
-    // Ascending by created_at: first two are the earliest two instants.
-    assert!(
-        page.items[0].created_at < page.items[1].created_at,
-        "page items are in ascending created_at order"
-    );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_list_following_cursor_has_no_overlap_or_gap() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x2002);
-
-    let mut expected: Vec<Uuid> = Vec::new();
-    for i in 0..5 {
-        let seq = 0x2002_0000 + u128::try_from(i).unwrap();
-        let rec = record_at(VCPU_GTS, tenant, seq, i);
-        expected.push(rec.id);
-        store.create(rec).await.expect("create record");
-    }
-    // The gts_id is shared, so iteration order is the SQL order (created_at,id).
-    expected.sort();
-
-    let order = created_at_id_asc();
-    let mut seen: Vec<Uuid> = Vec::new();
-    let mut cursor: Option<CursorV1> = None;
-
-    // Walk every page (limit 2) following the cursor each time.
-    loop {
-        let mut query = ODataQuery::new().with_limit(2).with_order(order.clone());
-        if let Some(c) = cursor.take() {
-            query = query.with_cursor(c);
-        }
-        let page = store
-            .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
-            .await
-            .expect("list page");
-
-        for item in &page.items {
-            assert!(
-                !seen.contains(&item.id),
-                "no record appears on two pages (overlap)"
-            );
-            seen.push(item.id);
-        }
-
-        match page.page_info.next_cursor {
-            Some(token) => {
-                cursor = Some(CursorV1::decode(&token).expect("decode next cursor"));
-            }
-            None => break,
-        }
-    }
-
-    let mut seen_sorted = seen.clone();
-    seen_sorted.sort();
-    assert_eq!(
-        seen_sorted, expected,
-        "walking all pages yields every record exactly once (no gap, no overlap)"
-    );
-    assert_eq!(seen.len(), 5, "exactly the five inserted records");
+/// The gateway-default keyset: `(window_end, id)`, ascending.
+fn default_order() -> ODataOrderBy {
+    asc(&["window_end", "id"])
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_list_descending_cursor_walk_is_ordered_with_no_overlap_or_gap() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x200D);
-
-    let mut expected: Vec<Uuid> = Vec::new();
-    for i in 0..5 {
-        let seq = 0x200D_0000 + u128::try_from(i).unwrap();
-        let rec = record_at(VCPU_GTS, tenant, seq, i);
-        expected.push(rec.id);
-        store.create(rec).await.expect("create record");
-    }
-    expected.sort();
-
-    let order = created_at_id_desc();
-    let mut seen: Vec<Uuid> = Vec::new();
-    let mut prev_created_at: Option<OffsetDateTime> = None;
-    let mut cursor: Option<CursorV1> = None;
-
-    // Walk every page (limit 2) following the DESC cursor each time.
-    loop {
-        let mut query = ODataQuery::new().with_limit(2).with_order(order.clone());
-        if let Some(c) = cursor.take() {
-            query = query.with_cursor(c);
-        }
-        let page = store
-            .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
-            .await
-            .expect("list page (desc)");
-
-        for item in &page.items {
-            // Strictly descending by created_at across the whole walk: the DESC
-            // seek predicate must never revisit or skip the order boundary.
-            if let Some(prev) = prev_created_at {
-                assert!(
-                    item.created_at < prev,
-                    "rows are strictly descending by created_at across pages"
-                );
-            }
-            prev_created_at = Some(item.created_at);
-            assert!(
-                !seen.contains(&item.id),
-                "no record appears on two pages (overlap)"
-            );
-            seen.push(item.id);
-        }
-
-        match page.page_info.next_cursor {
-            Some(token) => {
-                cursor = Some(CursorV1::decode(&token).expect("decode next cursor"));
-            }
-            None => break,
-        }
-    }
-
-    let mut seen_sorted = seen.clone();
-    seen_sorted.sort();
-    assert_eq!(
-        seen_sorted, expected,
-        "walking all pages (desc) yields every record exactly once (no gap, no overlap)"
-    );
-    assert_eq!(seen.len(), 5, "exactly the five inserted records");
+fn eq_str(field: &str, value: &str) -> Expr {
+    Expr::Compare(
+        Box::new(Expr::Identifier(field.to_owned())),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::String(value.to_owned()))),
+    )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_list_metadata_filter_narrows_results() {
-    // Register a type declaring the `region` metadata field.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
-    let tenant = Uuid::from_u128(0x2003);
+fn eq_uuid(field: &str, value: Uuid) -> Expr {
+    Expr::Compare(
+        Box::new(Expr::Identifier(field.to_owned())),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::Uuid(value))),
+    )
+}
 
-    // 3 records: two in us-east-1, one in eu-west-1.
-    let regions = ["us-east-1", "us-east-1", "eu-west-1"];
-    for (i, region) in regions.iter().enumerate() {
-        let idx = i64::try_from(i).unwrap();
-        let seq = 0x2003_0000 + u128::try_from(i).unwrap();
-        let mut rec = record_at(VCPU_GTS, tenant, seq, idx);
-        let mut meta = BTreeMap::new();
-        meta.insert(
-            MetadataKey::new("region").expect("valid metadata key"),
-            (*region).to_owned(),
+/// A range wide enough to select every fixture below.
+fn wide_range() -> TimeRange {
+    TimeRange::new(
+        common::fixture_window_start() - Duration::days(1),
+        common::fixture_window_end() + Duration::days(1),
+    )
+    .expect("ordered range")
+}
+
+/// `n` entries one hour apart, so `(window_end, id)` is strictly increasing
+/// across them and a page boundary is observable.
+async fn seed_hourly(store: &PgRecordStore, tenant: Uuid, n: i64) -> Vec<StoredUsageRecord> {
+    let meter = common::meter(common::VCPU_METER);
+    let mut out = Vec::with_capacity(usize::try_from(n).expect("small n"));
+    for i in 0..n {
+        let rec = common::entry_over(
+            &meter,
+            tenant,
+            &format!("idem-{i}"),
+            Decimal::from(i + 1),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
         );
-        rec.metadata = meta;
-        store.create(rec).await.expect("create record");
+        out.push(store.create_fixture(rec).await.expect("seed entry"));
     }
+    out
+}
 
-    let filter = MetadataFilter::new("region", ["us-east-1"]).expect("valid metadata filter");
-    let query = ODataQuery::new().with_order(created_at_id_asc());
+/// One seeded entry for [`grouping_folds_by_column_by_metadata_and_drops_rows_missing_the_dimension`]:
+/// key, quantity, resource id, optional subject id, and the value of its
+/// `region` metadata key.
+struct Seed {
+    key: &'static str,
+    value: i64,
+    resource: &'static str,
+    subject: Option<&'static str>,
+    region: &'static str,
+}
+
+/// The bucket value of a bare (ungrouped) fold.
+fn only_bucket_value(result: &usage_collector_sdk::AggregationResult) -> Option<BigDecimal> {
+    assert_eq!(
+        result.buckets.len(),
+        1,
+        "an empty group_by must yield exactly one bucket, never an empty list: {:?}",
+        result.buckets
+    );
+    assert!(
+        result.buckets[0].key.is_empty(),
+        "the single ungrouped bucket carries an empty key"
+    );
+    result.buckets[0].value.clone()
+}
+
+// Selection: from <= window_end < to
+
+/// A meter that was written reads its own row back.
+///
+/// Every other read test here asserts which rows a predicate *excludes*, and an
+/// empty page is the right answer to most of them — which leaves one failure
+/// invisible: a meter bound as the wrong SQL type makes
+/// [`push_meter_and_range_clauses`]' partition-key subquery yield `NULL`, which
+/// matches no row and returns exactly the empty page an *unwritten* meter
+/// returns by design. So this test's subject is the non-empty answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_written_meter_reads_its_own_row_back_rather_than_an_empty_page() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2_0001);
+
+    let entry = common::entry(&meter, tenant, "idem-own-row", Decimal::ONE);
+    let entry_id = entry.id;
+    store
+        .create_fixture(entry)
+        .await
+        .expect("the fixture entry is stored");
 
     let page = store
         .list(
-            common::fixture_gts_id(VCPU_GTS),
-            &query,
-            std::slice::from_ref(&filter),
+            common::meter_reference(&meter),
+            wide_range(),
+            &page_query(default_order(), None),
+            &[],
+            None,
         )
         .await
-        .expect("list with metadata filter");
+        .expect("the ledger read succeeds");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![entry_id],
+        "a written meter must read its own row back; an empty page here is the \
+         partition-key subquery yielding NULL, not an absent row"
+    );
+    assert_eq!(
+        page.items[0].gts_type_uuid,
+        common::meter_reference(&meter),
+        "and the row it reads back names the meter it was written under"
+    );
+}
+
+/// Both boundaries of the range, and the bound they are read against.
+///
+/// The lower bound is inclusive and the upper exclusive, and both are tested
+/// against a `window_end` sitting exactly on them — which is the only place the
+/// two can be told apart from `>` / `<=`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_is_lower_inclusive_and_upper_exclusive_on_window_end() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2001);
+
+    let at_lower = common::fixture_window_end();
+    let at_upper = at_lower + Duration::hours(1);
+    let on_lower = common::entry_over(
+        &meter,
+        tenant,
+        "idem-lower",
+        Decimal::ONE,
+        common::fixture_window_start(),
+        at_lower,
+    );
+    let on_upper = common::entry_over(
+        &meter,
+        tenant,
+        "idem-upper",
+        Decimal::from(2),
+        common::fixture_window_start(),
+        at_upper,
+    );
+    let (lower_id, upper_id) = (on_lower.id, on_upper.id);
+    store.create_fixture(on_lower).await.expect("seed lower");
+    store.create_fixture(on_upper).await.expect("seed upper");
+
+    let range = TimeRange::new(at_lower, at_upper).expect("ordered range");
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            range,
+            &page_query(default_order(), None),
+            &[],
+            None,
+        )
+        .await
+        .expect("list");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![lower_id],
+        "an entry whose window_end equals `from` is selected; one whose window_end \
+         equals `to` is not"
+    );
+    assert!(!ids.contains(&upper_id));
+}
+
+/// A point event (`window_start == window_end`) needs no special case: it is
+/// selected by the same predicate as everything else, because the predicate
+/// never names `window_start`.
+///
+/// The companion assertion is the one that distinguishes end-selection from
+/// overlap or containment: an entry whose `window_start` is **inside** the range
+/// and whose `window_end` is **outside** it is not selected — a period longer
+/// than the range is exactly the case those three rules disagree on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_point_event_is_selected_and_a_period_ending_outside_the_range_is_not() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2002);
+
+    let from = common::fixture_window_start();
+    let to = from + Duration::hours(2);
+
+    // A point event inside the range.
+    let instant = from + Duration::hours(1);
+    let point = common::entry_over(&meter, tenant, "idem-point", Decimal::ONE, instant, instant);
+    let point_id = point.id;
+    store.create_fixture(point).await.expect("seed point event");
+
+    // A period that starts inside the range and ends after it. Overlap would
+    // select it; containment would drop the point event; end-selection drops
+    // this one and keeps that one.
+    let straddling = common::entry_over(
+        &meter,
+        tenant,
+        "idem-straddle",
+        Decimal::from(2),
+        from + Duration::minutes(30),
+        to + Duration::hours(1),
+    );
+    let straddling_id = straddling.id;
+    store
+        .create_fixture(straddling)
+        .await
+        .expect("seed straddling entry");
+
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            TimeRange::new(from, to).expect("ordered range"),
+            &page_query(default_order(), None),
+            &[],
+            None,
+        )
+        .await
+        .expect("list");
+
+    let ids: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![point_id],
+        "only the point event's end falls in the range"
+    );
+    assert!(
+        !ids.contains(&straddling_id),
+        "an entry whose window_start is inside the range but whose window_end is outside \
+         it must not be selected: the rule reads the end alone"
+    );
+
+    let stored_point = page.items.first().expect("one item");
+    assert_eq!(
+        stored_point.window_start, stored_point.window_end,
+        "the zero-length period round-trips as one"
+    );
+}
+
+// Keyset pagination
+
+/// A look-ahead page returns a [`Keyset`] for the gateway to mint a
+/// continuation from, and never a wire token itself.
+///
+/// Minting, encoding and fingerprinting belong to the gateway; this plugin's one
+/// obligation is the boundary values and the direction, positionally aligned
+/// with the dispatched order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_look_ahead_page_returns_a_keyset_for_the_gateway_to_mint_from() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2003);
+    seed_hourly(&store, tenant, 5).await;
+
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            wide_range(),
+            &page_query(default_order(), Some(2)),
+            &[],
+            None,
+        )
+        .await
+        .expect("list");
 
     assert_eq!(
         page.items.len(),
         2,
-        "only the two us-east-1 records match the metadata filter"
+        "the page carries $top items, not the look-ahead row"
     );
-    for item in &page.items {
-        assert_eq!(
-            item.metadata.get(&MetadataKey::new("region").unwrap()),
-            Some(&"us-east-1".to_owned()),
-            "every returned record carries the filtered metadata value"
-        );
-    }
+    let keyset = page
+        .next
+        .as_ref()
+        .expect("a keyset is returned while entries remain");
+    assert_eq!(
+        keyset.direction(),
+        SortDir::Asc,
+        "the keyset records the order's single direction"
+    );
+    assert_eq!(keyset.values().len(), 2, "one value per order field");
 }
 
+/// Walking the keyset covers every entry exactly once, in order, with no gap
+/// and no overlap — ascending and descending.
+///
+/// Both directions, because the keyset predicate derives its comparison operator
+/// from the sort direction: a descending walk emits `<` where an ascending one
+/// emits `>`, and getting that backwards re-serves page one forever.
+///
+/// The walk drives `keyset: Option<&Keyset>` directly rather than round-tripping
+/// an encoded `CursorV1`: minting and decoding the wire token is the gateway's
+/// job, and this plugin's contract is the `Keyset` it hands back and the one it
+/// is handed next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_list_filter_by_tenant() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant_a = Uuid::from_u128(0x2004_000A);
-    let tenant_b = Uuid::from_u128(0x2004_000B);
+async fn a_keyset_walk_covers_every_entry_exactly_once_in_both_directions() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2004);
+    let seeded = seed_hourly(&store, tenant, 7).await;
+    let ascending: Vec<Uuid> = seeded.iter().map(|r| r.id).collect();
 
-    // Two records for tenant A, one for tenant B.
-    store
-        .create(record_at(VCPU_GTS, tenant_a, 0x2004_0001, 0))
-        .await
-        .expect("create A1");
-    store
-        .create(record_at(VCPU_GTS, tenant_a, 0x2004_0002, 1))
-        .await
-        .expect("create A2");
-    store
-        .create(record_at(VCPU_GTS, tenant_b, 0x2004_0003, 2))
-        .await
-        .expect("create B1");
-
-    // Build `tenant_id eq <tenant_a>` directly as an AST (the Uuid value type
-    // matches the `tenant_id` filter field's declared `kind = "Uuid"`).
-    let filter = Expr::Compare(
-        Box::new(Expr::Identifier("tenant_id".to_owned())),
-        CompareOperator::Eq,
-        Box::new(Expr::Value(Value::Uuid(tenant_a))),
-    );
-    let query = ODataQuery::new()
-        .with_order(created_at_id_asc())
-        .with_filter(filter);
-
-    let page = store
-        .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
-        .await
-        .expect("list filtered by tenant");
-
-    assert_eq!(page.items.len(), 2, "only tenant A's two records match");
-    for item in &page.items {
-        assert_eq!(
-            item.tenant_id, tenant_a,
-            "every returned record is tenant A"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_sum_nets_compensation() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3001);
-
-    // Original +10 row, then an active compensation of -3 that corrects it.
-    let mut original = record_at(VCPU_GTS, tenant, 0x3001_0001, 0);
-    original.value = Decimal::new(10, 0);
-    let original_id = original.id;
-    store.create(original).await.expect("create original");
-
-    let mut compensation = record_at(VCPU_GTS, tenant, 0x3001_0002, 1);
-    compensation.value = Decimal::new(-3, 0);
-    compensation.corrects_id = Some(original_id);
-    store
-        .create(compensation)
-        .await
-        .expect("create compensation");
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate sum");
-
-    assert_eq!(
-        result.buckets.len(),
-        1,
-        "empty group_by yields exactly one bucket"
-    );
-    let bucket = &result.buckets[0];
-    assert!(bucket.key.is_empty(), "no grouping -> empty bucket key");
-    assert_eq!(
-        bucket.value,
-        Some(BigDecimal::from(7_i64)),
-        "SUM nets the active compensation: 10 + (-3) = 7"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_count_excludes_active_compensation() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x300B);
-
-    // One event row, then an active compensation that corrects it. Unlike SUM
-    // (which nets the signed compensation), COUNT MUST see `corrects_id IS NULL`
-    // rows only — a compensation adjusts the running total, it is not an event
-    // (plugin-spi.md §Method 3). Counting it would inflate the event count.
-    let mut original = record_at(VCPU_GTS, tenant, 0x300B_0001, 0);
-    original.value = Decimal::new(10, 0);
-    let original_id = original.id;
-    store.create(original).await.expect("create original");
-
-    let mut compensation = record_at(VCPU_GTS, tenant, 0x300B_0002, 1);
-    compensation.value = Decimal::new(-3, 0);
-    compensation.corrects_id = Some(original_id);
-    store
-        .create(compensation)
-        .await
-        .expect("create compensation");
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Count,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate count");
-
-    assert_eq!(
-        result.buckets.len(),
-        1,
-        "empty group_by yields exactly one bucket"
-    );
-    assert!(result.buckets[0].key.is_empty(), "no grouping -> empty key");
-    assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(1_i64)),
-        "COUNT sees only the event row; the active compensation is excluded"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_count_counts_active_rows() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3002);
-
-    for i in 0..3 {
-        let seq = 0x3002_0000 + u128::try_from(i).unwrap();
-        store
-            .create(record_at(VCPU_GTS, tenant, seq, i))
-            .await
-            .expect("create record");
-    }
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Count,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate count");
-
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
-    assert!(result.buckets[0].key.is_empty(), "no grouping -> empty key");
-    assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(3_i64)),
-        "COUNT(*)::numeric reads back as 3 over three active rows"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_group_by_resource_id() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3003);
-
-    // res-a: 4 + 6 = 10; res-b: 5. Distinct created_at per row so the
-    // (…, created_at) unique tuple never collides.
-    let rows = [
-        ("idem-3003-1", 4_i64, 0x3003_0001_u128, "res-a", 0_i64),
-        ("idem-3003-2", 6, 0x3003_0002, "res-a", 1),
-        ("idem-3003-3", 5, 0x3003_0003, "res-b", 2),
-    ];
-    for (idem, value, seq, resource_id, ts) in rows {
-        let mut rec = common::fixture_usage_record_with_resource(
-            VCPU_GTS,
-            tenant,
-            idem,
-            Decimal::new(value, 0),
-            seq,
-            resource_id,
-        );
-        rec.created_at = OffsetDateTime::from_unix_timestamp(BASE_TS + ts).unwrap();
-        store.create(rec).await.expect("create record");
-    }
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: vec![AggregationDimension::ResourceId],
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate group by resource_id");
-
-    assert_eq!(
-        result.buckets.len(),
-        2,
-        "one bucket per distinct resource_id"
-    );
-    let mut got: Vec<(String, Option<BigDecimal>)> = result
-        .buckets
-        .iter()
-        .map(|b| {
-            assert_eq!(b.key.len(), 1, "single grouped dimension -> one key entry");
-            (b.key[0].clone(), b.value.clone())
-        })
-        .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        got,
-        vec![
-            ("res-a".to_owned(), Some(BigDecimal::from(10_i64))),
-            ("res-b".to_owned(), Some(BigDecimal::from(5_i64))),
-        ],
-        "each resource_id bucket carries its summed value"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_group_by_metadata() {
-    // Register a type declaring the `region` metadata field.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
-    let tenant = Uuid::from_u128(0x3004);
-
-    // us-east-1: 2 + 3 = 5; eu-west-1: 7.
-    let rows = [
-        ("us-east-1", 2_i64, 0_i64),
-        ("us-east-1", 3, 1),
-        ("eu-west-1", 7, 2),
-    ];
-    for (i, (region, value, ts)) in rows.iter().enumerate() {
-        let seq = 0x3004_0000 + u128::try_from(i).unwrap();
-        let mut rec = record_at(VCPU_GTS, tenant, seq, *ts);
-        rec.value = Decimal::new(*value, 0);
-        let mut meta = BTreeMap::new();
-        meta.insert(
-            MetadataKey::new("region").expect("valid metadata key"),
-            (*region).to_owned(),
-        );
-        rec.metadata = meta;
-        store.create(rec).await.expect("create record");
-    }
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: vec![AggregationDimension::Metadata(
-            MetadataKey::new("region").expect("valid metadata key"),
-        )],
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate group by metadata");
-
-    assert_eq!(result.buckets.len(), 2, "one bucket per distinct region");
-    let mut got: Vec<(String, Option<BigDecimal>)> = result
-        .buckets
-        .iter()
-        .map(|b| {
-            assert_eq!(b.key.len(), 1, "single grouped dimension -> one key entry");
-            (b.key[0].clone(), b.value.clone())
-        })
-        .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        got,
-        vec![
-            ("eu-west-1".to_owned(), Some(BigDecimal::from(7_i64))),
-            ("us-east-1".to_owned(), Some(BigDecimal::from(5_i64))),
-        ],
-        "each region bucket carries its summed value"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_min_max_avg_over_active_rows() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3008);
-
-    // Values {2, 8}: min 2, max 8, avg 5 -- exact, so no fractional precision.
-    for (i, v) in [2_i64, 8].into_iter().enumerate() {
-        let seq = 0x3008_0000 + u128::try_from(i).unwrap();
-        let mut rec = record_at(VCPU_GTS, tenant, seq, i64::try_from(i).unwrap());
-        rec.value = Decimal::new(v, 0);
-        store.create(rec).await.expect("create record");
-    }
-
-    for (op, expected) in [
-        (AggregationOp::Min, BigDecimal::from(2_i64)),
-        (AggregationOp::Max, BigDecimal::from(8_i64)),
-        (AggregationOp::Avg, BigDecimal::from(5_i64)),
+    for (label, order, expected) in [
+        ("ascending", default_order(), ascending.clone()),
+        ("descending", desc(&["window_end", "id"]), {
+            let mut v = ascending.clone();
+            v.reverse();
+            v
+        }),
     ] {
-        let spec = AggregationSpec {
-            op,
-            group_by: Vec::new(),
-        };
-        let result = store
-            .aggregate(
-                common::fixture_gts_id(VCPU_GTS),
-                &ODataQuery::new(),
+        let mut walked: Vec<Uuid> = Vec::new();
+        let mut keyset: Option<Keyset> = None;
+        for step in 0..10 {
+            let q = page_query(order.clone(), Some(2));
+            let page = store
+                .list(
+                    common::meter_reference(&meter),
+                    wide_range(),
+                    &q,
+                    &[],
+                    keyset.as_ref(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{label} page {step}: {e:?}"));
+            walked.extend(page.items.iter().map(|r| r.id));
+            match page.next {
+                Some(next) => keyset = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, expected,
+            "{label}: the walk must cover every entry exactly once, in the order it asked for"
+        );
+    }
+}
+
+/// A page boundary falling **between an invalidation and its target**.
+///
+/// The SPI names this case explicitly: the pair shares a `window_end` but not an
+/// `id`, and an admissible order names both, so the boundary can fall between
+/// them whichever the order leads with. The walk must still return both exactly
+/// once each — the ledger owes the pair as persisted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_boundary_between_an_invalidation_and_its_target_loses_neither() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2005);
+
+    let target = common::entry(&meter, tenant, "idem-target", Decimal::from(10));
+    let target = store
+        .create_fixture(target)
+        .await
+        .expect("create the target");
+    let withdrawal = common::withdrawal_of(&target);
+    let withdrawal = store
+        .create_fixture(withdrawal)
+        .await
+        .expect("create the withdrawal");
+    assert_eq!(
+        target.window_end, withdrawal.window_end,
+        "a faithful withdrawal copies its target's covered period, so the two tie on the \
+         leading order key and only `id` separates them"
+    );
+    assert_ne!(target.id, withdrawal.id);
+
+    // `$top = 1` puts the boundary exactly between them.
+    let mut walked: Vec<Uuid> = Vec::new();
+    let mut keyset: Option<Keyset> = None;
+    for step in 0..5 {
+        let q = page_query(default_order(), Some(1));
+        let page = store
+            .list(
+                common::meter_reference(&meter),
+                wide_range(),
+                &q,
                 &[],
-                spec,
+                keyset.as_ref(),
             )
             .await
-            .unwrap_or_else(|e| panic!("aggregate {op:?}: {e:?}"));
+            .unwrap_or_else(|e| panic!("page {step}: {e:?}"));
+        assert!(page.items.len() <= 1);
+        walked.extend(page.items.iter().map(|r| r.id));
+        match page.next {
+            Some(next) => keyset = Some(next),
+            None => break,
+        }
+    }
 
-        assert_eq!(
-            result.buckets.len(),
-            1,
-            "{op:?}: empty group_by -> one bucket"
-        );
-        // normalized() strips trailing-zero scale so AVG's numeric `5.0000...`
-        // compares equal to `5`. `Option<BigDecimal>` is not `Copy`, so borrow
-        // via `as_ref()` before mapping rather than moving out of the bucket.
-        assert_eq!(
-            result.buckets[0].value.as_ref().map(BigDecimal::normalized),
-            Some(expected.normalized()),
-            "{op:?} over {{2, 8}}"
-        );
+    let mut expected = vec![target.id, withdrawal.id];
+    expected.sort();
+    let mut got = walked.clone();
+    got.sort();
+    assert_eq!(
+        got, expected,
+        "both halves of the pair must survive a boundary drawn between them, each once: \
+         walked {walked:?}"
+    );
+}
+
+/// `$orderby` on every field the SDK publishes as keyset-safe.
+///
+/// Driven from [`KEYSET_SAFE_RECORD_FIELDS`] itself, not from a copy of it, so a
+/// field added to that list without a column behind it fails here rather than
+/// being quietly untested. Each field is asserted by **its own values coming
+/// back sorted**, because entries tying on the ordered field may come back in
+/// any order among themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_keyset_safe_field_is_an_admissible_order() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    // Two tenants, so `tenant_id` discriminates; the list path is scoped by
+    // meter and range, not by tenant, so both are visible to one call.
+    let tenants = [Uuid::from_u128(0x2006_0001), Uuid::from_u128(0x2006_0002)];
+
+    for (t, tenant) in tenants.into_iter().enumerate() {
+        for i in 0..3_i64 {
+            let mut rec = common::entry_over(
+                &meter,
+                tenant,
+                &format!("idem-{t}-{i}"),
+                Decimal::from(i + 1),
+                common::fixture_window_start() + Duration::hours(i),
+                common::fixture_window_end() + Duration::hours(i),
+            );
+            rec.resource_ref = ResourceRef::new(
+                format!("res-{}", (b'a' + u8::try_from(i).expect("small")) as char),
+                format!("type-{}", 2 - i),
+            )
+            .expect("valid resource ref");
+            rec.origin = if i == 0 {
+                RecordOrigin::Backfill
+            } else {
+                RecordOrigin::Live
+            };
+            // Varied like every other field this test orders by: an
+            // `$orderby=accepted_at` assertion over a column every row shares is
+            // trivially satisfied whatever order the rows come back in, and
+            // `entry_over` stamps one fixed `accepted_at` on every record.
+            //
+            // Offset by `(2 - i)`, not `i`: `window_end` above already varies by
+            // `+ hours(i)`, so offsetting the same way would correlate the two
+            // columns perfectly and a `record_row_key` arm that read
+            // `window_end` when asked for `accepted_at` would still produce the
+            // right order. `(2 - i)` inverts the relationship, so the two fields
+            // induce different orders and a column mix-up reds.
+            rec.accepted_at =
+                common::fixture_window_end() + Duration::hours(2 - i) + Duration::minutes(15);
+            store.create_fixture(rec).await.expect("seed");
+        }
+    }
+
+    for field in KEYSET_SAFE_RECORD_FIELDS {
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let order = match dir {
+                SortDir::Asc => asc(&[field]),
+                SortDir::Desc => desc(&[field]),
+            };
+            let page = store
+                .list(
+                    common::meter_reference(&meter),
+                    wide_range(),
+                    &page_query(order.clone(), None),
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("$orderby={field} {dir:?} must be admissible: {e:?}"));
+            assert_eq!(
+                page.items.len(),
+                6,
+                "$orderby={field}: every entry is still returned"
+            );
+
+            let keys: Vec<String> = page.items.iter().map(|r| order_key_of(r, field)).collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            if dir == SortDir::Desc {
+                sorted.reverse();
+            }
+            assert_eq!(
+                keys, sorted,
+                "$orderby={field} {dir:?} must return that field's values in that order"
+            );
+
+            // The continuation half of the obligation. The unpaginated call
+            // above never reaches `keyset_predicate`: `PgRecordStore` renders
+            // the tuple comparison only when a `Keyset` is passed in, and a page
+            // returning every row never truncates and so never mints one. A
+            // field checked only by that call could resolve a column and a row
+            // value and still 500 the moment a caller pages, if nothing resolves
+            // its `FieldKind` for the seek predicate's bind.
+            //
+            // Ordered by `[field, "id"]`, not `field` alone: this fixture shares
+            // most single-field values across the two tenants, which is fine for
+            // the whole-page assertion above but is exactly the shape a bare
+            // single-key keyset tuple comparison loses rows on -- a strict `>`
+            // over a boundary value tied with the next row's skips it. `id` is
+            // what the gateway's `establish_keyset_order` appends in production,
+            // so ordering on it here is the realistic dispatch -- except when
+            // `field` already *is* `"id"`: `ensure_tiebreaker` skips a field the
+            // order already names, so production never dispatches
+            // `["id", "id"]`, which is also a repeated order key the gateway
+            // refuses with a 400. Walk at `limit: 1` so every row is crossed by
+            // a real continuation, not just the first.
+            let keyset_fields: &[&str] = if *field == "id" {
+                &[field]
+            } else {
+                &[field, "id"]
+            };
+            let keyset_order = match dir {
+                SortDir::Asc => asc(keyset_fields),
+                SortDir::Desc => desc(keyset_fields),
+            };
+            let keyset_label = keyset_fields.join(",");
+            let mut keyset: Option<Keyset> = None;
+            let mut walked = 0usize;
+            loop {
+                let bounded = store
+                    .list(
+                        common::meter_reference(&meter),
+                        wide_range(),
+                        &page_query(keyset_order.clone(), Some(1)),
+                        &[],
+                        keyset.as_ref(),
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "$orderby={keyset_label} {dir:?}: continuation {walked} must be admissible: {e:?}"
+                        )
+                    });
+                assert_eq!(
+                    bounded.items.len(),
+                    1,
+                    "$orderby={keyset_label} {dir:?}: a limit-1 page returns exactly one row"
+                );
+                walked += 1;
+                match bounded.next {
+                    Some(next) => keyset = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                walked, 6,
+                "$orderby={keyset_label} {dir:?}: a limit-1 walk must cross all six rows via a \
+                 real continuation on every step"
+            );
+        }
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_avg_rounds_non_terminating_quotient() {
-    // {1, 1, 2}: mean = 4 / 3 = 1.333333… — a non-terminating quotient. The
-    // integer-mean case in `pg_aggregate_min_max_avg_over_active_rows` (avg 5)
-    // never reproduces the `ROUND(AVG(value), 6)::numeric` scale bound; this
-    // exercises it end-to-end and asserts the rounded value decodes back into
-    // `BigDecimal` (the reason the cast/round was added — a raw unbounded quotient
-    // would otherwise carry unbounded scale).
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3009);
-
-    for (i, v) in [1_i64, 1, 2].into_iter().enumerate() {
-        let seq = 0x3009_0000 + u128::try_from(i).unwrap();
-        let mut rec = record_at(VCPU_GTS, tenant, seq, i64::try_from(i).unwrap());
-        rec.value = Decimal::new(v, 0);
-        store.create(rec).await.expect("create record");
+/// The value `$orderby=<field>` sorts on, rendered so a string comparison
+/// agrees with the column's own collation for these fixtures.
+///
+/// A `match` rather than a map so a new entry in [`KEYSET_SAFE_RECORD_FIELDS`]
+/// fails to compile here, next to the decision it needs.
+fn order_key_of(record: &StoredUsageRecord, field: &str) -> String {
+    match field {
+        "id" => record.id.to_string(),
+        "window_start" => record.window_start.unix_timestamp().to_string(),
+        "window_end" => record.window_end.unix_timestamp().to_string(),
+        "tenant_id" => record.tenant_id.to_string(),
+        "resource_id" => record.resource_ref.resource_id().to_owned(),
+        "resource_type" => record.resource_ref.resource_type().to_owned(),
+        "origin" => record.origin.as_str().to_owned(),
+        "accepted_at" => record.accepted_at.unix_timestamp().to_string(),
+        other => panic!("no order key for `{other}`; KEYSET_SAFE_RECORD_FIELDS grew"),
     }
+}
 
-    let spec = AggregationSpec {
-        op: AggregationOp::Avg,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate avg over {1, 1, 2}");
+// $filter
 
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
-    assert_eq!(
-        result.buckets[0].value.as_ref().map(BigDecimal::normalized),
-        Some(
-            BigDecimal::from_str("1.333333")
-                .expect("valid decimal")
-                .normalized()
+/// Every published `$filter` field resolves to a column and discriminates.
+///
+/// "Resolves" and "discriminates" are two claims and the second is the one worth
+/// the fixtures: a filter that resolves but selects everything, or nothing, is
+/// indistinguishable from a working one on a single-row table. So each case
+/// names the exact id set it expects out of a seeded population containing
+/// counterexamples for every field.
+///
+/// `origin` and `entry_type` are the fields the contract suite's fixtures cannot
+/// serve, and also the ones whose columns are unlike the rest: `entry_type` is a
+/// `usage_entry_type` enum, the only filterable column whose comparison value is
+/// cast rather than bound as it stands, and `origin` is server-assigned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_published_filter_field_resolves_and_discriminates() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant_a = Uuid::from_u128(0x2007_000A);
+    let tenant_b = Uuid::from_u128(0x2007_000B);
+
+    // Entry 0: tenant A, res-a/type-a, subject s-a/kind-a, live.
+    let mut e0 = common::entry_over(
+        &meter,
+        tenant_a,
+        "idem-0",
+        Decimal::ONE,
+        common::fixture_window_start(),
+        common::fixture_window_end(),
+    );
+    e0.resource_ref = ResourceRef::new("res-a", "type-a").expect("valid");
+    e0.subject_ref = Some(SubjectRef::new("s-a", Some("kind-a")).expect("valid"));
+    let e0 = store.create_fixture(e0).await.expect("seed 0");
+
+    // Entry 1: tenant B, res-b/type-b, subject s-b/kind-b, backfill, one hour on.
+    let mut e1 = common::entry_over(
+        &meter,
+        tenant_b,
+        "idem-1",
+        Decimal::from(2),
+        common::fixture_window_start() + Duration::hours(1),
+        common::fixture_window_end() + Duration::hours(1),
+    );
+    e1.resource_ref = ResourceRef::new("res-b", "type-b").expect("valid");
+    e1.subject_ref = Some(SubjectRef::new("s-b", Some("kind-b")).expect("valid"));
+    e1.origin = RecordOrigin::Backfill;
+    let e1 = store.create_fixture(e1).await.expect("seed 1");
+
+    // Entry 2: a withdrawal of entry 0. Same tenant, period and attribution as
+    // its target, so it is only `entry_type` and `invalidates` that separate it.
+    let w = common::withdrawal_of(&e0);
+    let w = store.create_fixture(w).await.expect("seed the withdrawal");
+
+    let cases: Vec<(&str, Expr, Vec<Uuid>)> = vec![
+        ("tenant_id", eq_uuid("tenant_id", tenant_b), vec![e1.id]),
+        ("resource_id", eq_str("resource_id", "res-b"), vec![e1.id]),
+        ("resource_type", eq_str("resource_type", "type-a"), {
+            let mut v = vec![e0.id, w.id];
+            v.sort();
+            v
+        }),
+        ("subject_id", eq_str("subject_id", "s-b"), vec![e1.id]),
+        ("subject_type", eq_str("subject_type", "kind-a"), {
+            let mut v = vec![e0.id, w.id];
+            v.sort();
+            v
+        }),
+        (
+            "entry_type",
+            eq_str("entry_type", "invalidation"),
+            vec![w.id],
         ),
-        "AVG(4/3) must decode as the ROUND(.., 6) value 1.333333",
+        ("origin", eq_str("origin", "backfill"), vec![e1.id]),
+        ("invalidates", eq_uuid("invalidates", e0.id), vec![w.id]),
+    ];
+
+    for (field, expr, expected) in cases {
+        let q = page_query(default_order(), None).with_filter(expr);
+        let page = store
+            .list(common::meter_reference(&meter), wide_range(), &q, &[], None)
+            .await
+            .unwrap_or_else(|e| panic!("$filter on `{field}` must resolve: {e:?}"));
+        let mut got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "$filter on `{field}` must discriminate, not select everything or nothing"
+        );
+    }
+
+    // The complement of the `entry_type` case: filtering for `record` returns
+    // the two measurements and not the withdrawal. Written out because a
+    // column that answered one enum label and not the other would pass the
+    // case above.
+    let q = page_query(default_order(), None).with_filter(eq_str("entry_type", "record"));
+    let page = store
+        .list(common::meter_reference(&meter), wide_range(), &q, &[], None)
+        .await
+        .expect("list");
+    let mut got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    got.sort();
+    let mut expected = vec![e0.id, e1.id];
+    expected.sort();
+    assert_eq!(got, expected);
+}
+
+/// An `entry_type` literal that is not one of the enum's labels still
+/// reaches `store.list` as `Internal("database error")`, and that is
+/// **known and permanent**, not a pending fix.
+///
+/// **This test does not pin the SQLSTATE.** `bind_cast` renders the comparison
+/// as `entry_type = $1::usage_entry_type`, so an off-label literal raises `22P02`
+/// today — but `classify_db` (`infra/storage/error.rs`) folds every non-`23505`,
+/// non-transient SQLSTATE into `DbErrorClass::Other` and `map_sqlx_err` lowers
+/// every `Other` to the same fixed `Internal("database error")`. The assertion
+/// would be satisfied just as well by `42883` if `bind_cast` stopped casting.
+/// That mechanism — `bind_cast` casting the literal and only the literal, on
+/// `entry_type` and nothing else — is pinned at the `--lib` level by
+/// `translate_tests.rs`, whose asserted SQL names `usage_entry_type` directly.
+///
+/// What this test uniquely discriminates, and is worth the pg round-trip for, is
+/// the **error class**: `expect_err` plus the exact `map_sqlx_err` token
+/// separates "`PostgreSQL` refused it" from "something in the translate layer
+/// refused the value first" (which the plugin error enum can only represent as
+/// `Internal` either way, having no invalid-argument variant).
+///
+/// It calls `store.list` directly, with no gear in front of it, so it pins the
+/// backend's own §3.7 contract: a non-conforming host that skipped gear-side
+/// validation could provoke this exact `Internal`. No conforming gear reaches
+/// it, `domain::query::reject_off_label_literals` refusing an off-label
+/// `entry_type` or `origin` literal before either read path dispatches — pinned
+/// from the gear side by `an_off_label_entry_type_literal_is_refused`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_label_entry_type_filter_still_answers_an_internal_error() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+
+    // `Record` rather than a nonsense string: the labels are lower-case, so a
+    // capitalised one is a misspelling a caller plausibly sends, and it is
+    // still not a label.
+    let q = page_query(default_order(), None).with_filter(eq_str("entry_type", "Record"));
+    let err = store
+        .list(common::meter_reference(&meter), wide_range(), &q, &[], None)
+        .await
+        .expect_err("a literal off the enum's labels must not be answered with a page");
+
+    // The detail is asserted, not just the variant: `map_sqlx_err`'s fixed
+    // token is the only thing separating "the backend refused a literal it could
+    // not parse" from "something in the translate layer refused the value first",
+    // a guard there surfacing as `Internal` too with a detail of its own. It does
+    // NOT separate which SQLSTATE PostgreSQL raised.
+    assert!(
+        matches!(&err, UsageCollectorPluginError::Internal(detail) if detail == "database error"),
+        "a non-conforming host that bypassed the gear's reject_off_label_literals guard \
+         still gets this backend's own Internal(\"database error\") — that behaviour is \
+         unchanged by slice 7 task 9, which refuses the request one layer up instead; \
+         got: {err:?}"
     );
 }
 
+/// The metadata side channel: AND across filters, OR within one filter's values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_excludes_inactive() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3005);
+async fn the_metadata_side_channel_narrows_the_selection() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x2008);
 
-    // Two active rows summing 10 + 5; deactivate the 10 row.
-    let mut keep = record_at(VCPU_GTS, tenant, 0x3005_0001, 0);
-    keep.value = Decimal::new(5, 0);
-    let mut drop_row = record_at(VCPU_GTS, tenant, 0x3005_0002, 1);
-    drop_row.value = Decimal::new(10, 0);
-    let drop_id = drop_row.id;
-    store.create(keep).await.expect("create keep");
-    store.create(drop_row).await.expect("create drop");
-    store.deactivate(drop_id).await.expect("deactivate drop");
+    let mut ids = Vec::new();
+    for (i, (region, tier)) in [("eu", "gold"), ("eu", "silver"), ("us", "gold")]
+        .into_iter()
+        .enumerate()
+    {
+        let i = i64::try_from(i).expect("small");
+        let mut rec = common::entry_over(
+            &meter,
+            tenant,
+            &format!("idem-{i}"),
+            Decimal::from(i + 1),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
+        );
+        rec.metadata.insert(
+            MetadataKey::new("region").expect("valid key"),
+            region.to_owned(),
+        );
+        rec.metadata.insert(
+            MetadataKey::new("tier").expect("valid key"),
+            tier.to_owned(),
+        );
+        ids.push(store.create_fixture(rec).await.expect("seed").id);
+    }
 
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
+    // One filter, two values: OR within.
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            wide_range(),
+            &page_query(default_order(), None),
+            &[MetadataFilter::new("tier", ["gold", "platinum"]).expect("valid filter")],
+            None,
         )
         .await
-        .expect("aggregate excludes inactive");
+        .expect("list");
+    let mut got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    got.sort();
+    let mut expected = vec![ids[0], ids[2]];
+    expected.sort();
+    assert_eq!(got, expected, "OR within one filter's value set");
 
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
+    // Two filters: AND across.
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            wide_range(),
+            &page_query(default_order(), None),
+            &[
+                MetadataFilter::new("region", ["eu"]).expect("valid filter"),
+                MetadataFilter::new("tier", ["gold"]).expect("valid filter"),
+            ],
+            None,
+        )
+        .await
+        .expect("list");
+    let got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(got, vec![ids[0]], "AND across filters");
+}
+
+// The point lookup
+
+/// An entry outside the caller's compiled scope and an entry that never existed
+/// are **one answer**.
+///
+/// The scope is part of the `WHERE`, so a withheld row is indistinguishable from
+/// an absent one by the time the store looks at the result — and nothing may be
+/// logged, counted or timed that would tell them apart, that distinction being
+/// an existence oracle over every tenant's entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_outside_the_scope_and_a_row_that_does_not_exist_are_one_answer() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let mine = Uuid::from_u128(0x2009_0001);
+    let theirs = Uuid::from_u128(0x2009_0002);
+
+    let ours = common::entry(&meter, mine, "idem-mine", Decimal::ONE);
+    let ours = store.create_fixture(ours).await.expect("create ours");
+    let hidden = common::entry(&meter, theirs, "idem-theirs", Decimal::from(2));
+    let hidden = store.create_fixture(hidden).await.expect("create theirs");
+
+    let scope = common::tenant_scope(mine);
+
+    // In scope: found.
+    let got = store.get(ours.id, &scope).await.expect("our own entry");
+    assert_eq!(got.id, ours.id);
+
+    // Out of scope: not found, naming the id that was asked for.
+    let withheld = store
+        .get(hidden.id, &scope)
+        .await
+        .expect_err("an entry outside the scope must not be served");
+    // Absent entirely: the same error, for an id nothing ever derived.
+    let absent_id = Uuid::from_u128(0x2009_DEAD);
+    let absent = store
+        .get(absent_id, &scope)
+        .await
+        .expect_err("an id that was never stored is not found");
+
+    match (&withheld, &absent) {
+        (
+            UsageCollectorPluginError::UsageRecordNotFound { id: a },
+            UsageCollectorPluginError::UsageRecordNotFound { id: b },
+        ) => {
+            assert_eq!(*a, hidden.id);
+            assert_eq!(*b, absent_id);
+        }
+        other => panic!("both must be UsageRecordNotFound, got {other:?}"),
+    }
     assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(5_i64)),
-        "SUM counts only the active row (5); the deactivated 10 is excluded"
+        std::mem::discriminant(&withheld),
+        std::mem::discriminant(&absent),
+        "withheld and absent must be one variant: any difference is an existence oracle"
+    );
+
+    // And the row really is there, for the tenant that owns it.
+    let theirs_scope = common::tenant_scope(theirs);
+    assert_eq!(
+        store
+            .get(hidden.id, &theirs_scope)
+            .await
+            .expect("their entry")
+            .id,
+        hidden.id,
+        "the withheld row exists; it was the scope that withheld it"
     );
 }
 
+/// The subject attribution survives a write and a point lookup, both halves of
+/// it, including the untyped-subject shape the model allows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_subject_ref_round_trips_through_create_and_get() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3006);
+async fn the_subject_reference_round_trips_through_create_and_get() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200A);
+    let scope = common::tenant_scope(tenant);
 
-    let rec = common::fixture_usage_record_with_subject(
-        VCPU_GTS,
+    let mut typed = common::entry(&meter, tenant, "idem-typed", Decimal::ONE);
+    typed.subject_ref = Some(SubjectRef::new("subj-1", Some("user")).expect("valid"));
+    let typed_id = typed.id;
+    store
+        .create_fixture(typed)
+        .await
+        .expect("create typed subject");
+
+    let mut untyped = common::entry_over(
+        &meter,
         tenant,
-        "idem-3006-1",
-        Decimal::new(1, 0),
-        0x3006_0001,
-        "subj-1",
-        Some("user"),
+        "idem-untyped",
+        Decimal::from(2),
+        common::fixture_window_start() + Duration::hours(1),
+        common::fixture_window_end() + Duration::hours(1),
     );
-    let id = rec.id;
-    store.create(rec).await.expect("create with subject");
+    untyped.subject_ref = Some(SubjectRef::new("subj-2", None::<String>).expect("valid"));
+    let untyped_id = untyped.id;
+    store
+        .create_fixture(untyped)
+        .await
+        .expect("create untyped subject");
 
-    let got = store.get(id).await.expect("get the subject-bearing record");
-    let subject = got.subject_ref.expect("subject_ref must round-trip");
-    assert_eq!(subject.subject_id(), "subj-1", "subject_id round-trips");
+    let got = store.get(typed_id, &scope).await.expect("get typed");
+    let subject = got.subject_ref.expect("subject_ref round-trips");
+    assert_eq!(subject.subject_id(), "subj-1");
+    assert_eq!(subject.subject_type(), Some("user"));
+
+    let got = store.get(untyped_id, &scope).await.expect("get untyped");
+    let subject = got.subject_ref.expect("subject_ref round-trips");
+    assert_eq!(subject.subject_id(), "subj-2");
     assert_eq!(
         subject.subject_type(),
-        Some("user"),
-        "subject_type round-trips"
+        None,
+        "a subject without a type is a subject, not an absent one"
     );
 }
 
+// The fold
+
+/// A withdrawn pair is returned as persisted by both ledger paths, and
+/// contributes nothing to any fold — **both halves**.
+///
+/// An invalidation echoes the quantity it withdraws rather than negating it, so
+/// netting the two would double-count. Every fold applies the same exclusion;
+/// there is no per-fold rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_group_by_subject_id_excludes_subjectless() {
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant = Uuid::from_u128(0x3007);
+async fn a_withdrawn_pair_is_returned_by_the_ledger_and_folded_by_nothing() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200B);
+    let scope = common::tenant_scope(tenant);
 
-    // subj-a: 4 + 6 = 10; subj-b: 5; plus one subject-less row (7) that must be
-    // excluded from a group-by-subject aggregation per the SDK contract.
-    let subject_rows = [
-        ("idem-3007-1", 4_i64, 0x3007_0001_u128, "subj-a", 0_i64),
-        ("idem-3007-2", 6, 0x3007_0002, "subj-a", 1),
-        ("idem-3007-3", 5, 0x3007_0003, "subj-b", 2),
-    ];
-    for (idem, value, seq, subject_id, ts) in subject_rows {
-        let mut rec = common::fixture_usage_record_with_subject(
-            VCPU_GTS,
-            tenant,
-            idem,
-            Decimal::new(value, 0),
-            seq,
-            subject_id,
-            None,
-        );
-        rec.created_at =
-            OffsetDateTime::from_unix_timestamp(BASE_TS + ts).expect("valid created_at instant");
-        store.create(rec).await.expect("create subject row");
-    }
-    // A subject-less row (the IS NOT NULL guard must exclude it from grouping).
-    let mut subjectless = record_at(VCPU_GTS, tenant, 0x3007_0004, 3);
-    subjectless.value = Decimal::new(7, 0);
-    store
-        .create(subjectless)
+    let withdrawn = common::entry(&meter, tenant, "idem-withdrawn", Decimal::from(10));
+    let withdrawn = store
+        .create_fixture(withdrawn)
         .await
-        .expect("create subjectless row");
+        .expect("create the target");
+    let withdrawal = common::withdrawal_of(&withdrawn);
+    let withdrawal = store
+        .create_fixture(withdrawal)
+        .await
+        .expect("create the withdrawal");
+    let standing = common::entry_over(
+        &meter,
+        tenant,
+        "idem-standing",
+        Decimal::from(3),
+        common::fixture_window_start() + Duration::hours(1),
+        common::fixture_window_end() + Duration::hours(1),
+    );
+    let standing = store
+        .create_fixture(standing)
+        .await
+        .expect("create the standing entry");
 
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: vec![AggregationDimension::SubjectId],
-    };
-    let result = store
+    // The ledger returns all three.
+    let page = store
+        .list(
+            common::meter_reference(&meter),
+            wide_range(),
+            &page_query(default_order(), None),
+            &[],
+            None,
+        )
+        .await
+        .expect("list");
+    let mut got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    got.sort();
+    let mut all = vec![withdrawn.id, withdrawal.id, standing.id];
+    all.sort();
+    assert_eq!(
+        got, all,
+        "the raw list is the ledger: hiding either half destroys the audit trail"
+    );
+    // And so does the point lookup, for each half.
+    assert_eq!(
+        store
+            .get(withdrawn.id, &scope)
+            .await
+            .expect("get target")
+            .id,
+        withdrawn.id
+    );
+    assert_eq!(
+        store
+            .get(withdrawal.id, &scope)
+            .await
+            .expect("get withdrawal")
+            .id,
+        withdrawal.id
+    );
+
+    // The fold sees only the standing entry, under every fold.
+    for (fold, expected) in [
+        (AggregationFold::Sum, BigDecimal::from(3)),
+        (AggregationFold::Count, BigDecimal::from(1)),
+        (AggregationFold::Min, BigDecimal::from(3)),
+        (AggregationFold::Max, BigDecimal::from(3)),
+        (AggregationFold::Latest, BigDecimal::from(3)),
+    ] {
+        let result = store
+            .aggregate(
+                common::meter_reference(&meter),
+                wide_range(),
+                fold,
+                &ODataQuery::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{fold}: {e:?}"));
+        assert_eq!(
+            only_bucket_value(&result).map(|v| v.normalized()),
+            Some(expected.normalized()),
+            "{fold} must exclude both halves of the withdrawn pair: the withdrawal itself \
+             and the entry it names"
+        );
+    }
+}
+
+/// An orphan invalidation — one whose target row is gone — still contributes
+/// nothing to the **scan** path.
+///
+/// An orphan is unreachable through any SPI or retention path: an invalidation
+/// copies its target's `window_end` and type, so the sweep drops the pair
+/// together, and the gateway admits an invalidation only for an existing target.
+/// The raw `DELETE` below manufactures one anyway, because the scan's
+/// `invalidates IS NULL` conjunct is a standing obligation rather than an
+/// optimization of the `NOT EXISTS` one. The rollup path nets a pair by signed
+/// addition and relies on that unreachability (spec §5.2, invariant 4), so this
+/// pins the scan explicitly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphan_invalidation_contributes_nothing() {
+    let (h, store) = setup().await;
+    let scan = common::record_store(&h).without_rollup();
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200C);
+
+    let target = common::entry(&meter, tenant, "idem-target", Decimal::from(10));
+    let target = store
+        .create_fixture(target)
+        .await
+        .expect("create the target");
+    let withdrawal = common::withdrawal_of(&target);
+    store
+        .create_fixture(withdrawal)
+        .await
+        .expect("create the withdrawal");
+    let standing = common::entry_over(
+        &meter,
+        tenant,
+        "idem-standing",
+        Decimal::from(3),
+        common::fixture_window_start() + Duration::hours(1),
+        common::fixture_window_end() + Duration::hours(1),
+    );
+    store
+        .create_fixture(standing)
+        .await
+        .expect("create the standing entry");
+
+    // Manufacture an orphan out of band: the row goes, the withdrawal that
+    // named it stays.
+    let purged = sqlx::query("DELETE FROM usage_records WHERE id = $1")
+        .bind(target.id)
+        .execute(&h.pool)
+        .await
+        .expect("purge the target")
+        .rows_affected();
+    assert_eq!(purged, 1, "the target was purged");
+
+    let result = scan
         .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
+            common::meter_reference(&meter),
+            wide_range(),
+            AggregationFold::Sum,
             &ODataQuery::new(),
             &[],
-            spec,
+            &[],
         )
         .await
-        .expect("aggregate group by subject_id");
-
+        .expect("aggregate");
     assert_eq!(
-        result.buckets.len(),
-        2,
-        "subject-less row is excluded -> two subject buckets"
-    );
-    let mut got: Vec<(String, Option<BigDecimal>)> = result
-        .buckets
-        .iter()
-        .map(|b| {
-            assert_eq!(b.key.len(), 1, "single grouped dimension -> one key entry");
-            (b.key[0].clone(), b.value.clone())
-        })
-        .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        got,
-        vec![
-            ("subj-a".to_owned(), Some(BigDecimal::from(10_i64))),
-            ("subj-b".to_owned(), Some(BigDecimal::from(5_i64))),
-        ],
-        "each subject_id bucket carries its summed value"
+        only_bucket_value(&result).map(|v| v.normalized()),
+        Some(BigDecimal::from(3).normalized()),
+        "the orphan's echoed quantity must not reappear in the total once its target is gone"
     );
 }
 
+/// The five folds over a known population, including the `LATEST` tie-break.
+///
+/// `LATEST` is greatest `window_end`, then greatest `accepted_at`, then greatest
+/// `id` in byte order (the gear's DESIGN §3.1, and this plugin's own §3.6).
+///
+/// **This fixture ties on the first two keys, so it exercises the third.**
+/// `common::entry_over` stamps `fixture_window_end()` as `accepted_at` for every
+/// entry, so the pair at hour 1 ties on `window_end`, ties again on
+/// `accepted_at`, and falls through to greatest `id`. The middle key is covered
+/// by the SDK's `latest-tie-break` check instead, over a pair whose
+/// `accepted_at` differs.
+///
+/// **The precondition assertion is what makes the third key observable rather
+/// than coincidental**: the pair is arranged so the later-inserted entry carries
+/// the *lower* `id`, so a backend that ran out of keys and settled the tie on
+/// whatever the scan produced — or one that returned the most recently written
+/// row — answers 7 where the rule answers 5. Without that arrangement both
+/// answer alike. The entry `id` is a `UUIDv5` over the dedup identity, so which
+/// of two keys sorts higher is not something a fixture author can predict, which
+/// is why it is asserted rather than assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_filter_by_tenant_isolates_sum() {
-    // The aggregate path builds its WHERE clause independently of `list`; this
-    // pins that the PDP-injected `tenant_id eq …` `$filter` actually scopes the
-    // aggregation, so a regression that dropped the filter (summing across all
-    // tenants) is caught.
-    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
-    let tenant_a = Uuid::from_u128(0x3009_000A);
-    let tenant_b = Uuid::from_u128(0x3009_000B);
+async fn the_five_folds_answer_over_a_known_population() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200D);
 
-    // Tenant A: 4 + 6 = 10. Tenant B: 100 (must be excluded by the filter).
-    let mut a1 = record_at(VCPU_GTS, tenant_a, 0x3009_0001, 0);
-    a1.value = Decimal::new(4, 0);
-    let mut a2 = record_at(VCPU_GTS, tenant_a, 0x3009_0002, 1);
-    a2.value = Decimal::new(6, 0);
-    let mut b1 = record_at(VCPU_GTS, tenant_b, 0x3009_0003, 2);
-    b1.value = Decimal::new(100, 0);
-    store.create(a1).await.expect("create A1");
-    store.create(a2).await.expect("create A2");
-    store.create(b1).await.expect("create B1");
-
-    let filter = Expr::Compare(
-        Box::new(Expr::Identifier("tenant_id".to_owned())),
-        CompareOperator::Eq,
-        Box::new(Expr::Value(Value::Uuid(tenant_a))),
-    );
-    let query = ODataQuery::new().with_filter(filter);
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(common::fixture_gts_id(VCPU_GTS), &query, &[], spec)
-        .await
-        .expect("aggregate sum filtered by tenant");
-
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
-    assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(10_i64)),
-        "SUM includes only tenant A's rows (4 + 6); tenant B's 100 is excluded by the $filter"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_aggregate_metadata_filter_narrows_sum() {
-    // The metadata side-channel filter is shared by `list` and `aggregate` but
-    // only `list` exercised it with a real filter; this covers the real billing
-    // query shape ("sum where region = us-east-1") through the aggregate path.
-    let (_h, store) = setup_with_type(VCPU_GTS, &["region"]).await;
-    let tenant = Uuid::from_u128(0x300A);
-
-    // us-east-1: 2 + 3 = 5; eu-west-1: 7 (must be excluded by the metadata filter).
-    let rows = [
-        ("us-east-1", 2_i64, 0_i64),
-        ("us-east-1", 3, 1),
-        ("eu-west-1", 7, 2),
-    ];
-    for (i, (region, value, ts)) in rows.iter().enumerate() {
-        let seq = 0x300A_0000 + u128::try_from(i).unwrap();
-        let mut rec = record_at(VCPU_GTS, tenant, seq, *ts);
-        rec.value = Decimal::new(*value, 0);
-        let mut meta = BTreeMap::new();
-        meta.insert(
-            MetadataKey::new("region").expect("valid metadata key"),
-            (*region).to_owned(),
+    // Two entries at hour 0 (values 2 and 8), and two sharing hour 1's period
+    // end. `idem-c` (7) is written first and `idem-d` (5) second. `idem-d`
+    // carries the greater id, so the greatest-id rule answers 5 while the
+    // physical order the scan produces leads with 7 -- which is the whole reason
+    // the write order is this way round. See the precondition below.
+    let mut hour_one: Vec<StoredUsageRecord> = Vec::new();
+    for (i, value, key) in [
+        (0_i64, 2_i64, "idem-a"),
+        (0, 8, "idem-b"),
+        (1, 7, "idem-c"),
+        (1, 5, "idem-d"),
+    ] {
+        let rec = common::entry_over(
+            &meter,
+            tenant,
+            key,
+            Decimal::from(value),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
         );
-        rec.metadata = meta;
-        store.create(rec).await.expect("create record");
+        let stored = store.create_fixture(rec).await.expect("seed");
+        if i == 1 {
+            hour_one.push(stored);
+        }
     }
 
-    let filter = MetadataFilter::new("region", ["us-east-1"]).expect("valid metadata filter");
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
+    let (first_written, last_written) = (&hour_one[0], &hour_one[1]);
+    assert_eq!(
+        first_written.window_end, last_written.window_end,
+        "the pair ties on window_end"
+    );
+    // The last-written entry must carry the *greater* id. This pair ties on
+    // `window_end` and on `accepted_at`, so `id` is the only key left -- and a
+    // fold that ran out of keys does not error, it takes whatever order the scan
+    // produced, which over a freshly written chunk leads with the entry written
+    // first. With the greater id on the entry written *last*, the two disagree:
+    // greatest-id answers 5, scan order answers 7. Written the other way round
+    // they coincide and the expectation below would hold against a fold carrying
+    // no third key at all -- dropping `r.id DESC` from `LATEST_SELECT_EXPR` left
+    // the whole pg lane green until this assertion was turned around.
+    assert!(
+        last_written.id > first_written.id,
+        "the fixture must put the greater id on the entry written last, or the LATEST \
+         expectation below holds even against a fold with no id key: the pair ties on \
+         window_end and accepted_at, so such a fold falls to the scan's physical order, \
+         which leads with the entry written first. last_written={} first_written={}",
+        last_written.id,
+        first_written.id
+    );
+
+    for (fold, expected) in [
+        (AggregationFold::Sum, 22_i64),
+        (AggregationFold::Count, 4),
+        (AggregationFold::Min, 2),
+        (AggregationFold::Max, 8),
+        // Greatest window_end is hour 1; of the two there, both share one
+        // accepted_at, so the fold falls to greatest id - which the precondition
+        // above pins as `idem-d` (5), the entry written *last*. A backend
+        // answering 7 here is one that never reached the third key and settled
+        // the tie on the scan's order instead.
+        (AggregationFold::Latest, 5),
+    ] {
+        let result = store
+            .aggregate(
+                common::meter_reference(&meter),
+                wide_range(),
+                fold,
+                &ODataQuery::new(),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{fold}: {e:?}"));
+        assert_eq!(
+            only_bucket_value(&result).map(|v| v.normalized()),
+            Some(BigDecimal::from(expected).normalized()),
+            "{fold} over {{2, 8}} at hour 0 and {{5, 7}} at hour 1"
+        );
+    }
+}
+
+/// A bare fold over an **empty** selection still answers one bucket; `SUM` and
+/// `COUNT` carry `Some(0)` there while `MAX`, `MIN` and `LATEST` carry `None`.
+///
+/// The gear's DESIGN §3.3 splits the folds that way, and only a real query
+/// demonstrates it: a unit test reaches the statement that leads here and no
+/// further. `COUNT`'s zero is `SELECT COUNT(*)`'s own answer; `SUM`'s is
+/// `PostgreSQL`'s `NULL` over zero rows put right by the statement's `COALESCE`.
+///
+/// **The second half keeps that `COALESCE` honest.** A zero from an empty
+/// selection is worth nothing if a real total can also come back as zero or be
+/// lost on the way, so two non-empty selections are folded here: one whose
+/// surviving entries net to zero, and one whose total is negative (an ordinary
+/// outcome — DESIGN §3.3, "No business logic"). The `COUNT` beside each is what
+/// says the selection had entries in it.
+///
+/// **`SUM` and `COUNT` are asked on both read paths.** Every range here covers a
+/// whole hour, so both folds are rollup-eligible and `store` answers them from
+/// `usage_rollup_1h` while `scan` has the rollup off and reads the ledger. The
+/// two owe the same answer (spec §6.4), the empty selection included, and each
+/// carries its own expression for it. `MAX`, `MIN` and `LATEST` are never
+/// rollup-eligible, so both readers take the scan for those.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_fold_tells_an_empty_selection_a_netted_one_and_a_negative_total_apart() {
+    let (h, store) = setup().await;
+    let scan = common::record_store(&h).without_rollup();
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200E);
+    let paths: [(&str, &PgRecordStore); 2] = [("rollup", &store), ("scan", &scan)];
+
+    // A populated ledger, and a range that selects none of it — so the empty
+    // selection is the range's doing rather than an empty table's.
+    seed_hourly(&store, tenant, 3).await;
+    let empty = TimeRange::new(
+        common::fixture_window_end() + Duration::days(30),
+        common::fixture_window_end() + Duration::days(31),
+    )
+    .expect("ordered range");
+
+    for (path, reader) in paths {
+        for fold in [AggregationFold::Sum, AggregationFold::Count] {
+            let result = reader
+                .aggregate(
+                    common::meter_reference(&meter),
+                    empty,
+                    fold,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} {fold}: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&result).map(|v| v.normalized()),
+                Some(BigDecimal::from(0).normalized()),
+                "{path}: {fold} is defined over an empty selection and answers Some(0), \
+                 never None"
+            );
+        }
+
+        for fold in [
+            AggregationFold::Min,
+            AggregationFold::Max,
+            AggregationFold::Latest,
+        ] {
+            let result = reader
+                .aggregate(
+                    common::meter_reference(&meter),
+                    empty,
+                    fold,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} {fold}: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&result),
+                None,
+                "{path}: {fold} over an empty selection has no value to answer with"
+            );
+        }
+    }
+
+    // A selection that nets to zero and one that is negative, each two surviving
+    // entries at its own instant, far from the seeded hours and from each other.
+    for (day, entries, expected) in [
+        (40_i64, [("net-a", 5_i64), ("net-b", -5)], 0_i64),
+        (50, [("neg-a", 2), ("neg-b", -7)], -5),
+    ] {
+        let at = common::fixture_window_end() + Duration::days(day);
+        for (key, value) in entries {
+            let rec = common::entry_over(
+                &meter,
+                tenant,
+                key,
+                Decimal::from(value),
+                at - Duration::minutes(30),
+                at,
+            );
+            store.create_fixture(rec).await.expect("seed entry");
+        }
+        let around = TimeRange::new(at - Duration::hours(1), at + Duration::hours(1))
+            .expect("ordered range");
+
+        for (path, reader) in paths {
+            let sum = reader
+                .aggregate(
+                    common::meter_reference(&meter),
+                    around,
+                    AggregationFold::Sum,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} sum: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&sum).map(|v| v.normalized()),
+                Some(BigDecimal::from(expected).normalized()),
+                "{path}: a surviving selection keeps its total; {entries:?} sums to {expected}"
+            );
+            let count = reader
+                .aggregate(
+                    common::meter_reference(&meter),
+                    around,
+                    AggregationFold::Count,
+                    &ODataQuery::new(),
+                    &[],
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{path} count: {e:?}"));
+            assert_eq!(
+                only_bucket_value(&count).map(|v| v.normalized()),
+                Some(BigDecimal::from(2).normalized()),
+                "{path}: the selection holds both entries, so its total was folded rather \
+                 than defaulted"
+            );
+        }
+    }
+}
+
+/// Grouping: by a record column, by a metadata key, and by a dimension some rows
+/// do not carry.
+///
+/// The last is the one with a rule behind it: a row missing the grouped
+/// dimension is dropped rather than folded into a `NULL` bucket, so grouped
+/// buckets need not sum to the ungrouped total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grouping_folds_by_column_by_metadata_and_drops_rows_missing_the_dimension() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant = Uuid::from_u128(0x200F);
+
+    // res-a: 4 + 6; res-b: 5; and a fourth row with no subject at all.
+    let rows = [
+        Seed {
+            key: "idem-1",
+            value: 4,
+            resource: "res-a",
+            subject: Some("subj-a"),
+            region: "eu",
+        },
+        Seed {
+            key: "idem-2",
+            value: 6,
+            resource: "res-a",
+            subject: Some("subj-a"),
+            region: "eu",
+        },
+        Seed {
+            key: "idem-3",
+            value: 5,
+            resource: "res-b",
+            subject: Some("subj-b"),
+            region: "us",
+        },
+        Seed {
+            key: "idem-4",
+            value: 7,
+            resource: "res-b",
+            subject: None,
+            region: "us",
+        },
+    ];
+    for (i, seed) in rows.into_iter().enumerate() {
+        let Seed {
+            key,
+            value,
+            resource,
+            subject,
+            region,
+        } = seed;
+        let i = i64::try_from(i).expect("small");
+        let mut rec = common::entry_over(
+            &meter,
+            tenant,
+            key,
+            Decimal::from(value),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
+        );
+        rec.resource_ref = ResourceRef::new(resource, "compute.vm").expect("valid");
+        rec.subject_ref = subject.map(|s| SubjectRef::new(s, Some("user")).expect("valid"));
+        rec.metadata.insert(
+            MetadataKey::new("region").expect("valid key"),
+            region.to_owned(),
+        );
+        store.create_fixture(rec).await.expect("seed");
+    }
+
+    let by = |dim: AggregationDimension| {
+        let meter = meter.clone();
+        let store = &store;
+        async move {
+            let result = store
+                .aggregate(
+                    common::meter_reference(&meter),
+                    wide_range(),
+                    AggregationFold::Sum,
+                    &ODataQuery::new(),
+                    &[],
+                    &[dim],
+                )
+                .await
+                .expect("grouped aggregate");
+            result
+                .buckets
+                .into_iter()
+                .map(|b| {
+                    (
+                        b.key.join("|"),
+                        b.value
+                            .map(|v| v.normalized())
+                            .expect("a grouped bucket has a value"),
+                    )
+                })
+                .collect::<BTreeMap<String, BigDecimal>>()
+        }
     };
+
+    assert_eq!(
+        by(AggregationDimension::ResourceId).await,
+        BTreeMap::from([
+            ("res-a".to_owned(), BigDecimal::from(10).normalized()),
+            ("res-b".to_owned(), BigDecimal::from(12).normalized()),
+        ]),
+        "grouped by a record column"
+    );
+
+    assert_eq!(
+        by(AggregationDimension::Metadata(
+            MetadataKey::new("region").expect("valid key")
+        ))
+        .await,
+        BTreeMap::from([
+            ("eu".to_owned(), BigDecimal::from(10).normalized()),
+            ("us".to_owned(), BigDecimal::from(12).normalized()),
+        ]),
+        "grouped by a metadata key"
+    );
+
+    assert_eq!(
+        by(AggregationDimension::SubjectId).await,
+        BTreeMap::from([
+            ("subj-a".to_owned(), BigDecimal::from(10).normalized()),
+            ("subj-b".to_owned(), BigDecimal::from(5).normalized()),
+        ]),
+        "the subject-less row joins no bucket rather than forming a NULL one, so the \
+         grouped buckets (15) do not sum to the ungrouped total (22)"
+    );
+}
+
+/// A composed `$filter` and the metadata side channel both narrow the fold, not
+/// only the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fold_honours_the_filter_and_the_metadata_side_channel() {
+    let (_h, store) = setup().await;
+    let meter = common::meter(common::VCPU_METER);
+    let tenant_a = Uuid::from_u128(0x2010_000A);
+    let tenant_b = Uuid::from_u128(0x2010_000B);
+
+    for (i, (tenant, value, region)) in [
+        (tenant_a, 4_i64, "eu"),
+        (tenant_a, 6, "us"),
+        (tenant_b, 100, "eu"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let i = i64::try_from(i).expect("small");
+        let mut rec = common::entry_over(
+            &meter,
+            tenant,
+            &format!("idem-{i}"),
+            Decimal::from(value),
+            common::fixture_window_start() + Duration::hours(i),
+            common::fixture_window_end() + Duration::hours(i),
+        );
+        rec.metadata.insert(
+            MetadataKey::new("region").expect("valid key"),
+            region.to_owned(),
+        );
+        store.create_fixture(rec).await.expect("seed");
+    }
+
+    let scoped = ODataQuery::new().with_filter(eq_uuid("tenant_id", tenant_a));
     let result = store
         .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            std::slice::from_ref(&filter),
-            spec,
+            common::meter_reference(&meter),
+            wide_range(),
+            AggregationFold::Sum,
+            &scoped,
+            &[],
+            &[],
         )
         .await
-        .expect("aggregate sum with metadata filter");
-
-    assert_eq!(result.buckets.len(), 1, "empty group_by -> one bucket");
+        .expect("aggregate");
     assert_eq!(
-        result.buckets[0].value,
-        Some(BigDecimal::from(5_i64)),
-        "SUM includes only the us-east-1 rows (2 + 3); eu-west-1's 7 is excluded by the metadata filter"
+        only_bucket_value(&result).map(|v| v.normalized()),
+        Some(BigDecimal::from(10).normalized()),
+        "the composed filter bounds the fold, not only the list"
+    );
+
+    let result = store
+        .aggregate(
+            common::meter_reference(&meter),
+            wide_range(),
+            AggregationFold::Sum,
+            &scoped,
+            &[MetadataFilter::new("region", ["eu"]).expect("valid filter")],
+            &[],
+        )
+        .await
+        .expect("aggregate");
+    assert_eq!(
+        only_bucket_value(&result).map(|v| v.normalized()),
+        Some(BigDecimal::from(4).normalized()),
+        "the side channel narrows inside the filter"
+    );
+}
+
+// Per-type chunk pruning
+
+/// Two types in one time range sit in two chunks. A read of one type must
+/// execute only its own chunk. `gts_type_uuid` alone excludes nothing, so this
+/// fails if the partition-key clause is missing or stops excluding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_type_read_executes_only_that_types_chunk() {
+    let h = common::bring_up()
+        .await
+        .expect("timescaledb container (Docker required)");
+    let store = common::record_store(&h);
+    let tenant = Uuid::from_u128(0x9A0E);
+    let vcpu = common::meter(common::VCPU_METER);
+    let gb = common::meter(common::GB_METER);
+    store
+        .create_fixture(common::entry(&vcpu, tenant, "vcpu", Decimal::ONE))
+        .await
+        .expect("create vcpu");
+    store
+        .create_fixture(common::entry(&gb, tenant, "gb", Decimal::ONE))
+        .await
+        .expect("create gb");
+
+    let range = TimeRange::new(
+        common::fixture_window_start(),
+        common::fixture_window_end() + Duration::seconds(1),
+    )
+    .expect("a strictly ordered range");
+    let mut ctx = SqlCtx::new(1);
+    let mut clauses: Vec<String> = Vec::new();
+    push_meter_and_range_clauses(
+        common::meter_reference(&vcpu),
+        range,
+        &mut ctx,
+        &mut clauses,
+    );
+    let sql = format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM {} WHERE {}",
+        ledger_from_clause(),
+        clauses.join(" AND "),
+    );
+
+    let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(sql))
+        .bind(common::meter_reference(&vcpu))
+        .bind(range.lower_inclusive())
+        .bind(range.upper_exclusive())
+        .fetch_all(&h.pool)
+        .await
+        .expect("explain the single-type read");
+
+    let executed = plan
+        .iter()
+        .filter(|line| line.contains("_hyper_") && !line.contains("never executed"))
+        .count();
+    assert_eq!(
+        executed,
+        1,
+        "only the queried type's chunk may execute:\n{}",
+        plan.join("\n")
     );
 }

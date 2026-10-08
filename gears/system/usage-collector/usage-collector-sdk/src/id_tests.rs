@@ -1,184 +1,473 @@
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use crate::id::{USAGE_RECORD_ID_NAMESPACE, created_at_micros, derive_usage_record_id};
-use crate::models::{IdempotencyKey, UsageTypeGtsId};
+use crate::id::{USAGE_RECORD_ID_NAMESPACE, canonical_period_bound, derive_usage_record_id};
+use crate::models::{EntryType, IdempotencyKey, MeterTypeId};
 
 fn tenant() -> Uuid {
     Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
 }
-fn gts() -> UsageTypeGtsId {
-    // Must be a valid derived GTS instance id: the segment after `~` is itself
-    // a full vendor.package.namespace.type.vMAJOR[.MINOR] chain.
-    UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1"
+fn gts() -> MeterTypeId {
+    // Must be a valid derived GTS type id: `~`-terminated, adding exactly one
+    // segment to the reserved usage-record base.
+    MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~"
     ))
     .unwrap()
 }
 fn key(s: &str) -> IdempotencyKey {
     IdempotencyKey::new(s).unwrap()
 }
-fn at(secs: i64) -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(secs).unwrap()
+/// `2023-11-14T22:13:20.000000Z`
+fn ws() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+}
+/// `2023-11-14T23:13:20.000000Z`
+fn we() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_700_003_600).unwrap()
+}
+fn expect(raw: &str) -> Uuid {
+    Uuid::parse_str(raw).unwrap()
 }
 
 #[test]
 fn derive_is_deterministic() {
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
     );
 }
 
 #[test]
 fn derive_matches_golden_vector() {
     // UUIDv5(NS, "11111111-1111-1111-1111-111111111111" 0x1F
-    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1" 0x1F
-    //            "1700000000000000" 0x1F
-    //            "idem-1")
-    // Regenerated in Task 1 Step 4 — DO NOT hand-edit without rerunning.
+    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
+    //            "idem-1" 0x1F
+    //            "2023-11-14T22:13:20.000000Z" 0x1F
+    //            "2023-11-14T23:13:20.000000Z" 0x1F
+    //            "record")
+    //
+    // Computed independently of this crate (RFC 4122 UUIDv5 over the
+    // pre-image `cpt-cf-usage-collector-adr-record-identity-derivation`
+    // fixes). DO NOT hand-edit: regenerate both sides and reconcile.
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        Uuid::parse_str("a019f808-e219-5bc0-b95f-dd5981b40d51").unwrap(),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("e6a0ee4e-a198-521a-b462-fb839cf01204"),
+    );
+}
+
+#[test]
+fn derive_matches_golden_vector_for_an_invalidation() {
+    // The same five inputs as `derive_matches_golden_vector`, with the
+    // sixth reading `invalidation`:
+    //
+    // UUIDv5(NS, "11111111-1111-1111-1111-111111111111" 0x1F
+    //            "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~" 0x1F
+    //            "idem-1" 0x1F
+    //            "2023-11-14T22:13:20.000000Z" 0x1F
+    //            "2023-11-14T23:13:20.000000Z" 0x1F
+    //            "invalidation")
+    //
+    // Computed independently of this crate, like its `record` twin. Both
+    // literals are needed: one vector alone pins the pre-image for one
+    // entry type and would survive a derivation that ignored the sixth
+    // input on the other. DO NOT hand-edit.
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Invalidation
+        ),
+        expect("cdf725ce-9fc0-5155-9739-3d8001a7432e"),
+    );
+}
+
+/// The pre-image is the six inputs in order, `0x1F`-joined, entry type last.
+///
+/// `cpt-cf-usage-collector-adr-record-identity-derivation` fixes the order
+/// in its formula and the bytes in "The canonical pre-image". This test
+/// rebuilds that byte string by hand and digests it here, so the order, the
+/// separator and each input's canonical rendering are pinned against the
+/// document rather than against the concatenation in `id.rs` — which is the
+/// thing under test. `derive_matches_golden_vector` above pins the same
+/// pre-image from the other side, as a literal computed outside this crate.
+#[test]
+fn the_pre_image_is_the_six_inputs_entry_type_last() {
+    let pre_image = |entry_type: &[u8]| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"11111111-1111-1111-1111-111111111111");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(
+            b"gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~",
+        );
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"idem-1");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"2023-11-14T22:13:20.000000Z");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(b"2023-11-14T23:13:20.000000Z");
+        bytes.push(0x1F);
+        bytes.extend_from_slice(entry_type);
+        bytes
+    };
+
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &pre_image(b"record")),
+        "a measurement's pre-image ends in the literal `record`",
+    );
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Invalidation
+        ),
+        Uuid::new_v5(&USAGE_RECORD_ID_NAMESPACE, &pre_image(b"invalidation")),
+        "a withdrawal's pre-image ends in the literal `invalidation`",
     );
 }
 
 #[test]
 fn derive_produces_a_v5_uuid() {
     assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000))
-            .get_version_num(),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        )
+        .get_version_num(),
         5,
     );
 }
 
 #[test]
+fn namespace_is_pinned() {
+    // Fixed forever: a change re-maps every identifier the gear has issued.
+    assert_eq!(
+        USAGE_RECORD_ID_NAMESPACE,
+        expect("56313026-863b-4de8-b32b-1f96b67306ed"),
+    );
+}
+
+#[test]
 fn distinct_keys_yield_distinct_ids() {
-    assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-2"), at(1_700_000_000)),
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-2"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("182bbbe4-d829-5755-8bdc-60a16dd7e0e1"),
     );
 }
 
 #[test]
 fn distinct_tenants_yield_distinct_ids() {
     let other = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-    assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        derive_usage_record_id(other, &gts(), &key("idem-1"), at(1_700_000_000)),
+    assert_eq!(
+        derive_usage_record_id(other, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("792060aa-d863-5a5e-acf1-dd02f58982df"),
     );
 }
 
 #[test]
 fn distinct_gts_ids_yield_distinct_ids() {
-    // Same tenant + idempotency_key + created_at, different gts_id.
-    let other = UsageTypeGtsId::new(gts_id!(
-        "cf.core.uc.usage_record.v1~cf.mini_chat._.messages_sent.v1"
+    let other = MeterTypeId::new(gts_id!(
+        "cf.core.uc.usage_record.v1~cf.mini_chat._.messages_sent.v1~"
     ))
     .unwrap();
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &other,
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        expect("f53b957a-71ee-50d4-b58a-ffa50e3b4acd"),
+    );
+}
+
+#[test]
+fn the_tenant_enters_in_its_lowercase_hyphenated_form() {
+    // The base golden vector's tenant is all decimal digits, so it cannot
+    // tell a lowercase rendering apart from an uppercase one. This vector
+    // carries hex letters, and it is the only thing standing between the
+    // pre-image and a `to_string().to_uppercase()` slip. The second
+    // assertion is the caller-facing half of the same rule: `Uuid` parses
+    // either spelling, and both must reach one pre-image.
+    let lower = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    let upper = Uuid::parse_str("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE").unwrap();
+    assert_eq!(
+        derive_usage_record_id(lower, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("dc9774b2-2e7b-5ecc-b52a-96a4fb6b4b36"),
+    );
+    assert_eq!(
+        derive_usage_record_id(upper, &gts(), &key("idem-1"), ws(), we(), EntryType::Record),
+        expect("dc9774b2-2e7b-5ecc-b52a-96a4fb6b4b36"),
+    );
+}
+
+#[test]
+fn a_different_covered_period_yields_a_different_id() {
+    // The point of carrying both bounds: one stable per-meter idempotency
+    // key covers many periods, and two periods are two entries rather than
+    // a collision.
+    let one_micro_later = ws() + time::Duration::microseconds(1);
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            one_micro_later,
+            we(),
+            EntryType::Record
+        ),
+        expect("455e1f38-a4f7-532c-ba16-97c683980e02"),
+    );
     assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        derive_usage_record_id(tenant(), &other, &key("idem-1"), at(1_700_000_000)),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we(),
+            EntryType::Record
+        ),
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            we() + time::Duration::microseconds(1),
+            EntryType::Record
+        ),
+        "window_end is an input too",
     );
 }
 
 #[test]
-fn distinct_created_at_yields_distinct_ids() {
-    // The core of ADR-0014: the same 3-tuple at two different `created_at`
-    // values MUST derive two distinct ids (so the plugin's two persisted rows
-    // no longer share one id).
+#[should_panic(expected = "window_start must be before or equal to window_end")]
+fn derive_rejects_reversed_bounds() {
+    let _ = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        we(),
+        ws(),
+        EntryType::Record,
+    );
+}
+
+#[test]
+fn a_point_event_derives_over_equal_bounds() {
+    // A confirmation of
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: a point event
+    // is a zero-length period, and the derivation needs no separate case for
+    // it.
+    assert_eq!(
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            ws(),
+            ws(),
+            EntryType::Record
+        ),
+        expect("7e376526-129c-50f1-a326-a4e684c8cf92"),
+    );
+}
+
+#[test]
+fn equivalent_spellings_of_one_instant_derive_one_id() {
+    // A confirmation of
+    // `cpt-cf-usage-collector-adr-record-identity-derivation`: the canonical
+    // form collapses a non-UTC offset and a fraction of zero / three / six
+    // digits onto one pre-image. The
+    // bounds are parsed from the wire spellings an emitter would actually
+    // send, rather than built from components, because that is the path the
+    // equivalence has to hold across. Every pairing must derive the base
+    // vector. (UUID case is pinned separately by
+    // `the_tenant_enters_in_its_lowercase_hyphenated_form`, which needs a
+    // letter-bearing tenant the base vector does not have.)
+    let base = expect("e6a0ee4e-a198-521a-b462-fb839cf01204");
+    let parse = |raw: &str| {
+        OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).unwrap()
+    };
+    let derive_over = |start: &str, end: &str| {
+        derive_usage_record_id(
+            tenant(),
+            &gts(),
+            &key("idem-1"),
+            parse(start),
+            parse(end),
+            EntryType::Record,
+        )
+    };
+
+    assert_eq!(
+        derive_over("2023-11-14T22:13:20Z", "2023-11-14T23:13:20Z"),
+        base,
+        "an absent fraction pads to six digits",
+    );
+    assert_eq!(
+        derive_over("2023-11-14T22:13:20.000Z", "2023-11-14T23:13:20.000Z"),
+        base,
+        "a three-digit fraction pads to six digits",
+    );
+    assert_eq!(
+        derive_over("2023-11-14T22:13:20.000000Z", "2023-11-14T23:13:20.000000Z"),
+        base,
+        "a six-digit fraction is already canonical",
+    );
+    assert_eq!(
+        derive_over("2023-11-15T03:43:20+05:30", "2023-11-15T04:43:20+05:30"),
+        base,
+        "a non-UTC offset normalizes before the bound is formatted",
+    );
+    assert_eq!(
+        derive_over("2023-11-14T17:13:20-05:00", "2023-11-14T18:13:20-05:00"),
+        base,
+        "a negative offset normalizes the same way",
+    );
+}
+
+// ── canonical_period_bound: the 27-character form ───────────────────────────
+
+#[test]
+fn canonical_period_bound_is_twenty_seven_characters() {
+    let rendered = canonical_period_bound(ws());
+    assert_eq!(rendered, "2023-11-14T22:13:20.000000Z");
+    assert_eq!(rendered.len(), 27);
+}
+
+#[test]
+fn canonical_period_bound_always_carries_six_fraction_digits() {
+    let with_micros = ws() + time::Duration::microseconds(1);
+    assert_eq!(
+        canonical_period_bound(with_micros),
+        "2023-11-14T22:13:20.000001Z"
+    );
+    assert_eq!(
+        canonical_period_bound(ws() + time::Duration::milliseconds(500)),
+        "2023-11-14T22:13:20.500000Z"
+    );
+}
+
+#[test]
+fn canonical_period_bound_zero_pads_every_component() {
+    // The base vector's instant has no single-digit component and a
+    // four-digit year, so it cannot tell `{:02}` from `{}` on the month,
+    // day, hour, minute or second, nor `{:04}` from `{}` on the year. This
+    // instant has a single-digit value in every one of those positions —
+    // dropping any pad shortens the form below 27 characters and re-maps
+    // every identifier derived over it.
+    let padded = OffsetDateTime::new_utc(
+        Date::from_calendar_date(999, Month::January, 2).unwrap(),
+        Time::from_hms_micro(3, 4, 5, 6).unwrap(),
+    );
+    let rendered = canonical_period_bound(padded);
+    assert_eq!(rendered, "0999-01-02T03:04:05.000006Z");
+    assert_eq!(rendered.len(), 27);
+}
+
+#[test]
+fn canonical_period_bound_normalizes_a_non_utc_offset() {
+    let plus_one = UtcOffset::from_hms(1, 0, 0).unwrap();
+    assert_eq!(
+        canonical_period_bound(ws().to_offset(plus_one)),
+        canonical_period_bound(ws()),
+    );
+}
+
+#[test]
+fn canonical_period_bound_truncates_below_the_microsecond() {
+    // The documented contract of the helper, and the reason its callers
+    // must validate first: it drops sub-microsecond nanos rather than
+    // rejecting them, so two instants a nanosecond apart render one bound.
+    // `CreateUsageRecord::try_into_usage_record` is what makes that
+    // unreachable on the ingestion path.
+    let with_nanos = ws().replace_nanosecond(1_500).unwrap();
+    assert_eq!(
+        canonical_period_bound(with_nanos),
+        "2023-11-14T22:13:20.000001Z"
+    );
+}
+
+// ── Entry type, the sixth input ─────────────────────────────────────────────
+
+/// A record and its invalidation differ in exactly one input and derive two
+/// identifiers.
+///
+/// `cpt-cf-usage-collector-adr-record-identity-derivation`, "Decision
+/// Outcome": an invalidation "copies the tenant, type, idempotency key and
+/// covered period of its target. Its identifier therefore differs from its
+/// target's for one reason only, the entry type."
+#[test]
+fn a_record_and_its_invalidation_derive_two_ids_from_one_key() {
+    let record = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        ws(),
+        we(),
+        EntryType::Record,
+    );
+    let invalidation = derive_usage_record_id(
+        tenant(),
+        &gts(),
+        &key("idem-1"),
+        ws(),
+        we(),
+        EntryType::Invalidation,
+    );
+
     assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000)),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_001)),
+        record, invalidation,
+        "the entry type is the sixth input and the only one these two differ in, so a \
+         derivation that reads it gives two identifiers. Equal ids mean the entry type is not \
+         reaching the pre-image"
     );
-}
-
-#[test]
-fn sub_microsecond_created_at_truncates_to_same_id() {
-    // Two `created_at` values that differ only below microsecond precision must
-    // derive the SAME id — Postgres stores µs, so a distinct id here would be a
-    // false `IdempotencyConflict` on an exact retry.
-    let a = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_000_500).unwrap();
-    let b = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_000_999).unwrap();
-    let c = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_001_000).unwrap();
-    assert_eq!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), a),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), b),
-        "sub-us difference must not change the id",
-    );
-    assert_ne!(
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), a),
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), c),
-        "a full-us difference must change the id",
-    );
-}
-
-#[test]
-fn separator_in_key_does_not_alias() {
-    // Regenerated in Task 1 Step 4 — DO NOT hand-edit without rerunning.
-    let with_us = derive_usage_record_id(tenant(), &gts(), &key("idem\u{1f}1"), at(1_700_000_000));
-    assert_eq!(
-        with_us,
-        Uuid::parse_str("0a1bbbeb-220b-58a1-a73f-5ec86ef74fb0").unwrap()
-    );
-    assert_ne!(
-        with_us,
-        derive_usage_record_id(tenant(), &gts(), &key("idem-1"), at(1_700_000_000))
-    );
-}
-
-#[test]
-fn namespace_is_pinned() {
-    assert_eq!(
-        USAGE_RECORD_ID_NAMESPACE,
-        Uuid::parse_str("56313026-863b-4de8-b32b-1f96b67306ed").unwrap(),
-    );
-}
-
-// ── created_at_micros: the shared µs-canonicalization primitive ───────────────
-
-#[test]
-fn created_at_micros_projects_whole_seconds_to_the_microsecond_count() {
-    assert_eq!(created_at_micros(at(1_700_000_000)), 1_700_000_000_000_000);
-}
-
-#[test]
-fn created_at_micros_floors_sub_microsecond_nanos() {
-    // The floor is what makes an exact retry that differs only below µs derive
-    // the same id — see `sub_microsecond_created_at_truncates_to_same_id`.
-    let base = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_000_000).unwrap();
-    let plus_500ns = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_000_500).unwrap();
-    let plus_1us = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_001_000).unwrap();
-    assert_eq!(
-        created_at_micros(base),
-        created_at_micros(plus_500ns),
-        "sub-us nanos floor away",
-    );
-    assert_eq!(
-        created_at_micros(plus_1us) - created_at_micros(base),
-        1,
-        "a full us advances the count by exactly one",
-    );
-}
-
-#[test]
-fn created_at_micros_is_exact_for_pre_epoch_instants() {
-    // One microsecond before the unix epoch: 1969-12-31T23:59:59.999999Z.
-    // `unix_timestamp() (-1) * 1_000_000 + microsecond() (999_999) = -1` — the
-    // "no integer division" composition floors correctly for negatives, where a
-    // naive `nanos / 1000` would not.
-    let one_micro_pre_epoch = OffsetDateTime::from_unix_timestamp_nanos(-1_000).unwrap();
-    assert_eq!(created_at_micros(one_micro_pre_epoch), -1);
-}
-
-#[test]
-fn created_at_micros_is_offset_invariant() {
-    // The client-reproducibility invariant: the same instant in a different
-    // offset must project to the same µs count (and thus the same derived id),
-    // because both `unix_timestamp()` and the sub-second `microsecond()` are
-    // instant-based, not wall-clock-based.
-    let utc = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-    let shifted = utc.to_offset(time::UtcOffset::from_hms(5, 30, 0).unwrap());
-    assert_eq!(created_at_micros(utc), created_at_micros(shifted));
 }

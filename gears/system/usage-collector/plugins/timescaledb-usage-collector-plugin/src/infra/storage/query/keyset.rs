@@ -1,25 +1,23 @@
 //! Order-by rendering, keyset (tuple-comparison) predicates, and cursor
-//! encode/decode for keyset pagination.
+//! decode for keyset pagination.
 //!
 //! All column identifiers come from a caller-supplied allowlist closure
-//! (`record_column` / `usage_type_column` from [`super::translate`]); cursor
-//! key values are always bound. The v1 gateway default order is the
-//! all-ascending `(created_at, id)` tuple, so [`keyset_predicate`] emits the
-//! row-value tuple form for uniform-direction orders and rejects mixed
-//! directions (documented limitation — see that fn).
+//! (`record_column` from [`super::translate`]); cursor key values are always
+//! bound. The gateway's default order is the all-ascending `(window_end, id)`
+//! tuple, so [`keyset_predicate`] emits the row-value tuple form for
+//! uniform-direction orders. Every call site in this crate that acts on a sort
+//! direction takes it from [`uniform_dir`], so a mixed-direction order — which
+//! the gateway guarantees cannot arrive — is refused when the first page is
+//! rendered and when the returned keyset is built, not only on the continuation.
 //!
-//! # Verified `toolkit-odata` cursor / order API (Task E1)
-//!
-//! - `ODataOrderBy(pub Vec<OrderKey>)`; `OrderKey { field: String, dir:
-//!   SortDir }`; `SortDir::{Asc, Desc}` with `reverse()`. `ODataOrderBy` has
-//!   `to_signed_tokens() -> String` (`"+created_at,+id"`) and
-//!   `from_signed_tokens(&str) -> Result<Self, toolkit_odata::Error>`.
-//! - `CursorV1 { k: Vec<String>, o: SortDir, s: String, f: Option<String>, d:
-//!   String }`; `encode(&self) -> serde_json::Result<String>` (base64url);
-//!   `decode(token: &str) -> Result<CursorV1, toolkit_odata::Error>`. `d` is
-//!   `"fwd"` / `"bwd"`.
-//! - `Page::new(items: Vec<T>, page_info: PageInfo)`; `PageInfo { next_cursor:
-//!   Option<String>, prev_cursor: Option<String>, limit: u64 }`.
+//! This module mints no cursor: minting, encoding, fingerprinting and the
+//! forward-only check belong to the gateway, which also verifies a returned
+//! [`usage_collector_sdk::Keyset`]'s arity and direction against the order it
+//! dispatched before minting from it. [`decode_cursor`] survives as disclosed
+//! dead code — the SPI says decoding a wire cursor is "the gateway's alone", the
+//! gateway strips `query.cursor` before every dispatch, and the only caller in
+//! this crate is a test. It is a deletion candidate, not a contract
+//! obligation.
 
 use std::str::FromStr;
 
@@ -33,52 +31,78 @@ use toolkit_odata::{CursorV1, ODataOrderBy, SortDir};
 use super::bind::SqlBind;
 use super::translate::SqlCtx;
 
-/// Reject any cursor whose direction is not forward (`"fwd"`).
+/// The one sort direction an admissible order carries.
 ///
-/// v1 mints and supports only forward cursors. [`keyset_predicate`] derives the
-/// `>`/`<` comparison operator from the sort direction, **not** from the
-/// cursor's `d` field, so a `"bwd"` cursor would be silently walked forward and
-/// return the wrong page. Reject it fail-closed until backward paging is
-/// actually implemented.
+/// The gateway guarantees `query.order` "uses one sort direction throughout"
+/// (`UsageCollectorPluginV1::list_usage_records`), so a mixed-direction order is
+/// a breach rather than a shape to serve. Every caller in this crate that acts
+/// on a direction resolves it here rather than reading one key's and trusting
+/// the rest, because they run at different points of one request and refusing in
+/// only one of them is not refusing:
+///
+/// - [`render_order_by`] runs on the first page, before any cursor exists, and
+///   would otherwise render `window_end ASC, id DESC` and serve it.
+/// - [`keyset_predicate`] runs on a continuation only, so alone it turns a
+///   wrongly-ordered served page into a `500` on page two rather than a refusal
+///   on page one.
+/// - `build_list_page` (`record_store.rs`) builds the
+///   [`usage_collector_sdk::Keyset`] handed back to the gateway, and would
+///   otherwise record the leading key's direction as the keyset's own — which
+///   `query::verify_returned_keyset` then refuses one request later.
 ///
 /// # Errors
 ///
-/// Returns an error string when `cursor.d` is anything other than `"fwd"`.
-pub fn ensure_forward_cursor(cursor: &CursorV1) -> Result<(), String> {
-    if cursor.d == "fwd" {
-        Ok(())
+/// Returns an error string when `dirs` is empty or carries more than one
+/// direction. [`keyset_predicate`] and `build_list_page` check emptiness first;
+/// [`render_order_by`] relies on this one. The empty arm is the fail-closed
+/// floor for a direct caller of this public function.
+pub fn uniform_dir(dirs: impl IntoIterator<Item = SortDir>) -> Result<SortDir, String> {
+    let mut dirs = dirs.into_iter();
+    let Some(first) = dirs.next() else {
+        return Err("order must not be empty".to_owned());
+    };
+    if dirs.all(|dir| dir == first) {
+        Ok(first)
     } else {
-        Err(format!(
-            "unsupported cursor direction `{}`: only forward paging is supported",
-            cursor.d
-        ))
+        Err(
+            "mixed-direction keyset order refused: one sort direction is required throughout"
+                .to_owned(),
+        )
     }
 }
 
-/// Render an `ORDER BY` column list (`"created_at ASC, id ASC"`) from an
+/// Render an `ORDER BY` column list (`"window_end ASC, id ASC"`) from an
 /// `ODataOrderBy`, resolving each field through `col`.
+///
+/// The caller-supplied `$orderby` path: `col` is handed an untyped caller string
+/// here, unlike the `$filter` path where a `FilterField` has already bounded the
+/// input, so the allowlist is the whole boundary between that string and the
+/// rendered SQL. An unresolved field is refused, never interpolated.
+///
+/// The direction comes from [`uniform_dir`], not from each key independently:
+/// this runs on the first page, so mapping directions one by one would *serve* a
+/// mixed-direction order and leave [`keyset_predicate`] to refuse it a page
+/// later.
 ///
 /// # Errors
 ///
-/// Returns an error string when the order is empty, or when a field is not on
-/// the allowlist (never interpolated).
+/// Returns an error string when the order is empty or its directions are mixed
+/// (both from [`uniform_dir`], which sees the order before any column is
+/// resolved), or when a field is not on the allowlist (never interpolated).
 pub fn render_order_by(
     order: &ODataOrderBy,
     col: impl Fn(&str) -> Option<&'static str>,
 ) -> Result<String, String> {
-    if order.is_empty() {
-        return Err("order must not be empty".to_owned());
-    }
+    let dir = match uniform_dir(order.0.iter().map(|key| key.dir))? {
+        SortDir::Asc => "ASC",
+        SortDir::Desc => "DESC",
+    };
     let parts = order
         .0
         .iter()
         .map(|key| {
             let column = col(&key.field)
                 .ok_or_else(|| format!("order field not allowlisted: {}", key.field))?;
-            let dir = match key.dir {
-                SortDir::Asc => "ASC",
-                SortDir::Desc => "DESC",
-            };
             Ok(format!("{column} {dir}"))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -93,12 +117,27 @@ pub fn render_order_by(
 /// via [`cursor_key_to_bind`] — keyed by the field's declared [`FieldKind`]
 /// (resolved through `kind`), not its column name — and pushed onto `ctx`.
 ///
-/// # v1 limitation
+/// # Order shape
 ///
-/// Only uniform-direction orders are supported. The v1 gateway always sorts
-/// `(created_at, id)` ascending, so the tuple form covers the live path;
-/// mixed-direction orders return an error (the lexicographic OR-form is not
-/// emitted in v1).
+/// The tuple is rendered in the order `order_pairs` arrives in, each bind pushed
+/// alongside the key it belongs to; nothing here looks up a canonical name or
+/// assumes a canonical slot. That is an obligation:
+/// `UsageCollectorPluginV1::list_usage_records` says the canonical names are
+/// "guaranteed to be *present*, not to be last: a caller ordering by `id` is
+/// handed on as `(id, window_end)`. A plugin MUST read the order it is given
+/// rather than assume a position for either key."
+///
+/// # Uniform directions
+///
+/// Only a uniform-direction order renders as a row-value tuple; a
+/// mixed-direction one is refused by [`uniform_dir`] before any bind is pushed.
+/// The gateway guarantees one does not arrive, so this is the same fail-closed
+/// backstop the NULL-safety note below describes, against the same route: a
+/// continuation's order is decoded from the cursor's signed tokens, and whatever
+/// lets a crafted cursor smuggle in a nullable key lets it smuggle in a mixed
+/// direction. The lexicographic OR-form that would serve one is deliberately not
+/// emitted, so the breach is refused rather than papered over with a comparison
+/// that silently returns the wrong rows.
 ///
 /// # NULL safety
 ///
@@ -137,14 +176,12 @@ pub fn keyset_predicate(
         ));
     }
 
-    let all_asc = order_pairs.iter().all(|(_, asc)| *asc);
-    let all_desc = order_pairs.iter().all(|(_, asc)| !*asc);
-    let cmp = if all_asc {
-        ">"
-    } else if all_desc {
-        "<"
-    } else {
-        return Err("mixed-direction keyset orders are unsupported in v1".to_owned());
+    let dirs = order_pairs
+        .iter()
+        .map(|(_, asc)| if *asc { SortDir::Asc } else { SortDir::Desc });
+    let cmp = match uniform_dir(dirs)? {
+        SortDir::Asc => ">",
+        SortDir::Desc => "<",
     };
 
     let mut columns = Vec::with_capacity(order_pairs.len());
@@ -198,45 +235,6 @@ pub fn cursor_key_to_bind(kind: FieldKind, raw: &str) -> Result<SqlBind, String>
             "cursor key kind `{other}` is not supported as a keyset column"
         )),
     }
-}
-
-/// Build and encode the forward (`"fwd"`) cursor for the next page from the
-/// last in-page row's key values, in `order` field order.
-///
-/// `s` carries the signed sort tokens (`"+created_at,+id"`); `o` is the
-/// primary sort direction; `f` carries the optional filter hash for
-/// consistency checks on decode.
-///
-/// # Errors
-///
-/// Returns an error string when the order is empty, its arity differs from
-/// `last_row_keys`, or serialization fails.
-pub fn encode_next_cursor(
-    order: &ODataOrderBy,
-    last_row_keys: &[String],
-    filter_hash: Option<&str>,
-) -> Result<String, String> {
-    if order.is_empty() {
-        return Err("cursor order must not be empty".to_owned());
-    }
-    if order.0.len() != last_row_keys.len() {
-        return Err(format!(
-            "row key count {} does not match order arity {}",
-            last_row_keys.len(),
-            order.0.len()
-        ));
-    }
-    let primary_dir = order.0.first().map_or(SortDir::Asc, |k| k.dir);
-    let cursor = CursorV1 {
-        k: last_row_keys.to_vec(),
-        o: primary_dir,
-        s: order.to_signed_tokens(),
-        f: filter_hash.map(str::to_owned),
-        d: "fwd".to_owned(),
-    };
-    cursor
-        .encode()
-        .map_err(|e| format!("cursor encode failed: {e}"))
 }
 
 /// Decode a cursor token. Thin wrapper over [`CursorV1::decode`].

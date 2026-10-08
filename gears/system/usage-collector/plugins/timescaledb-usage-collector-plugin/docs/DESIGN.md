@@ -39,11 +39,11 @@ Updated:  2026-09-16 by Virtuozzo International GmbH
 
 The TimescaleDB Usage Collector Storage Plugin implements the Usage Collector's storage Service Provider Interface (`UsageCollectorPluginV1`, as gear DESIGN §3.3 declares it) on PostgreSQL with the TimescaleDB extension. It is the durable system of record for usage entries only — this design gives the crate no usage-type catalog: declaration and resolution, including the declared fold, are owned by `types-registry` (ADR-0008) and never reach the SPI. The plugin is pure persistence and query (§2.1); every call arrives already authorized and structurally validated.
 
-It has four responsibilities: **record persistence** — single and batch inserts deduplicated on the gear's 6-tuple identity (§2.2) and append-only invalidation (§3.1); **query execution** — keyset raw reads and pushed-down SUM / COUNT / MIN / MAX / LATEST aggregation, from the hourly rollup where eligible and an exact scan otherwise; **the usage feed and reconciliation** — snapshot-consistent pages in inserting-transaction order below the instance-wide settled horizon, and per-scope counters and watermarks; and **data lifecycle** — a per-GTS-type retention sweep driven by each type's current declared retention.
+It has four responsibilities: **record persistence** — batch inserts, one entry or many, deduplicated on the gear's 6-tuple identity (§2.2) and append-only invalidation (§3.1); **query execution** — keyset raw reads and pushed-down SUM / COUNT / MIN / MAX / LATEST aggregation, from the hourly rollup where eligible and an exact scan otherwise; **the usage feed and reconciliation** — snapshot-consistent pages in inserting-transaction order below the instance-wide settled horizon, and per-scope counters and watermarks; and **data lifecycle** — a per-GTS-type retention sweep driven by each type's current declared retention.
 
 TimescaleDB fits append-heavy time-series ingestion with time-windowed analytical reads, and its partitioning lets the plugin run a per-type retention sweep and an hourly continuous aggregate natively: `usage_records` is a hypertable partitioned on `window_end` and a per-type integer `type_key`, so a chunk drops by the retention of the types it holds. The plugin is statically linked, binds at runtime through `types-registry` + `ClientHub` GTS instance scope, and has no compile-time dependency on the host gear.
 
-**This design is normative for the gear's target SPI.** This branch's plugin code predates it, down to its SPI shape, and the file, module, function and test names in this design are the target layout (§4.5).
+**This design is normative for the gear's target SPI**, and the file, module, function and test names in it are a target layout rather than a description of the tree. §4.5 says where to read what still trails it.
 
 ### 1.2 Architecture Drivers
 
@@ -54,7 +54,7 @@ The plugin realizes the persistence and query side of the gear's functional requ
 | Capability | Plugin PRD requirement | Gear PRD requirement | Design response |
 | --- | --- | --- | --- |
 | Registration and schema | `cpt-cf-uc-plugin-fr-registration`, `cpt-cf-uc-plugin-fr-schema-provisioning` | `cpt-cf-usage-collector-fr-pluggable-storage` | Full `UsageCollectorPluginV1`; idempotent migrations, then GTS + ClientHub registration at `init` (§3.2, §3.7). |
-| Ingestion and idempotency | `cpt-cf-uc-plugin-fr-record-persistence`, `cpt-cf-uc-plugin-fr-idempotent-dedup` | `cpt-cf-usage-collector-fr-ingestion`, `cpt-cf-usage-collector-fr-record-metadata`, `cpt-cf-usage-collector-fr-idempotency` | `ON CONFLICT … DO NOTHING` on the 6-tuple UNIQUE, `entry_type` included; exact-equality absorb or `IdempotencyConflict`; one multi-row write per batch, results in input order (§2.2, §3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`, `cpt-cf-uc-plugin-seq-ingest-batch`). |
+| Ingestion and idempotency | `cpt-cf-uc-plugin-fr-record-persistence`, `cpt-cf-uc-plugin-fr-idempotent-dedup` | `cpt-cf-usage-collector-fr-ingestion`, `cpt-cf-usage-collector-fr-record-metadata`, `cpt-cf-usage-collector-fr-idempotency` | `ON CONFLICT … DO NOTHING` on the 6-tuple UNIQUE, `entry_type` included; exact-equality absorb or `IdempotencyConflict`; one multi-row write per batch, results in input order (§2.2, §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`). |
 | Invalidation | `cpt-cf-uc-plugin-fr-invalidation-persistence` | `cpt-cf-usage-collector-fr-record-invalidation` | Appended withdrawal entry; at most one per target through the dedup identity, which every withdrawal of one target shares (§3.1, §3.7). |
 | Dedup level | `cpt-cf-uc-plugin-fr-dedup-level` | `cpt-cf-usage-collector-fr-idempotency` | `linearizable`, bound zero, commit order (§4.1 item 9). |
 | Durable acknowledgement | `cpt-cf-uc-plugin-fr-durable-ack` | `cpt-cf-usage-collector-fr-ingestion` | `SET LOCAL synchronous_commit = on`; `fsync`/`full_page_writes` startup checks (§3.5). |
@@ -78,7 +78,7 @@ The plugin realizes the persistence and query side of the gear's functional requ
 | Backend consistency profile | `cpt-cf-uc-plugin-nfr-consistency-profile` → `cpt-cf-usage-collector-nfr-query-freshness` | Whole plugin | All nine gear DESIGN §3.10 items, dedup level `linearizable`, query-path lag bound zero on a single primary (§4.1). | Documented per §4; no dedicated test. |
 | Operational visibility | `cpt-cf-uc-plugin-nfr-operational-visibility` → `cpt-cf-usage-collector-nfr-operational-visibility` | OTel metrics | Push-based counters/histograms/gauges under `uc_timescaledb_*` (§4). | Dashboard/alert review against the emitted signal set. |
 | Feed freshness | `cpt-cf-uc-plugin-nfr-feed-freshness` → `cpt-cf-usage-collector-nfr-billing-feed-freshness` | Record Store feed read + all write transactions | Visibility bounded by the oldest running write transaction; request path and retention drops capped by `transaction_timeout_secs`, refreshes committed in batches (§4.1 item 2). | Derived, conditional (§4.1 item 2); unmeasured. |
-| Replay throughput | `cpt-cf-uc-plugin-nfr-replay-throughput` → `cpt-cf-usage-collector-nfr-replay-throughput` | Record Store feed read | Index-ordered merge on `usage_records_feed_idx` across chunks, with the compiled scope applied as a filter (§3.7, §4.1 item 7). | Unmeasured; load test in §4.1 item 7. |
+| Replay throughput | `cpt-cf-uc-plugin-nfr-replay-throughput` → `cpt-cf-usage-collector-nfr-replay-throughput` | Record Store feed read | Per-type index-ordered read on `usage_records_feed_idx`, combined by a bounded outer sort, across chunks, with the compiled scope applied as a filter (§3.7, §4.1 item 7). | Unmeasured; load test in §4.1 item 7. |
 | Aggregate freshness | `cpt-cf-uc-plugin-nfr-aggregate-freshness` → `cpt-cf-usage-collector-nfr-aggregate-freshness` | Rollup | Refresh-policy bounds published separately for acceptance and invalidation (§4.1 item 4). | Derived; load test in §4.1 item 4. |
 
 #### Key ADRs (gear-level, referenced)
@@ -136,7 +136,7 @@ The plugin performs no authentication, PDP authorization, attribution validation
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-principle-spi-conformance`
 
-The plugin implements the gear's `UsageCollectorPluginV1` — seven methods — exactly as declared, returning the six-variant `UsageCollectorPluginError` vocabulary (`Transient`, `IdempotencyConflict`, `UsageRecordNotFound`, `UsageRecordNotConverged`, `CursorBeyondRetention`, `Internal`). `FeedStart`, the feed read's start argument, is `#[non_exhaustive]`: the plugin matches it with a wildcard arm returning `Internal(detail)`, so a start mode a later gear version admits fails loudly here rather than being read as one of the two this version declares (gear DESIGN §3.3, §3.3 Signature below). Backend errors are classified into `Transient` (retryable) vs `Internal` (non-retryable) plus the typed domain variants; the host applies retry / fail-closed behavior without backend-specific parsing. Conformance is a green run of the gear's full contract suite, not compilation alone (§3.3).
+The plugin implements the gear's `UsageCollectorPluginV1` — six methods — exactly as declared, returning the six-variant `UsageCollectorPluginError` vocabulary (`Transient`, `IdempotencyConflict`, `UsageRecordNotFound`, `UsageRecordNotConverged`, `CursorBeyondRetention`, `Internal`). `FeedStart`, the feed read's start argument, is `#[non_exhaustive]`: the plugin matches it with a wildcard arm returning `Internal(detail)`, so a start mode a later gear version admits fails loudly here rather than being read as one of the two this version declares (gear DESIGN §3.3, §3.3 Signature below). Backend errors are classified into `Transient` (retryable) vs `Internal` (non-retryable) plus the typed domain variants; the host applies retry / fail-closed behavior without backend-specific parsing. Conformance is a green run of the gear's full contract suite, not compilation alone (§3.3).
 
 ### 2.2 Constraints
 
@@ -144,7 +144,7 @@ The plugin implements the gear's `UsageCollectorPluginV1` — seven methods — 
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-constraint-dedup-key-preservation`
 
-Deduplication is enforced by the `usage_records` hypertable's `UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key)` (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO NOTHING RETURNING` (§3.6), whose conflict target names the same seven columns. The identity is the gear's DESIGN §3.1 6-tuple `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)` **verbatim**: `type_key` is in the `UNIQUE` only because a hypertable `UNIQUE` must contain every partition column, and a type's key never changes, so the seventh column is not an identity input and not a divergence. `entry_type` must be in it: a record and its invalidation share tenant, type, key and covered period, so a constraint on the first five would treat every invalidation as a collision with its target. Every other place keyed on identity — the read-back of a conflicting row, the join between a write's input and its inserted rows, the in-batch comparison — keys on `id`, which covers all six inputs, or on the 6-tuple, never on the first five alone. The dedup index rides the chunk lifecycle — no separate dedup table, no cleanup job — so uniqueness is preserved for as long as the record's chunk exists: at least the referenced type's currently declared retention (Data Retention below), chunk-granular. Within that window a same-identity replay is a silent absorb (`UsageRecord::caller_supplied_eq`) or an `IdempotencyConflict`, never a fresh insert; once retention drops the chunk, a replay is accepted as a fresh insert. One stable per-meter `idempotency_key` therefore covers many covered periods: a replay over a *different* `(window_start, window_end)` is a distinct identity by design, and a record and its invalidation are two distinct identities.
+Deduplication is enforced by the `usage_records` hypertable's `UNIQUE (tenant_id, gts_type_uuid, idempotency_key, window_start, window_end, entry_type, type_key)` (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO NOTHING RETURNING` (§3.6), whose conflict target names the same seven columns. The identity is the gear's DESIGN §3.1 6-tuple `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)` with its type component expressed as that type's Registry Reference. The gateway derives each entry `id` as a `UUIDv5` over the 6-tuple naming the *identifier*, and keeps doing so; this constraint carries `gts_type_uuid` instead. The two partition rows into **identical identity classes** wherever an identifier and its Registry Reference are one-to-one, which `types-registry` ADR-0001 guarantees for the **managed** identifier profile and deliberately not beyond it: a managed identifier may not carry an explicit UUID tail and managed storage rejects a colliding derivation at admission, but an External Registry Source may serve two identifiers embedding one tail, and ADR-0001 accepts that as an undetectable residual. Where that map is many-to-one the reference-keyed classes are **unions** of the identifier-keyed ones — a coarser partition, and therefore a strictly stronger constraint, since it can only refuse more. So this constraint is **at least as strong** as the identifier-keyed one it replaces, and exactly as strong under the managed profile; it can never admit a duplicate the identifier-keyed constraint would have caught. What is no longer true is the word **verbatim** — it is not the same columns. `type_key` is in the `UNIQUE` only because a hypertable `UNIQUE` must contain every partition column, and a type's key never changes, so the seventh column is not an identity input and not a divergence. `entry_type` must be in it: a record and its invalidation share tenant, type, key and covered period, so a constraint on the first five would treat every invalidation as a collision with its target. Every other place keyed on identity — the read-back of a conflicting row, the join between a write's input and its inserted rows, the in-batch comparison — keys on `id`, which covers all six inputs, or on the 6-tuple, never on the first five alone. The dedup index rides the chunk lifecycle — no separate dedup table, no cleanup job — so uniqueness is preserved for as long as the record's chunk exists: at least the referenced type's currently declared retention (Data Retention below), chunk-granular. Within that window a same-identity replay is a silent absorb (`UsageRecord::caller_supplied_eq`) or an `IdempotencyConflict`, never a fresh insert; once retention drops the chunk, a replay is accepted as a fresh insert. One stable per-meter `idempotency_key` therefore covers many covered periods: a replay over a *different* `(window_start, window_end)` is a distinct identity by design, and a record and its invalidation are two distinct identities.
 
 **Bounded preservation is the gear floor, not a narrowing of it**: gear DESIGN §3.10 keeps the dedup identity visible "for as long as the referenced type's retention policy keeps it". The retention each type must declare is §4.1 item 6.
 
@@ -168,7 +168,7 @@ Metadata filtering does not need an allowlist because a `metadata` key is a valu
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-constraint-gateway-owned-cursors`
 
-The gateway owns every wire cursor (`toolkit_odata::CursorV1`) on both paginated paths (gear DESIGN §2.1 *Cursor gateway ownership*). On the raw list the plugin receives the structured `(window_end, id)`-suffixed keyset the gateway decoded and returns the page's rows with the keyset of its last row. On the feed it issues and receives only its own opaque `FeedPosition`. It never encodes, decodes, signs or validates a `CursorV1`, and uses no offset-based scan on either path. The gear's SPI trait returns an `ODataPage` from the raw list while its raw-query sequence returns a keyset; this design follows the principle, and the trait's return type is an open question for the gateway.
+The gateway owns every wire cursor (`toolkit_odata::CursorV1`) on both paginated paths (gear DESIGN §2.1 *Cursor gateway ownership*). On the raw list the plugin receives the structured `(window_end, id)`-suffixed keyset the gateway decoded and returns the page's rows with the keyset of its last row. On the feed it issues and receives only its own opaque `FeedPosition`. It never encodes, decodes, signs or validates a `CursorV1`, and uses no offset-based scan on either path. The gear's SPI trait now matches: `list_usage_records` takes `keyset: Option<&Keyset>` and returns `usage_collector_sdk::RecordPage` — rows plus the keyset to continue from — so the trait and the raw-query sequence agree, and the return type is no longer an open question (closed by ruling H1).
 
 #### Vendor Isolation
 
@@ -197,7 +197,7 @@ A chunk drop and the deletion of the `usage_rollup_1h` rows it fed happen in **o
 | UsageRecord | The single ledger entry. Carries a deterministic gateway-derived `id` (`UUIDv5` of the 6-tuple dedup identity `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`, [`0007-record-identity-derivation`](../../../docs/ADR/0007-cpt-cf-usage-collector-adr-record-identity-derivation.md)), `tenant_id`, `gts_type_id`, signed `quantity`, the covered period (`window_start`, `window_end`), attribution refs, `idempotency_key`, `entry_type`, `origin`, `accepted_at`, `metadata`, and an optional `invalidation`. A correction is a distinct appended entry, never a mutation of an existing one. | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
 | Invalidation | A withdrawal, carried on the `UsageRecord` it belongs to rather than persisted as a separate entity: `target` (the entry it withdraws, derived by the gateway) and `reason` (a `ReasonCode`, supplied by the caller). The entry declares its kind in `entry_type`, and the invalidation is present exactly when `entry_type = invalidation`; an ordinary measurement carries `None`. | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
 | AggregationSpec / AggregationResult | The declared aggregation fold (`AggregationFold`: `Sum` \| `Count` \| `Max` \| `Min` \| `Latest` — there is no `Avg`) plus ordered group-by; bucketed result. | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
-| ODataQuery / CursorV1 / Page | Gateway-parsed filter and the structured keyset decoded from a cursor; the page envelope. The plugin never handles the wire cursor (§2.2). | `toolkit-odata` |
+| ODataQuery / Keyset / RecordPage | `ODataQuery` is the gateway-parsed filter and order (`toolkit-odata`). `Keyset` is the structured continuation the gateway decoded from the wire cursor and hands in as `Option<&Keyset>`, and `RecordPage` is what the raw list returns — rows plus the keyset of the last row; both are SDK types, not `toolkit-odata` ones, and no path in this crate imports `toolkit_odata::Page`. The plugin never handles the wire cursor (§2.2). | `toolkit-odata`, [`keyset.rs`](../../../usage-collector-sdk/src/keyset.rs) |
 | FeedPosition | A point in feed order: `{xact_id, id}`. Issued and interpreted by this plugin alone; opaque to the gateway. | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
 | FeedPage | Entries in feed order and the next `FeedPosition` (none once a bounded replay is reached). | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
 | ReconciliationMetadata | Per `(tenant_id, gts_type_id)`: accepted count, fold-appropriate summary, acceptance and covered-period-end watermarks. | [`models.rs`](../../../usage-collector-sdk/src/models.rs) |
@@ -208,7 +208,7 @@ A chunk drop and the deletion of the `usage_rollup_1h` rows it fed happen in **o
 
 - **Transaction id** (`usage_records.xact_id`, §3.7): the `xid8` of the transaction that inserted the entry, stamped by the database default `pg_current_xact_id()` and never set by the Record Store. Every entry of one batch shares it. Transaction ids are assigned in increasing order when a transaction first writes, so an invalidation carries a larger one than its target (§3.6 Correction order).
 - **Feed position** (`FeedPosition`): `{xact_id, id}`. Its age, as the gateway defines it (gear DESIGN §3.1 `FeedPosition`), is the acceptance instant of the oldest entry of a subscribed GTS type after it, whatever the reader's scope, and a position with no such entry after it is current. A head position has nothing settled after it, so it is current when issued. The position stores no age: the plugin reads it when the position is presented (§3.6 `cpt-cf-uc-plugin-seq-feed-page`, Retention refusal). It never travels through the SPI except as the opaque value this plugin issued: out in a `FeedPage`, back in as `until` or inside `FeedStart::After` (§3.3 Signature).
-- **Type key** (`usage_type_key`, §3.7, `TypeKeyCache`): a small integer assigned once per `gts_type_id` on its first write and never changed; the hypertable's type partition dimension (§3.7 `usage_type_key`).
+- **Type key** (`usage_type_key`, §3.7, `TypeKeyCache`): a small integer assigned once per `gts_type_uuid` on its first write and never changed; the hypertable's type partition dimension (§3.7 `usage_type_key`).
 
 **Relationships**:
 
@@ -244,7 +244,7 @@ Bootstraps the plugin as a ToolKit gear, makes the backend discoverable by the h
 
 ##### Responsibility scope
 
-`#[toolkit::gear]` `init` (`src/gear.rs`): load and validate config (`TimescaleDbPluginConfig`, `src/config.rs`, §3.5), including the required `feed_replay_horizon_secs`, create the connection pool, run schema migrations, apply post-migration partitioning and rollup-policy setup, then perform the GTS handshake — `PluginV1::<UsageCollectorPluginSpecV1>::build_registration(...)`, publish to `types-registry`, and `ClientHub::register_scoped::<dyn UsageCollectorPluginV1>` under `ClientScope::gts_id(&instance_id)`. Carries the configured `vendor` and `priority`. `start`/`stop` (`RunnableCapability`) run and cancel the background loop that sweeps retention, samples rollup health and samples the feed's settled-horizon lag (§3.6 `cpt-cf-uc-plugin-seq-retention-sweep`, `cpt-cf-uc-plugin-seq-rollup-refresh`).
+`#[toolkit::gear]` `init` (`src/gear.rs`): load and validate config (`TimescaleDbPluginConfig`, `src/config.rs`, §3.5), create the connection pool, run schema migrations, apply post-migration partitioning and rollup-policy setup, then perform the GTS handshake — `PluginV1::<UsageCollectorPluginSpecV1>::build_registration(...)`, publish to `types-registry`, and `ClientHub::register_scoped::<dyn UsageCollectorPluginV1>` under `ClientScope::gts_id(&instance_id)`. Carries the configured `vendor` and `priority`. `start`/`stop` (`RunnableCapability`) run and cancel the background loop that sweeps retention, samples rollup health and samples the feed's settled-horizon lag (§3.6 `cpt-cf-uc-plugin-seq-retention-sweep`, `cpt-cf-uc-plugin-seq-rollup-refresh`).
 
 ##### Responsibility boundaries
 
@@ -414,7 +414,6 @@ The plugin exposes one inbound contract: the storage SPI, consumed in-process by
 
 | Method | Description | Stability |
 | --- | --- | --- |
-| `create_usage_record` | Persist one entry durably; dedup on the 6-tuple, or `IdempotencyConflict`. | stable |
 | `create_usage_records` | Batch persist; per-record results in input order. | stable |
 | `get_usage_record` | Fetch one entry by `id` under the compiled scope; `converged_only` changes nothing at this plugin's level (§3.6). | stable |
 | `query_aggregated_usage_records` | Pushed-down SUM/COUNT/MIN/MAX/LATEST + group-by, from the rollup or the ledger. | stable |
@@ -443,7 +442,7 @@ The plugin exposes one inbound contract: the storage SPI, consumed in-process by
 
 #### TimescaleDB / PostgreSQL
 
-The system of record for all plugin data (`cpt-cf-uc-plugin-contract-timescaledb`). Reached via a `sqlx` PostgreSQL connection pool over a TLS-by-default DSN, held in a `Debug`-redacted secret wrapper (`SecretFromEnv`) so it never appears in logs or panic output. `connect_options` resolves the SSL mode rather than trusting operator convention: the silent fallback modes — an unspecified `sslmode`, `prefer`, or `allow` — are raised to `require`, `verify-ca` and `verify-full` are preserved, and an explicit `sslmode=disable` is honoured as a deliberate non-production opt-out with a warning emitted once per pool build.
+The system of record for all plugin data (`cpt-cf-uc-plugin-contract-timescaledb`). Reached via a `sqlx` PostgreSQL connection pool over a TLS-by-default DSN, held in a `Debug`-redacted secret wrapper (`SecretFromEnv`) so it never appears in logs or panic output. `connect_options` resolves the SSL mode rather than trusting operator convention: the silent fallback modes — an unspecified `sslmode`, `prefer`, or `allow` — are raised to `require`, `verify-ca` and `verify-full` are preserved, and an explicit `sslmode=disable` is honoured as a deliberate non-production opt-out with a warning emitted once per pool build. **PostgreSQL 17 is the minimum server version.** `transaction_timeout` (Configuration below) exists only from that release and is applied as a connection startup parameter, so an older server rejects every connection with `unrecognized configuration parameter` rather than degrading, and the gear does not start at all.
 
 **Configuration** (`TimescaleDbPluginConfig`, `src/config.rs`; durations are whole seconds):
 
@@ -453,63 +452,28 @@ The system of record for all plugin data (`cpt-cf-uc-plugin-contract-timescaledb
 | `pool_size_min` / `pool_size_max` | Connection pool bounds (`max` must be ≥ 2) | 2 / 16 |
 | `connection_timeout_secs` | Connection acquire timeout | 10 |
 | `statement_timeout_secs` | Per-statement timeout on every request-path connection | 30 |
-| `transaction_timeout_secs` | Postgres `transaction_timeout` on every pool connection and on the retention sweep's detached connection; bounds a whole transaction, not just one statement (§3.6, §4.1 item 2). MUST be greater than `statement_timeout_secs`; config load rejects a value that is not | 60 |
-| `feed_acceptance_slack_secs` | A predicate inside every write path's INSERT statement refuses, as `Transient`, a row whose `accepted_at` differs from that statement's own `statement_timestamp()` by more than this, in either direction (§3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`); counted by `uc_timescaledb_stale_acceptance_rejections_total`. Enters the acceptance-order slack (§3.6 `cpt-cf-uc-plugin-seq-feed-page`) | 120 |
+| `transaction_timeout_secs` | Postgres `transaction_timeout` on every pool connection and on the retention sweep's detached connection; bounds a whole transaction, not just one statement (§3.6, §4.1 item 2). MUST be greater than `statement_timeout_secs`; config load rejects a value that is not, because the transaction bound fires first at or below it and ends the session rather than cancelling the statement. Requires PostgreSQL 17 (above) | 60 |
+| `feed_acceptance_slack_secs` | A predicate inside every write path's INSERT statement refuses, as `Transient`, a row whose `accepted_at` differs from that statement's own `statement_timestamp()` by more than this, in either direction (§3.6 `cpt-cf-uc-plugin-seq-ingest-batch`); counted by `uc_timescaledb_stale_acceptance_rejections_total`. Enters the acceptance-order slack (§3.6 `cpt-cf-uc-plugin-seq-feed-page`) | 120 |
 | `chunk_time_interval_secs` | Time width of new ledger chunks; a multiple of 3600; applies to chunks created afterwards | 604800 (7d) |
 | `type_key_slice_width` | How many type keys share one chunk slice (§2.2 Data Retention); applies to chunks created afterwards | 1 |
 | `retention_sweep_interval_secs` | Seconds between retention sweeps | 3600 (1h) |
-| `feed_replay_horizon_secs` | The deployment's operational replay horizon H; every feed position no older than this is served. The retention it requires of every GTS type is §4.1 item 6 | — (required) |
 | `rollup_materialization_lag_secs` | Buckets newer than this are answered from the ledger rather than materialised | 7200 (2h) |
 | `rollup_live_window_secs` | Reach of the frequent (live) refresh policy | 259200 (3d) |
 | `rollup_refresh_interval_secs` | Seconds between live refresh-policy runs | 120 |
 | `rollup_history_refresh_interval_secs` | Seconds between history refresh-policy runs; see §4.1 item 4 for acting consumers | 3600 (1h) |
 | `vendor` / `priority` | GTS instance selection metadata | constructorfabric / 10 |
 
-**Durability.** Every write transaction runs `SET LOCAL synchronous_commit = on`, so an operator-level `synchronous_commit` of `off` or `local` cannot weaken an acknowledgement. Unlike `synchronous_commit`, `fsync` and `full_page_writes` are server-wide and cannot be forced per transaction, and either one off can lose a committed write on a crash. At `init`, the plugin therefore verifies `current_setting('fsync') = 'on'` and `current_setting('full_page_writes') = 'on'` and fails startup otherwise (`cpt-cf-uc-plugin-fr-durable-ack`). With synchronous standbys, `remote_write` or stronger is the operator's choice and is recorded in the deployment's consistency profile (§4.1).
+**Durability.** Every write transaction whose commit is acknowledged to a caller runs `SET LOCAL synchronous_commit = on`, so an operator-level `synchronous_commit` of `off` or `local` cannot weaken an acknowledgement. Those are the write transactions of §3.6's ingest sequences. The retention sweep's transaction is not one of them, and §3.6's sweep sequence omits the statement deliberately: no caller waits on that commit, and a chunk the sweep fails to drop is kept until the next sweep. Unlike `synchronous_commit`, `fsync` and `full_page_writes` are server-wide and cannot be forced per transaction, and either one off can lose a committed write on a crash. At `init`, the plugin therefore verifies `current_setting('fsync') = 'on'` and `current_setting('full_page_writes') = 'on'` and fails startup otherwise (`cpt-cf-uc-plugin-fr-durable-ack`). With synchronous standbys, `remote_write` or stronger is the operator's choice and is recorded in the deployment's consistency profile (§4.1).
+
+**Isolation.** `default_transaction_isolation = read committed` is applied to every request-path connection as a startup parameter alongside the timeouts above. This is a correctness dependency rather than a bound: §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`'s read-back of the admitted, not-won rows runs inside the same transaction that lost their dedup slots, and under `repeatable read` it would keep that transaction's original snapshot and miss every winner, answering a `Transient` for rows §3.3's `dedup-concurrent` requires resolved absorb-vs-conflict. Unlike `fsync` and `full_page_writes` it is per-connection, so it is forced rather than checked at startup; the feed page's explicit `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` overrides it per transaction and is unaffected.
 
 ### 3.6 Interactions & Sequences
 
-These flows cover every SPI operation in §3.3 and the plugin's two background processes. They realize the plugin PRD use cases `cpt-cf-uc-plugin-usecase-ingest-dedup` (`cpt-cf-uc-plugin-seq-ingest-dedup`), `cpt-cf-uc-plugin-usecase-read-feed-page` and `cpt-cf-uc-plugin-usecase-refuse-stale-cursor` (`cpt-cf-uc-plugin-seq-feed-page`); `cpt-cf-uc-plugin-usecase-bind-startup` is the Gear component's `init` (§3.2).
-
-#### Ingest with idempotency dedup
-
-**ID**: `cpt-cf-uc-plugin-seq-ingest-dedup`
-
-```mermaid
-sequenceDiagram
-    participant Host as Plugin Host
-    participant Adapter as SPI Adapter
-    participant Rec as Record Store
-    participant DB as TimescaleDB
-    Host->>Adapter: create_usage_record(record)
-    Adapter->>Rec: create(record)
-    Rec->>DB: resolve type_key (usage_type_key, autocommit)
-    Rec->>DB: BEGIN, SET LOCAL synchronous_commit = on
-    Rec->>DB: WITH input AS (… computes admitted from statement_timestamp() …), ins AS (INSERT … SELECT … FROM input WHERE admitted ON CONFLICT (6-tuple, type_key) DO NOTHING RETURNING …) SELECT … FROM input LEFT JOIN ins USING (id), one statement
-    DB-->>Rec: admitted flag and won flag for the row
-    alt admitted and won
-        Rec->>DB: COMMIT
-        Rec-->>Adapter: UsageRecord (xact_id stamped by default)
-    else not admitted
-        Rec->>DB: ROLLBACK
-        Rec-->>Adapter: Transient (stale acceptance)
-    else admitted, not won (6-tuple already exists)
-        Rec->>DB: SELECT the existing row by id
-        Rec->>DB: ROLLBACK
-        alt caller-supplied fields equal
-            Rec-->>Adapter: stored UsageRecord (silent absorb)
-        else caller-supplied fields differ
-            Rec-->>Adapter: IdempotencyConflict
-        end
-    end
-    Adapter-->>Host: Result<UsageRecord, _>
-```
-
-**Description**: the entry's `type_key` is resolved (assigned on first write, cached thereafter — §3.1) before the write transaction opens, so the INSERT is that transaction's first write (the Precondition in `cpt-cf-uc-plugin-seq-feed-page` relies on this). The write is **one statement** that carries its own guard verdict out, shaped `WITH input AS (…computes admitted…), ins AS (INSERT … SELECT … FROM input WHERE admitted ON CONFLICT (6-tuple, type_key) DO NOTHING RETURNING …) SELECT … FROM input LEFT JOIN ins USING (id)`: `input` computes `admitted` — `accepted_at` within `feed_acceptance_slack_secs` (§3.5) of that statement's own `statement_timestamp()`, in either direction; `ins` inserts only an admitted row; the outer select returns `admitted` and whether the row won. Nothing before or after the statement computes the guard, since a later statement would run under a later `statement_timestamp()`. A won row is a fresh insert, its `xact_id` stamped by the column default. **The guard's verdict takes precedence**: a row not admitted is `Transient` (counted by `uc_timescaledb_stale_acceptance_rejections_total`, §4.3; the host lifts it to a retryable error so the retry is stamped afresh) even when its identity exists; this is what enforces the acceptance-order slack. `SET LOCAL synchronous_commit = on` makes a returned `COMMIT` durable (`cpt-cf-uc-plugin-fr-durable-ack`). An admitted row that did not win is read back by `id` and resolved via `UsageRecord::caller_supplied_eq`: equal canonical fields is a silent absorb returning the stored entry. `metadata` compares as a **parsed JSON document**, not as text: two submissions whose metadata differs only in key order, in insignificant whitespace, or in a duplicate key's earlier occurrence are equal, because `jsonb` retains none of those distinctions and a byte comparison would therefore report a conflict the store cannot substantiate on read-back. Every other canonical field compares by value. `origin` and `accepted_at` are server-assigned and take no part in the comparison, so a retry absorbed from the other ingestion path returns the stored entry with its stored `origin`. Any difference is `IdempotencyConflict`, carrying the idempotency key and the stored entry (`existing`), which the host needs to report an already-invalidated target. The read-back keys on `id`, never on `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`: once a record is invalidated two rows share those five columns, so a read by them could return the invalidation for a record retry or the record for an invalidation retry. A same-key request naming a different covered period, or the invalidation of a stored record, is a distinct identity, hence a fresh insert. The first write to commit is the survivor; late commits and abandoned calls are §4.1 item 9. If retention drops the conflicting row's chunk between the conflicting insert and the read-back, the call returns a retryable `Transient`.
+These flows cover every SPI operation in §3.3 and the plugin's two background processes. They realize the plugin PRD use cases `cpt-cf-uc-plugin-usecase-ingest-dedup` (`cpt-cf-uc-plugin-seq-ingest-batch`), `cpt-cf-uc-plugin-usecase-read-feed-page` and `cpt-cf-uc-plugin-usecase-refuse-stale-cursor` (`cpt-cf-uc-plugin-seq-feed-page`); `cpt-cf-uc-plugin-usecase-bind-startup` is the Gear component's `init` (§3.2).
 
 #### Batch ingest with per-record results
 
-**ID**: `cpt-cf-uc-plugin-seq-ingest-batch`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-ingest-batch`
 
 ```mermaid
 sequenceDiagram
@@ -528,11 +492,11 @@ sequenceDiagram
     Adapter-->>Host: Vec of per-record Result, positionally aligned to input
 ```
 
-**Description**: the same guarded single statement as `cpt-cf-uc-plugin-seq-ingest-dedup`, over an `input` CTE built from `UNNEST(…)`: `admitted` is computed per input row, only admitted rows are inserted, and the outer select returns each row's `admitted` and won flags. Type keys are resolved before `BEGIN` for the same reason. The guard's verdict takes precedence per row: a row not admitted is a stale-acceptance `Transient` even when its identity exists. The outer select joins input to inserted rows on `id`, and only the admitted, not-won rows are read back, by `id`, in one statement, and each is classified a silent absorb or an `IdempotencyConflict` carrying its key and `existing`. Two same-identity entries inside one batch, recognised by equal `id` and hence equal six inputs, resolve the later against the earlier — absorbed when identical, `IdempotencyConflict` when divergent. A record and its invalidation in one batch are two identities and are resolved each against its own row. A conflict or rejection on one record never fails the others. The whole call is wrapped in a bounded retry (`MAX_BATCH_ATTEMPTS`) on an outer `Transient` (a deadlock-victim abort or a serialization failure); each attempt takes a fresh connection and transaction, so a rolled-back attempt leaves nothing behind and a re-run is safe because the write is idempotent. Per-record `Transient` outcomes inside a successful batch are the host's to handle and are never retried in-process. Every entry of one batch shares the batch's `xact_id`; feed order within it falls back to `id`.
+**Description**: the entries' `type_key`s are resolved (assigned on first write, cached thereafter — §3.1) before the write transaction opens, so the INSERT is that transaction's first write (the Precondition in `cpt-cf-uc-plugin-seq-feed-page` relies on this). The write is **one statement** that carries its own guard verdict out, shaped `WITH input AS (…computes admitted…), ins AS (INSERT … SELECT … FROM input WHERE admitted ON CONFLICT (6-tuple, type_key) DO NOTHING RETURNING …) SELECT … FROM input LEFT JOIN ins USING (id)`, over an `input` CTE built from `UNNEST(…)`: `input` computes `admitted` per row — `accepted_at` within `feed_acceptance_slack_secs` (§3.5) of that statement's own `statement_timestamp()`, in either direction; `ins` inserts only admitted rows; the outer select returns each row's `admitted` and won flags. **The guard's verdict takes precedence per row**: a row not admitted is `Transient` (counted by `uc_timescaledb_stale_acceptance_rejections_total`, §4.3; the host lifts it to a retryable error so the retry is stamped afresh) even when its identity exists. The outer select joins input to inserted rows on `id`, and only the admitted, not-won rows are read back, by `id`, in one statement, and each is classified a silent absorb or an `IdempotencyConflict` carrying its key and `existing`. The comparison is `UsageRecord::caller_supplied_eq` over every canonical field; `metadata` compares as the **parsed JSON document**, not the submitted bytes (§3.7 `usage_records`.metadata), so two entries differing only in key order, insignificant whitespace, or a duplicate key's earlier occurrence are equal, while `origin` and `accepted_at`, being server-assigned, take no part in the comparison. The read-back keys on `id`, never on the five columns a record shares with its invalidation, since once a record is invalidated two rows share those five columns and a read by them could return the invalidation for a record retry or the record for an invalidation retry. If retention drops an admitted-not-won row's chunk between the conflicting insert and this read-back, that row's outcome is a retryable `Transient`, counted by `uc_timescaledb_dedup_stale_total`. Two same-identity entries inside one batch, recognised by equal `id` and hence equal six inputs, resolve the later against the earlier — absorbed when identical, `IdempotencyConflict` when divergent. A record and its invalidation in one batch are two identities and are resolved each against its own row. A conflict or rejection on one record never fails the others. The whole call is wrapped in a bounded retry (`MAX_BATCH_ATTEMPTS`) on an outer `Transient` (a deadlock-victim abort, a serialization failure, a lock wait that exceeds the connection's `lock_timeout` — the retention sweep's `ACCESS EXCLUSIVE` chunk lock is one such wait, §3.6 `cpt-cf-uc-plugin-seq-retention-sweep` — a connectivity fault, meaning a backend that is unreachable or refusing work or a pool that cannot supply a usable connection, or a concurrent writer of one of this batch's own dedup identities colliding on the ledger's PRIMARY KEY, which the `ON CONFLICT` arbiter does not cover and which the Record Store lifts to a `Transient` so the re-run resolves against the winner's committed row); each attempt takes a fresh connection and transaction, so a rolled-back attempt leaves nothing behind and a re-run is safe because the write is idempotent. Per-record `Transient` outcomes inside a successful batch are the host's to handle and are never retried in-process. Every entry of one batch shares the batch's `xact_id`; feed order within it falls back to `id`.
 
 #### Aggregated query (rollup or exact scan)
 
-**ID**: `cpt-cf-uc-plugin-seq-query-aggregated`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-query-aggregated`
 
 ```mermaid
 sequenceDiagram
@@ -560,7 +524,7 @@ sequenceDiagram
 
 #### Keyset-paginated raw list
 
-**ID**: `cpt-cf-uc-plugin-seq-list-keyset`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-list-keyset`
 
 ```mermaid
 sequenceDiagram
@@ -568,10 +532,10 @@ sequenceDiagram
     participant Adapter as SPI Adapter
     participant Rec as Record Store
     participant DB as TimescaleDB
-    Host->>Adapter: list_usage_records(gts_type_id, time_range, query, metadata_filter)
+    Host->>Adapter: list_usage_records(gts_type_id, time_range, query, metadata_filter, keyset?)
     Adapter->>Rec: list(...)
     Rec->>Rec: translate filter, take the gateway-decoded keyset as the seek key
-    Rec->>DB: SELECT page WHERE gts_type_id, window_end in range, rows after seek key, ORDER BY the host-supplied effective order, LIMIT n+1
+    Rec->>DB: SELECT page WHERE gts_type_uuid, window_end in range, rows after seek key, ORDER BY the host-supplied effective order, LIMIT n+1
     DB-->>Rec: up to n+1 rows
     Rec->>Rec: trim to page, keep the last in-page row's keyset
     Rec-->>Adapter: rows + last keyset
@@ -582,7 +546,7 @@ sequenceDiagram
 
 #### Converged-only lookup
 
-**ID**: `cpt-cf-uc-plugin-seq-converged-lookup`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-converged-lookup`
 
 ```mermaid
 sequenceDiagram
@@ -606,7 +570,7 @@ sequenceDiagram
 
 #### Feed page
 
-**ID**: `cpt-cf-uc-plugin-seq-feed-page`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-feed-page`
 
 ```mermaid
 sequenceDiagram
@@ -621,11 +585,11 @@ sequenceDiagram
     Rec->>DB: SELECT pg_snapshot_xmin(pg_current_snapshot())
     DB-->>Rec: horizon (the transaction snapshot is now fixed)
     opt page_after present
-        Rec->>DB: optional early check, is a mark in usage_feed_retention_marks WHERE gts_type_id = ANY($subs) above $after
+        Rec->>DB: optional early check, is a mark in usage_feed_retention_marks WHERE gts_type_uuid = ANY($subs) above $after
         DB-->>Rec: marked or not
     end
     opt not marked
-        Rec->>DB: unprepared SELECT … WHERE gts_type_id = ANY($subs) AND scope predicate AND (xact_id, id) > $after (predicate omitted on a first read) AND xact_id < $horizon [AND (xact_id, id) <= $until] ORDER BY xact_id, id LIMIT $limit
+        Rec->>DB: unprepared SELECT s.* FROM unnest($subs) AS t(gts) CROSS JOIN LATERAL (SELECT … WHERE gts_type_uuid = t.gts AND scope predicate AND (xact_id, id) > $after (predicate omitted on a first read) AND xact_id < $horizon [AND (xact_id, id) <= $until] ORDER BY xact_id, id LIMIT $limit) AS s ORDER BY s.xact_id_text::xid8, s.id LIMIT $limit
         DB-->>Rec: entries
     end
     Rec->>DB: COMMIT
@@ -645,13 +609,13 @@ sequenceDiagram
     Adapter-->>Host: Result<FeedPage, _>
 ```
 
-**Description**: feed order is `(xact_id, id)` over the subscribed types, served from `usage_records_feed_idx` (§3.7). The page statement applies the compiled scope as a bound predicate, so an out-of-scope entry is absent. Write H for `feed_replay_horizon_secs`, S for the acceptance-order slack (Acceptance-order slack, below), and pos(e) for an entry's `(xact_id, id)`. A page runs as six steps: (1) `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`; (2) `SELECT pg_snapshot_xmin(pg_current_snapshot())`, which fixes the transaction snapshot and returns the settled horizon `$horizon`; (3) with `page_after` present, an optional early mark check, a fast path only; (4) the page statement with `xact_id < $horizon` and the scope predicate, and with the position lower bound only when `page_after` is present; (5) `COMMIT`; (6) with `page_after` present, the authoritative mark re-check in autocommit, then return the page or the refusal. Steps (1) and (2) establish the horizon. The page statement is sent **unprepared**. **Why.** TimescaleDB excludes chunks at plan time against the catalog it then sees. Under `REPEATABLE READ`, `$horizon` is the xmin of the snapshot step (2) fixed, so every entry below it — and the chunk holding it — was committed before that snapshot. A statement planned after step (2) sees a catalog no older than the snapshot, so its plan includes every such chunk that has not been dropped (Retention refusal, Mark check). Reading the horizon in the scan statement itself, or reusing a generic plan cached on the pooled connection before a chunk existed, could plan against an older chunk set and silently skip that chunk's rows.
+**Description**: feed order is `(xact_id, id)` over the subscribed types, served from `usage_records_feed_idx` (§3.7). The page statement applies the compiled scope as a bound predicate, so an out-of-scope entry is absent. Write H for the deployment's operational replay horizon, S for the acceptance-order slack (Acceptance-order slack, below), and pos(e) for an entry's `(xact_id, id)`. A page runs as six steps: (1) `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`; (2) `SELECT pg_snapshot_xmin(pg_current_snapshot())`, which fixes the transaction snapshot and returns the settled horizon `$horizon`; (3) with `page_after` present, an optional early mark check, a fast path only; (4) the page statement with `xact_id < $horizon` and the scope predicate, and with the position lower bound only when `page_after` is present; (5) `COMMIT`; (6) with `page_after` present, the authoritative mark re-check in autocommit, then return the page or the refusal. Steps (1) and (2) establish the horizon. The page statement is sent **unprepared**. **Why.** TimescaleDB excludes chunks at plan time against the catalog it then sees. Under `REPEATABLE READ`, `$horizon` is the xmin of the snapshot step (2) fixed, so every entry below it — and the chunk holding it — was committed before that snapshot. A statement planned after step (2) sees a catalog no older than the snapshot, so its plan includes every such chunk that has not been dropped (Retention refusal, Mark check). Reading the horizon in the scan statement itself, or reusing a generic plan cached on the pooled connection before a chunk existed, could plan against an older chunk set and silently skip that chunk's rows.
 
 - **Completeness.** Every transaction whose id is below the horizon has finished, and the page statement's plan includes every chunk holding one of their entries that retention has not dropped (step 2 before step 4, above), so no entry can later become visible at or before a returned position, whatever the concurrency, commit order or number of gateway replicas. A dropped chunk is Retention refusal's concern. This holds for an unchanged compiled scope: entries a widened scope admits behind a returned position are not delivered.
 - **Snapshot and replay.** Positions are immutable and entries are never mutated, so a scan observes only arrivals ahead of it, and a replay bounded by `until` returns the same entries in the same order.
 - **Correction order.** The gateway accepts an invalidation only after its target has converged; the invalidation's transaction is therefore assigned its id after the target's committed, and `xact_id(invalidation) > xact_id(target)`.
 - **Head position.** A page shorter than `limit` has read every settled, in-scope entry after `page_after`, or every one the subscription retains on a first read. Its next position is `{xmin − 1, max uuid}`, where `xmin` is `$horizon`. Every settled position is at or below `xmin − 1`, and a transaction at exactly `xmin` lands strictly after it. Nothing settled follows a head position, so it is current when issued and the page reads no age for it. Entries that settle after it are judged when the position is presented again (Retention refusal).
-- **Precondition.** The write-time check (`cpt-cf-uc-plugin-seq-ingest-dedup`) bounds `accepted_at` against its INSERT's `statement_timestamp()`. That INSERT is its transaction's first write (type keys resolve in autocommit before `BEGIN`), and the id is assigned while it runs, which `statement_timeout_secs` bounds, so `statement_timestamp() ≤ assign ≤ statement_timestamp() + statement_timeout_secs` — assignment can lag, for example, across an `ON CONFLICT` wait on a concurrent inserter. Hence `assign(entry) − statement_timeout_secs − feed_acceptance_slack_secs ≤ accepted_at ≤ assign(entry) + feed_acceptance_slack_secs`.
+- **Precondition.** The write-time check (`cpt-cf-uc-plugin-seq-ingest-batch`) bounds `accepted_at` against its INSERT's `statement_timestamp()`. That INSERT is its transaction's first write (type keys resolve in autocommit before `BEGIN`), and the id is assigned while it runs, which `statement_timeout_secs` bounds, so `statement_timestamp() ≤ assign ≤ statement_timestamp() + statement_timeout_secs` — assignment can lag, for example, across an `ON CONFLICT` wait on a concurrent inserter. Hence `assign(entry) − statement_timeout_secs − feed_acceptance_slack_secs ≤ accepted_at ≤ assign(entry) + feed_acceptance_slack_secs`.
 - **First read.** A read whose start is `FeedStart::Oldest` — no `page_after` in the flows above (§3.3 Signature) — places no lower bound on position: the page statement runs without the `(xact_id, id) > $after` predicate, so a first read begins at the oldest entry the subscription retains, which is what the gear requires — its `feed-bootstrap-position` contract test, the `FeedStart::Oldest` doc comment on `read_feed_page` (gear DESIGN §3.3), and [`0011-feed-aggregate-split`](../../../docs/ADR/0011-cpt-cf-usage-collector-adr-feed-aggregate-split.md), which admits that one start and no other. There is no start lookup and no age threshold. **Completeness** holds for the reason it does on a continuation: an unsettled entry has an id no smaller than `$horizon`, so it sorts after every entry the page reads. A subscription retaining no entry reads nothing and returns the head position. **Never refused.** A first read carries no position, so Retention refusal's check does not run: there is no position for a mark to stand above, and the plugin refuses on nothing else. **Cost.** A first read opens a replay of the whole retained history of the subscription — up to the deployment's retention, which §4.1 item 6 puts above the gear's 125-day floor at the launch defaults — and the consumer absorbs it by the deduplication every replay already obliges (gear PRD `cpt-cf-usage-collector-fr-billing-usage-feed`). Its first page reads the same index range as any other page, from the first chunk retention keeps rather than from a looked-up start, so §4.1 item 7's figure bounds it. **Continuation.** A consumer replaying that history holds an old position for as long as the replay runs, and the retention sweep can drop a chunk behind it meanwhile; the mark check then refuses its next page. That is the gateway's rule for a position after which retention has removed an entry, not a departure from it, and the consumer restarts from `FeedStart::Oldest`. A consumer whose replay outpaces the sweep, and one that has caught up, are unaffected.
 - **Retention refusal.** The gateway defines a position's age as the acceptance instant of the oldest entry of a subscribed GTS type after it, whatever the reader's scope, and a position with no such entry after it is current (gear DESIGN §3.1 `FeedPosition`). A cursor no older than H is served; beyond H what a deployment still retains is plugin-dependent, but that latitude is over retention rather than behaviour — **no cursor is refused on its age**, and a cursor after which retention has already removed an entry is refused whatever its age (ADR-0011 Two zones and one refusal, `cpt-cf-usage-collector-fr-billing-retention-floor`). This plugin therefore serves a cursor whose continuation is intact however old it is, which the gear's `feed-retention-refusal` contract test asserts, and age could not carry the decision anyway: a retention sweep clamps the age of a stale cursor to the retention boundary (gear PRD `cpt-cf-usage-collector-fr-billing-retention-floor`). One check carries it, and it returns `CursorBeyondRetention`, counted by `uc_timescaledb_feed_cursor_refusals_total` (§4.3).
   - **Mark check, steps (3) and (6).** `usage_feed_retention_marks` (§3.7) holds, per GTS type, the highest position retention has deleted. The retention sweep raises a type's marks in the transaction that drops the chunk, and nothing can insert into the chunk between the sweep's read of its highest positions and the drop (`cpt-cf-uc-plugin-seq-retention-sweep`). A page refuses when any subscribed type's mark is greater than `page_after`. Step (3) reads the marks under the page's snapshot, which can miss a drop that commits after step (2), so it is only a fast path. Step (6) reads them again in autocommit after `COMMIT` and is authoritative: when it finds a mark above `page_after`, the page already read is discarded. **Argument.** A mark above `page_after` names a deleted entry after it, so the range after `page_after` may be incomplete, and refusing it is the gateway's rule. Conversely, suppose step (6) finds no mark above `page_after`. The page statement takes a lock on every chunk it plans and holds it until `COMMIT`, and a chunk drop needs `ACCESS EXCLUSIVE`, so no chunk the page read is dropped before `COMMIT`. A chunk the plan lacks because its drop committed before planning raised its marks in that same transaction, so step (6) sees them. A chunk excluded at plan time holds no row the page's predicate admits, so its drop removes nothing the page could read (at most a spurious mark refusal, Refusal granularity). A chunk whose drop commits while the planner waits for its lock is either skipped, the case just covered, or raises an error surfaced as `Transient`, which serves no page. So every deleted entry of a subscribed type that the page could have read would have left a mark above `page_after`, and none did: the page is complete. A drop that commits between `COMMIT` and step (6) can refuse a complete page, but only a position after which retention has removed an entry. **Cost.** One extra small autocommit query per page, and a page refused at step (6) is read for nothing. **Positions within H.** In a conforming deployment (§4.1 item 6) an entry retention deletes was accepted at least H + S before its drop: its `window_end` is no earlier than `accepted_at` less the backfill window, and its chunk drops no earlier than that `window_end` plus the type's retention. A position with a deleted entry of a subscribed type after it is therefore at least H + S old at the re-check, measured as the gateway measures age, so a mark never refuses a position within H.
@@ -664,7 +628,7 @@ sequenceDiagram
 
 #### Reconciliation
 
-**ID**: `cpt-cf-uc-plugin-seq-reconciliation`
+- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-seq-reconciliation`
 
 ```mermaid
 sequenceDiagram
@@ -674,17 +638,17 @@ sequenceDiagram
     participant DB as TimescaleDB
     Host->>Adapter: get_reconciliation_metadata(tenant_id, gts_type_id, time_range, fold, scope)
     Adapter->>Rec: reconciliation(...)
-    Rec->>DB: for the requested tenant_id and gts_type_id under scope predicate: count(*) and fold summary over from <= window_end < to (withdrawn pairs excluded from the summary), max(accepted_at), max(window_end) unbounded
+    Rec->>DB: for the requested tenant_id and gts_type_uuid under scope predicate: count(*) and fold summary over from <= window_end < to (withdrawn pairs excluded from the summary), max(accepted_at), max(window_end) unbounded
     DB-->>Rec: rows
     Rec-->>Adapter: ReconciliationMetadata
     Adapter-->>Host: Result<ReconciliationMetadata, _>
 ```
 
-**Description**: `scope` (the compiled PDP scope) is applied as a predicate alongside `gts_type_id`, restricting whether the requested tenant's entries are visible at all. One row for the requested `(tenant_id, gts_type_id)` scope, with no paging: the gear serves one scope per call. A scope with entries of the type but none in range reports a zero `accepted_count` and an empty-selection summary (`accrued_sum` = 0, or `observation_count` = 0 with `latest_observation` absent), and its watermarks are unaffected, since both are unbounded by the range. A scope holding no entries at all reports both watermarks absent. The REST schema renders `latest_observation` and both watermarks as `null`. `accrued_sum` stays `0` rather than `null`, because an accrual over an empty set is defined while an observation over one is not. `accepted_count` counts every accepted entry in range — records and invalidations — because it reports ingestion activity. The summary follows the fold the host passes: `SUM` → `accrued_sum`, the same exact-scan fold as the aggregate path with withdrawn pairs excluded (never the rollup); any other fold → `observation_count` of non-withdrawn records and `latest_observation` by the `LATEST` total order. The watermarks read `max(accepted_at)` through `usage_records_watermark_idx` and `max(window_end)` through `usage_records_tenant_type_window_idx`, regardless of range. One entry per dedup identity holds trivially at the `linearizable` level. The signature and the treatment of withdrawn pairs are settled by the gear: the SPI declares the parameters this design takes, and `accepted_count` counts every accepted entry the range selects, invalidations included, while the summary excludes withdrawn pairs (§3.3 Signature).
+**Description**: `scope` (the compiled PDP scope) is applied as a predicate alongside `gts_type_uuid`, restricting whether the requested tenant's entries are visible at all. One row for the requested `(tenant_id, gts_type_uuid)` scope, with no paging: the gear serves one scope per call. A scope with entries of the type but none in range reports a zero `accepted_count` and an empty-selection summary (`accrued_sum` = 0, or `observation_count` = 0 with `latest_observation` absent), and its watermarks are unaffected, since both are unbounded by the range. A scope holding no entries at all reports both watermarks absent. The REST schema renders `latest_observation` and both watermarks as `null`. `accrued_sum` stays `0` rather than `null`, because an accrual over an empty set is defined while an observation over one is not. `accepted_count` counts every accepted entry in range — records and invalidations — because it reports ingestion activity. The summary follows the fold the host passes: `SUM` → `accrued_sum`, the same exact-scan fold as the aggregate path with withdrawn pairs excluded (never the rollup); any other fold → `observation_count` of non-withdrawn records and `latest_observation` by the `LATEST` total order. The watermarks read `max(accepted_at)` through `usage_records_watermark_idx` and `max(window_end)` through `usage_records_tenant_type_window_idx`, regardless of range. One entry per dedup identity holds trivially at the `linearizable` level. The signature and the treatment of withdrawn pairs are settled by the gear: the SPI declares the parameters this design takes, and `accepted_count` counts every accepted entry the range selects, invalidations included, while the summary excludes withdrawn pairs (§3.3 Signature).
 
 #### Retention sweep
 
-**ID**: `cpt-cf-uc-plugin-seq-retention-sweep`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-retention-sweep`
 
 ```mermaid
 sequenceDiagram
@@ -704,7 +668,7 @@ sequenceDiagram
                 Sweeper->>DB: BEGIN ISOLATION LEVEL READ COMMITTED, SET LOCAL lock_timeout = '5s'
                 Sweeper->>DB: LOCK TABLE the chunk IN ACCESS EXCLUSIVE MODE
                 alt chunk lock acquired
-                    Sweeper->>DB: read the chunk's highest (xact_id, id) per gts_type_id from its feed index
+                    Sweeper->>DB: read the chunk's highest (xact_id, id) per gts_type_uuid from its feed index
                     Sweeper->>DB: raise each type's mark in usage_feed_retention_marks to the greater of the stored and the read position
                     Sweeper->>DB: drop chunk, delete its rollup rows, COMMIT
                 else lock_timeout expires
@@ -723,7 +687,7 @@ sequenceDiagram
 
 #### Rollup refresh
 
-**ID**: `cpt-cf-uc-plugin-seq-rollup-refresh`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-seq-rollup-refresh`
 
 ```mermaid
 sequenceDiagram
@@ -745,18 +709,18 @@ sequenceDiagram
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-db-schema`
 
-This section is the **target** schema; the migrations on this branch predate it (§4.5).
+This section is the schema `migrations/` now carries rather than one it still trails: `0001_init.sql` declares the ledger's columns, its indexes and the two keyed tables beside it, and `0002_usage_rollup.sql` declares the continuous aggregate, in each case as stated here. Nothing checks the two against each other — `migration_probe` checks this crate's column constants against `0001_init.sql`, and `schema_integration_pg` reads the live table and every index back — so that remains a statement about the last schema pass and not a tested invariant. §4.5 is where what the code still trails is declared.
 
 #### Table: usage_records (hypertable)
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-records`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-records`
 
 | Column | Type | Description |
 | --- | --- | --- |
 | id | uuid | Deterministic gateway-derived entry identity (`UUIDv5` of the 6-tuple dedup identity, ADR-0007); persisted verbatim. |
 | tenant_id | uuid | Owning tenant. |
-| gts_type_id | text | The meter this entry was submitted against; typed and resolved entirely by `types-registry` — no FK, no catalog row here. |
-| type_key | int | Plugin-internal partitioning key of `gts_type_id` (`usage_type_key`); the hypertable's second partition dimension. |
+| gts_type_uuid | uuid | The `types-registry` Registry Reference of the meter this entry was submitted against, and the only meter identity this ledger stores; the GTS identifier is diagnostic on `MeterRef` and is not persisted. Typed and resolved entirely by `types-registry` — no FK, no catalog row here. |
+| type_key | int | Plugin-internal partitioning key of `gts_type_uuid` (`usage_type_key`); the hypertable's second partition dimension. |
 | quantity | numeric | Signed quantity; `numeric` with no typmod, so the submitted digits and scale round-trip verbatim across the published range, negative half included; never sign-constrained. |
 | window_start | timestamptz | Inclusive start of the covered period. |
 | window_end | timestamptz | Exclusive end of the covered period; the hypertable's primary partition dimension and the sole column every read-path range predicate selects on (ADR-0014). |
@@ -769,24 +733,24 @@ This section is the **target** schema; the migrations on this branch predate it 
 | entry_type | usage_entry_type | Enum `('record', 'invalidation')`, 4 bytes rather than a variable-length string, written from the dispatched entry's declared kind and never derived from another column. A dedup identity column in `usage_records_dedup_uniq`; `$filter=entry_type eq 'invalidation'` compares against it directly, the literal casting to the enum. |
 | accepted_at | timestamptz | Gear-assigned acceptance instant, stamped by the Ingestion Gateway. |
 | xact_id | xid8 | Id of the inserting transaction; default `pg_current_xact_id()`, never set by the Record Store. The feed order's first key (§3.6 `cpt-cf-uc-plugin-seq-feed-page`). |
-| metadata | jsonb | Caller metadata, stored as **semantic JSON, not as the submitted bytes**. `jsonb` holds a parsed document: it drops insignificant whitespace, does not preserve object-key order, and keeps only the last of duplicate keys. Values, their types and the document structure round-trip; the byte sequence does not. The type is load-bearing — the metadata predicate compiles to `metadata ->> $key` (§2.2), which `json` cannot serve — and no surface promises the bytes: a read returns the declared metadata *values* (`cpt-cf-usage-collector-fr-record-metadata`), and the collision comparison is over parsed documents (`caller_supplied_eq`, §3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`). |
+| metadata | jsonb | Caller metadata, stored as **semantic JSON, not as the submitted bytes**. `jsonb` holds a parsed document: it drops insignificant whitespace, does not preserve object-key order, and keeps only the last of duplicate keys. Values, their types and the document structure round-trip; the byte sequence does not. The type is load-bearing — the metadata predicate compiles to `metadata ->> $key` (§2.2), which `json` cannot serve — and no surface promises the bytes: a read returns the declared metadata *values* (`cpt-cf-usage-collector-fr-record-metadata`), and the collision comparison is over parsed documents (`caller_supplied_eq`, §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`). |
 
 **PK**: `(id, window_end, type_key)` (a hypertable's PRIMARY KEY must contain every partition column).
 
-**Constraints**: hypertable on `window_end` and on `type_key`; `UNIQUE (tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type, type_key)` (`usage_records_dedup_uniq`) is the **dedup authority**, reached via `INSERT … ON CONFLICT … DO NOTHING RETURNING` (§3.6) with the same seven columns as its conflict target — the gear's 6-tuple; `type_key` is carried only as a partition column (§2.2, `usage_type_key` below). `usage_records_window_ordered` (`window_start <= window_end`); `usage_records_invalidation_pairing` (`entry_type = 'invalidation'` exactly when `invalidates` and `reason_code` are both set; an ordinary measurement carries neither), which keeps the declared kind and the withdrawal fields from disagreeing in storage; `usage_records_subject_pairing` (`subject_type` requires `subject_id`).
+**Constraints**: hypertable on `window_end` and on `type_key`; `UNIQUE (tenant_id, gts_type_uuid, idempotency_key, window_start, window_end, entry_type, type_key)` (`usage_records_dedup_uniq`) is the **dedup authority**, reached via `INSERT … ON CONFLICT … DO NOTHING RETURNING` (§3.6) with the same seven columns as its conflict target — the gear's 6-tuple with its type component expressed as that type's Registry Reference; `type_key` is carried only as a partition column (§2.2, `usage_type_key` below). The gateway derives each entry `id` as a `UUIDv5` over the 6-tuple naming the *identifier*, and keeps doing so, so the constraint is no longer that tuple's columns; it partitions rows into **identical identity classes** all the same wherever an identifier and its Registry Reference are one-to-one, which `types-registry` ADR-0001 guarantees for its managed identifier profile and not for externally served identifiers carrying an explicit UUID tail. Where that map is many-to-one the reference-keyed classes are unions of the identifier-keyed ones — coarser, and so stricter — which makes this constraint **at least as strong** as the identifier-keyed one it replaces, and exactly as strong under the managed profile (§2.2, §3.1). `usage_records_window_ordered` (`window_start <= window_end`); `usage_records_invalidation_pairing` (`entry_type = 'invalidation'` exactly when `invalidates` and `reason_code` are both set; an ordinary measurement carries neither), which keeps the declared kind and the withdrawal fields from disagreeing in storage; `usage_records_subject_pairing` (`subject_type` requires `subject_id`).
 
-**Additional info**: `usage_records_invalidates_idx (invalidates, window_end, type_key) WHERE invalidates IS NOT NULL` is a lookup index for the aggregate fold's withdrawal-exclusion rule, not a constraint (at most one invalidation per target follows from the dedup identity: §3.1). `usage_records_tenant_type_window_idx (tenant_id, gts_type_id, window_end DESC)` and `usage_records_tenant_window_idx (tenant_id, window_end DESC)` support time-windowed reads; `usage_records_feed_idx (gts_type_id, xact_id, id)` serves the feed order, with the scope predicate applied as a filter (§4.1 item 7), and gives the retention sweep each type's highest position in a chunk (§3.6 `cpt-cf-uc-plugin-seq-retention-sweep`); `usage_records_watermark_idx (gts_type_id, tenant_id, accepted_at DESC)` serves the reconciliation acceptance watermark.
+**Additional info**: `usage_records_invalidates_idx (invalidates, window_end, type_key) WHERE invalidates IS NOT NULL` is a lookup index for the aggregate fold's withdrawal-exclusion rule, not a constraint (at most one invalidation per target follows from the dedup identity: §3.1). `usage_records_tenant_type_window_idx (tenant_id, gts_type_uuid, window_end DESC)` and `usage_records_tenant_window_idx (tenant_id, window_end DESC)` support time-windowed reads; `usage_records_feed_idx (gts_type_uuid, xact_id, id)` serves the feed order **per subscribed type** — one equality-driven, pathkey-preserving lateral iteration each, combined by a bounded outer sort over at most `subscription width × page limit` rows (§3.6, §4.1 item 7) — with the scope predicate applied as a filter, and gives the retention sweep each type's highest position in a chunk (§3.6 `cpt-cf-uc-plugin-seq-retention-sweep`); `usage_records_watermark_idx (gts_type_uuid, tenant_id, accepted_at DESC)` serves the reconciliation acceptance watermark.
 
 #### Table: usage_type_key
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-type-key`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-type-key`
 
 | Column | Type | Description |
 | --- | --- | --- |
-| gts_type_id | text | The GTS type this key names. |
-| type_key | int | Assigned once per `gts_type_id` (`GENERATED ALWAYS AS IDENTITY`); never changes once assigned. |
+| gts_type_uuid | uuid | The `types-registry` Registry Reference of the GTS type this key names. |
+| type_key | int | Assigned once per `gts_type_uuid` (`GENERATED ALWAYS AS IDENTITY`); never changes once assigned. |
 
-**PK**: `gts_type_id`
+**PK**: `gts_type_uuid`
 
 **Constraints**: `type_key` is `UNIQUE`.
 
@@ -794,15 +758,15 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_feed_retention_marks
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
 
 | Column | Type | Description |
 | --- | --- | --- |
-| gts_type_id | text | The GTS type whose deleted entries this mark covers. |
+| gts_type_uuid | uuid | The `types-registry` Registry Reference of the GTS type whose deleted entries this mark covers. |
 | xact_id | xid8 | With `id`, the highest feed position among the entries of this type that retention has deleted. |
 | id | uuid | Tie-breaker within `xact_id`, as in feed order. |
 
-**PK**: `gts_type_id`
+**PK**: `gts_type_uuid`
 
 **Constraints**: `xact_id` and `id` are `NOT NULL`.
 
@@ -810,7 +774,7 @@ This section is the **target** schema; the migrations on this branch predate it 
 
 #### Table: usage_rollup_1h
 
-**ID**: `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
 
 An hourly TimescaleDB continuous aggregate over `usage_records`, materialised real-time (`timescaledb.materialized_only = false`).
 
@@ -818,12 +782,12 @@ An hourly TimescaleDB continuous aggregate over `usage_records`, materialised re
 | --- | --- | --- |
 | bucket | timestamptz | `time_bucket(INTERVAL '1 hour', window_end)`. |
 | tenant_id | uuid | Grain leaf. |
-| gts_type_id | text | Grain leaf. |
-| type_key | int | Grain leaf; adds no rows (a function of `gts_type_id`) but lets reads and the retention sweep's rollup cut prune by type. |
+| gts_type_uuid | uuid | Grain leaf: the meter's `types-registry` Registry Reference. |
+| type_key | int | Grain leaf; adds no rows (a function of `gts_type_uuid`) but lets reads and the retention sweep's rollup cut prune by type. |
 | sum_value | numeric | Signed sum: `+quantity` for a record, `-quantity` for its invalidation. |
 | count_value | bigint | Signed count: `+1` for a record, `-1` for its invalidation. |
 
-**Keyed on**: `(bucket, tenant_id, gts_type_id, type_key)`.
+**Keyed on**: `(bucket, tenant_id, gts_type_uuid, type_key)`.
 
 **Constraints**: none of its own — it is a materialised `GROUP BY` over `usage_records`, not a base table.
 
@@ -877,25 +841,25 @@ With the defaults (§3.5), a late live write or a recent withdrawal appears with
 
 #### 5. Monotonic reads
 
-*Single-node topology.* Monotonic reads per `(tenant_id, gts_type_id)` hold on this deployment because every read and write lands on the same single Postgres node through the one pool (item 1). **Read replicas are what breaks this**: pointing any read path at a replica reintroduces replica lag and the guarantee no longer holds. Nothing in this plugin detects or compensates for that; it is a topology choice the operator makes.
+*Single-node topology.* Monotonic reads per `(tenant_id, gts_type_uuid)` hold on this deployment because every read and write lands on the same single Postgres node through the one pool (item 1). **Read replicas are what breaks this**: pointing any read path at a replica reintroduces replica lag and the guarantee no longer holds. Nothing in this plugin detects or compensates for that; it is a topology choice the operator makes.
 
 #### 6. Retention per GTS type
 
 Each type's **current** declared `retention` trait, read from `types-registry` and measured from the covered period's `window_end`, is what the retention sweep enforces (§2.2 Data Retention, §3.6 `cpt-cf-uc-plugin-seq-retention-sweep`) — never a table-wide TimescaleDB policy. **The retention floor is the deployer's obligation, not the plugin's.** The plugin does not check a type's declared retention against the rule below.
 
-**Feed readiness.** The gear sets a minimum retention of the backfill window plus one replay horizon (`cpt-cf-usage-collector-fr-billing-retention-floor`). This design extends that gear minimum for the feed with a single rule, which binds every GTS type, whatever consumes it, as the gear floor does: every GTS type MUST declare retention ≥ backfill window + `feed_replay_horizon_secs` + 2 × `feed_acceptance_slack_secs` + `statement_timeout_secs` (§3.6 `cpt-cf-uc-plugin-seq-feed-page`). The rule keeps every entry retention deletes at least `feed_replay_horizon_secs` + the acceptance-order slack past its acceptance, so the feed's retention mark never refuses a position within the horizon on account of its own scope, nor a consumer that keeps polling at the head outside the long-transaction case (§3.6 Retention refusal, Known shortfall). The plugin reads the horizon from configuration because the SPI does not carry it, and refuses a position after which retention has deleted an entry of a subscribed type — never on the position's own age (§3.6 Retention refusal). A first read begins at the oldest entry the subscription retains, as the gear requires (§3.6 First read), so this rule also fixes how far back a new consumer's first connect replays. The retention mark is kept per GTS type and ignores the compiled scope, so it can refuse a cursor whose own scope lost nothing — the granularity the gateway's rule names, not a shortfall (§3.6 Retention refusal, Refusal granularity). This retention rule is a plugin assumption.
+**Feed readiness.** The gear sets a minimum retention of the backfill window plus one replay horizon (`cpt-cf-usage-collector-fr-billing-retention-floor`). This design extends that gear minimum for the feed with a single rule, which binds every GTS type, whatever consumes it, as the gear floor does: every GTS type MUST declare retention ≥ backfill window + the deployment replay horizon + 2 × `feed_acceptance_slack_secs` + `statement_timeout_secs` (§3.6 `cpt-cf-uc-plugin-seq-feed-page`). The rule keeps every entry retention deletes at least the deployment replay horizon + the acceptance-order slack past its acceptance, so the feed's retention mark never refuses a position within the horizon on account of its own scope, nor a consumer that keeps polling at the head outside the long-transaction case (§3.6 Retention refusal, Known shortfall). The plugin does not read the replay horizon; it refuses a position after which retention has deleted an entry of a subscribed type — never on the position's own age (§3.6 Retention refusal). A first read begins at the oldest entry the subscription retains, as the gear requires (§3.6 First read), so this rule also fixes how far back a new consumer's first connect replays. The retention mark is kept per GTS type and ignores the compiled scope, so it can refuse a cursor whose own scope lost nothing — the granularity the gateway's rule names, not a shortfall (§3.6 Retention refusal, Refusal granularity). This retention rule is a plugin assumption.
 
 #### 7. Sustained bulk read rate
 
-The feed reads `usage_records_feed_idx (gts_type_id, xact_id, id)` (§3.7) as an index-ordered merge across the chunks retention keeps. The scope predicate is applied as a filter on the index-ordered merge. A consumer whose scope admits a small share of a subscription reads the whole subscription's index range to fill a page, and the confirming test measures a narrow scope as well as a full one. **Target**: `cpt-cf-usage-collector-nfr-replay-throughput` requires a consumer 24 hours behind to catch up within 6 hours — at the launch planning assumption of ≤ 10,000,000 entries/hour/region for a charging subscription, ≥ 50,000,000 entries/hour/region. **Not measured**: the test that would produce the number replays a 24-hour backlog of a subscription at that arrival rate while ingestion runs at the throughput-profile envelope, and also times a first read's first page over that subscription (§3.6 First read). **Outside the documented posture** — a subscription arriving faster than the planning assumption, a replica read path, or a shared PostgreSQL instance — the deployer republishes items 1, 2, 5 and 7 against a measurement before the deployment feeds a charging consumer.
+The feed reads `usage_records_feed_idx (gts_type_uuid, xact_id, id)` (§3.7) as an index-ordered read **per subscribed type — one equality-driven lateral iteration each, combined by a bounded outer sort over at most `subscription width × page limit` rows; the sort never sees the whole backlog** — across the chunks retention keeps. The scope predicate is applied as a filter inside each per-type read. A consumer whose scope admits a small share of a subscription reads the whole subscription's index range to fill a page, and the confirming test measures a narrow scope as well as a full one. **Target**: `cpt-cf-usage-collector-nfr-replay-throughput` requires a consumer 24 hours behind to catch up within 6 hours — at the launch planning assumption of ≤ 10,000,000 entries/hour/region for a charging subscription, ≥ 50,000,000 entries/hour/region. **Not measured**: the test that would produce the number replays a 24-hour backlog of a subscription at that arrival rate while ingestion runs at the throughput-profile envelope, and also times a first read's first page over that subscription (§3.6 First read). **Outside the documented posture** — a subscription arriving faster than the planning assumption, a replica read path, or a shared PostgreSQL instance — the deployer republishes items 1, 2, 5 and 7 against a measurement before the deployment feeds a charging consumer.
 
 #### 8. Ingestion batching
 
-*The answer is negative, and nothing here is measured.* The plugin does **not** coalesce concurrent `create_usage_record`/`create_usage_records` calls from separate callers into one backend write. Batching is entirely caller-driven: one multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT … DO NOTHING` per `create_batch` call (§3.6 `cpt-cf-uc-plugin-seq-ingest-batch`), sized by whatever the caller passed in. A target batch size and a longest coalescing wait are therefore **not applicable** to this backend. **Planning shares (gear DESIGN §3.11.2, not a gate)**: persist p95 ≤ 75ms and aggregated-query p95 ≤ 425ms. **Not measured**: a load test driving concurrent `create_usage_record`/`create_usage_records` and `query_aggregated_usage_records` traffic against a sized deployment is what would produce them.
+*The answer is negative, and nothing here is measured.* The plugin does **not** coalesce concurrent `create_usage_records` calls from separate callers into one backend write. Batching is entirely caller-driven: one multi-row `INSERT … SELECT FROM UNNEST(…) ON CONFLICT … DO NOTHING` per `create_batch` call (§3.6 `cpt-cf-uc-plugin-seq-ingest-batch`), sized by whatever the caller passed in. A target batch size and a longest coalescing wait are therefore **not applicable** to this backend. **Planning shares (gear DESIGN §3.11.2, not a gate)**: persist p95 ≤ 75ms and aggregated-query p95 ≤ 425ms. **Not measured**: a load test driving concurrent `create_usage_records` and `query_aggregated_usage_records` traffic against a sized deployment is what would produce them.
 
 #### 9. Dedup level
 
-`linearizable`. The **convergence bound is zero**: a single Postgres primary decides every write as it commits, so there is no interval during which a write is acknowledged but not yet decided. Races under one dedup identity resolve in Postgres **commit order** through `ON CONFLICT … DO NOTHING` (§2.2 Dedup-Key Identity & Retention-Bounded Preservation, §3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`): the first write to commit is the survivor, and convergence is established at that transaction's own commit — never from elapsed time. `uc_timescaledb_dedup_late_convergence_total` counts a write discarded after its identity converged and stays at **zero** under this level, since nothing here is decided after convergence. No divergent-discard metric is needed or published: that obligation applies to `eventual` only, and this plugin is `linearizable`. **Late-committing writes.** A transaction that exceeds `transaction_timeout_secs` is aborted by Postgres, so nothing commits late. If the host abandons a call after `COMMIT` was sent, the entry persists as the survivor: its identity converged at that commit, so no decision is taken after convergence, and the caller's retry is absorbed when identical and `IdempotencyConflict` when divergent. An insert that reaches the store after another write converged the identity is discarded by `ON CONFLICT … DO NOTHING`. `UsageRecordNotConverged` is never returned (§3.6 `cpt-cf-uc-plugin-seq-converged-lookup`).
+`linearizable`. The **convergence bound is zero**: a single Postgres primary decides every write as it commits, so there is no interval during which a write is acknowledged but not yet decided. Races under one dedup identity resolve in Postgres **commit order** through `ON CONFLICT … DO NOTHING` (§2.2 Dedup-Key Identity & Retention-Bounded Preservation, §3.6 `cpt-cf-uc-plugin-seq-ingest-batch`): the first write to commit is the survivor, and convergence is established at that transaction's own commit — never from elapsed time. `uc_timescaledb_dedup_late_convergence_total` counts a write discarded after its identity converged and stays at **zero** under this level, since nothing here is decided after convergence. No divergent-discard metric is needed or published: that obligation applies to `eventual` only, and this plugin is `linearizable`. **Late-committing writes.** A transaction that exceeds `transaction_timeout_secs` is aborted by Postgres, so nothing commits late. If the host abandons a call after `COMMIT` was sent, the entry persists as the survivor: its identity converged at that commit, so no decision is taken after convergence, and the caller's retry is absorbed when identical and `IdempotencyConflict` when divergent. An insert that reaches the store after another write converged the identity is discarded by `ON CONFLICT … DO NOTHING`. `UsageRecordNotConverged` is never returned (§3.6 `cpt-cf-uc-plugin-seq-converged-lookup`).
 
 ### 4.2 Published Limits
 
@@ -915,7 +879,7 @@ The plugin emits OpenTelemetry push metrics under the `uc_timescaledb_` sub-name
 
 | Metric | Type | Labels | Target |
 | --- | --- | --- | --- |
-| `uc_timescaledb_insert_duration_seconds` | Histogram | `mode` (`single`, `batch`) | brackets the bulk-ingestion envelope (`cpt-cf-usage-collector-nfr-throughput`); `mode="batch"`: † |
+| `uc_timescaledb_insert_duration_seconds` | Histogram | — | brackets the bulk-ingestion envelope (`cpt-cf-usage-collector-nfr-throughput`): † |
 | `uc_timescaledb_query_duration_seconds` | Histogram | `query_kind` (`aggregated`, `raw`) | aggregated p95 ≤ 500ms over a 30-day single-tenant range (`cpt-cf-usage-collector-nfr-query-latency`); `query_kind="raw"`: † |
 | `uc_timescaledb_pool_acquire_duration_seconds` | Histogram | — | bounded by `connection_timeout_secs` (10s, §3.5) |
 | `uc_timescaledb_feed_page_duration_seconds` | Histogram | — | † |
@@ -934,7 +898,7 @@ The plugin emits OpenTelemetry push metrics under the `uc_timescaledb_` sub-name
 | `uc_timescaledb_batch_rows` | Histogram | — | — |
 | `uc_timescaledb_query_requests_total` | Counter | `query_kind` (`aggregated`, `raw`) | — |
 
-> `uc_timescaledb_pool_connections_active`/`_idle` are read from the pool handle on each collection cycle (callback-based, no DB I/O). `uc_timescaledb_dedup_absorbed_total` increments on exact-equality retries silently absorbed on the 6-tuple `ON CONFLICT` path (§3.6 ingest-dedup); `uc_timescaledb_dedup_stale_total` counts the retention-race `Transient` of §3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`. `uc_timescaledb_batch_rows` records the row count per `create_usage_records` write so write amortization is observable, and its *sum* is the bulk-ingestion throughput SLI below — records per second, the unit `cpt-cf-usage-collector-nfr-throughput` is stated in. The insert histogram's `_count` must not be read as throughput: it observes once per write call, so a one-row write and a ten-thousand-row write are one observation each, and its rate tracks call frequency rather than records — it moves when batch size changes at constant throughput. Read the two together: rows falling while calls hold steady is a shrinking batch, calls falling while rows hold steady is a coarser one, and both falling is a real throughput loss; `uc_timescaledb_query_requests_total` exposes the aggregated-vs-raw workload mix.
+> `uc_timescaledb_pool_connections_active`/`_idle` are read from the pool handle on each collection cycle (callback-based, no DB I/O). `uc_timescaledb_dedup_absorbed_total` increments on exact-equality retries silently absorbed on the 6-tuple `ON CONFLICT` path (§3.6 ingest-batch); `uc_timescaledb_dedup_stale_total` counts the `Transient` of §3.6 `cpt-cf-uc-plugin-seq-ingest-batch` raised when a write lost its dedup slot and the row that took it could not then be read back, whatever made it unreadable — the retention race the counter is named for is one cause and not the only one, though a deployer-set `default_transaction_isolation = repeatable read` is no longer among them, since every request-path connection now forces `read committed` (§3.5). `uc_timescaledb_batch_rows` records the row count per `create_usage_records` write so write amortization is observable, and its *sum* is the bulk-ingestion throughput SLI below — records per second, the unit `cpt-cf-usage-collector-nfr-throughput` is stated in. The insert histogram's `_count` must not be read as throughput: it observes once per write call, so a one-row write and a ten-thousand-row write are one observation each, and its rate tracks call frequency rather than records — it moves when batch size changes at constant throughput. Read the two together: rows falling while calls hold steady is a shrinking batch, calls falling while rows hold steady is a coarser one, and both falling is a real throughput loss; `uc_timescaledb_query_requests_total` exposes the aggregated-vs-raw workload mix.
 
 #### Reliability Metrics
 
@@ -951,11 +915,11 @@ The plugin emits OpenTelemetry push metrics under the `uc_timescaledb_` sub-name
 | `uc_timescaledb_feed_cursor_refusals_total` | Counter | — | — |
 | `uc_timescaledb_stale_acceptance_rejections_total` | Counter | — | — |
 
-> `uc_timescaledb_backend_errors_total` is keyed by the SPI's `Transient`/`Internal` classification via the `error_category` label (§2.1 SPI Conformance); `uc_timescaledb_batch_retries_total` increments once per bounded in-process `create_batch` retry after a transient backend error (deadlock-victim self-heal, §3.6), so a retried-and-recovered write is distinguishable from a `Transient` bubbled to the host; `uc_timescaledb_idempotency_conflicts_total` counts canonical-field-mismatch `IdempotencyConflict` results; `uc_timescaledb_invalidations_total` counts accepted withdrawal entries (§3.1 Invalidation). `uc_timescaledb_dedup_late_convergence_total` is recorded once at zero at startup so the series exports even though it never fires under this plugin's `linearizable` level (§4.1 item 9).
+> `uc_timescaledb_backend_errors_total` is keyed by the SPI's `Transient`/`Internal` classification via the `error_category` label (§2.1 SPI Conformance); `uc_timescaledb_batch_retries_total` increments once per bounded in-process `create_batch` retry after a transient backend error (§3.6 lists the causes that reach the retry), so a retried-and-recovered write is distinguishable from a `Transient` bubbled to the host; `uc_timescaledb_idempotency_conflicts_total` counts canonical-field-mismatch `IdempotencyConflict` results; `uc_timescaledb_invalidations_total` counts accepted withdrawal entries (§3.1 Invalidation). `uc_timescaledb_dedup_late_convergence_total` is recorded once at zero at startup so the series exports even though it never fires under this plugin's `linearizable` level (§4.1 item 9).
 >
 > `uc_timescaledb_ready` is a plugin-local backend-health gauge — set to 1 after a successful pool build + migration, cleared when the backend is unreachable (a connection cannot be established) and re-armed on the next successful acquire. A pool-acquire timeout while the pool stands at `pool_size_max` is saturation rather than unreachability and leaves the gauge set: it surfaces as `Transient` with a retry hint, and the pool gauges plus the saturation alert below are what make it visible. Clearing readiness for it would flap the gauge under load and fire the readiness alert for a backend that is healthy but busy. It is **distinct** from the host-computed structural `uc_plugin_ready` gauge in the gear (§3.11.5) and is **not** a background probe.
 >
-> `uc_timescaledb_feed_horizon_lag_seconds` is `now()` minus the earliest `xact_start` among backends in `pg_stat_activity` whose `backend_xid` is not null, as visible to the plugin role — the lag between acceptance and feed visibility the settled horizon imposes (§4.1 item 2) — sampled by the Gear component's background loop (§3.2). It is **best-effort**: it is left unset when the plugin role cannot see other roles' sessions, it misses a prepared transaction, which has no backend, and no startup check backs it. `uc_timescaledb_feed_cursor_refusals_total` counts `CursorBeyondRetention` refusals, raised when a retention mark stands above the presented position (§3.6 `cpt-cf-uc-plugin-seq-feed-page`, Retention refusal); a sustained rate means consumers are falling behind what the deployment retains; a refusal of a consumer that polls at the head is the long-transaction shortfall (§3.6 Retention refusal, Known shortfall; §4.5). `uc_timescaledb_stale_acceptance_rejections_total` counts the write-time slack check's `Transient` rejections (§3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`, `-ingest-batch`); a sustained rate means gateway clock skew, dispatch delay or retry churn exceeds the configured `feed_acceptance_slack_secs`.
+> `uc_timescaledb_feed_horizon_lag_seconds` is `now()` minus the earliest `xact_start` among backends in `pg_stat_activity` whose `backend_xid` is not null, as visible to the plugin role — the lag between acceptance and feed visibility the settled horizon imposes (§4.1 item 2) — sampled by the Gear component's background loop (§3.2). It is **best-effort**: it is left unset when the plugin role cannot see other roles' sessions, it misses a prepared transaction, which has no backend, and no startup check backs it. `uc_timescaledb_feed_cursor_refusals_total` counts `CursorBeyondRetention` refusals, raised when a retention mark stands above the presented position (§3.6 `cpt-cf-uc-plugin-seq-feed-page`, Retention refusal); a sustained rate means consumers are falling behind what the deployment retains; a refusal of a consumer that polls at the head is the long-transaction shortfall (§3.6 Retention refusal, Known shortfall; §4.5). `uc_timescaledb_stale_acceptance_rejections_total` counts the write-time slack check's `Transient` rejections (§3.6 `cpt-cf-uc-plugin-seq-ingest-batch`); a sustained rate means gateway clock skew, dispatch delay or retry churn exceeds the configured `feed_acceptance_slack_secs`.
 
 #### Security Metrics
 
@@ -998,7 +962,7 @@ The plugin emits OpenTelemetry push metrics under the `uc_timescaledb_` sub-name
 
 #### Label cardinality
 
-All labels are bounded to the enumerated value sets above. Unbounded identifiers — `tenant_id`, `gts_type_id`, `id`, `idempotency_key`, `invalidates`, `request_id`, `trace_id` — MUST NOT be used as metric labels; they belong in structured logs and distributed traces, not in metric dimensions.
+All labels are bounded to the enumerated value sets above. Unbounded identifiers — `tenant_id`, `gts_type_id`, `gts_type_uuid`, `id`, `idempotency_key`, `invalidates`, `request_id`, `trace_id` — MUST NOT be used as metric labels; they belong in structured logs and distributed traces, not in metric dimensions.
 
 **Distributed tracing**: each SPI dispatch runs inside the ambient tracing span opened by the host; the plugin opens no root span and records its SQL work under that span, so backend latency is attributable end-to-end through the host's `trace_id`.
 
@@ -1013,15 +977,15 @@ All labels are bounded to the enumerated value sets above. Unbounded identifiers
 
 Columnar compression is deferred; it is additive and does not change the SPI surface.
 
-**This design is normative, and this branch's plugin code predates it**, down to its SPI shape: the code still carries the usage-type catalog and deactivation methods and the superseded schema, the SDK carries no SPI contract suite, and `README.md` still describes the superseded configuration. File, module, function and test names this design gives are the target layout, not a description of this branch. The code slice that implements this design derives its work from the design itself, not from a list kept here.
+**This design is normative, and the code has been catching up to it rather than the other way round.** SPI-suite conformance is asserted by `tests/contract_conformance_pg.rs`, which runs the driven contract suite against a live backend and expects no violations. It is not a list of everything this design states and the code does not do: an obligation no contract check reaches, such as a throughput rate or a pruning key, is outside it, and `DECOMPOSITION.md`'s checkboxes are where those stand. File, module, function and test names this design gives are a target layout rather than a description of the tree. The code that implements this design derives its work from the design itself, not from a list kept here.
 
 **To verify when implementing**, on `timescale/timescaledb:2.29.2-pg18`:
 
 - `xid8` as a column on a hypertable, and `pg_snapshot_xmin` as the settled horizon.
-- The ordered merge on `usage_records_feed_idx` across chunks, with and without a narrow scope predicate.
+- The per-type ordered read on `usage_records_feed_idx`, combined by a bounded outer sort, across chunks, with and without a narrow scope predicate.
 - Plan-time chunk exclusion: a chunk committed just before a page's snapshot is in the page statement's plan.
 - Cached plans: a prepared plan cached before a chunk was created would skip that chunk, which the unprepared statements avoid.
-- A page statement with no position lower bound plans the ordered merge from the first chunk retention keeps.
+- A page statement with no position lower bound plans each per-type read from the first chunk retention keeps.
 - A refresh policy with `buckets_per_batch` commits each batch in its own transaction.
 - The `LATEST` memory bound of §4.2.
 - A narrow compiled scope over a busy subscription fills a feed page within `statement_timeout_secs` (§4.1 item 7).
@@ -1032,7 +996,7 @@ Columnar compression is deferred; it is additive and does not change the SPI sur
 
 ### 4.6 Testing Architecture
 
-This subsection is the **target** test architecture; §4.5 says the code on this branch predates it. Integration tests run against a real TimescaleDB via `testcontainers` (the `timescale/timescaledb` image, pulled on demand), gated behind the `postgres` Cargo feature and requiring Docker:
+This subsection is the **target** test architecture; §4.5 says where to read what still trails it. Integration tests run against a real TimescaleDB via `testcontainers` (the `timescale/timescaledb` image, pulled on demand), gated behind the `postgres` Cargo feature and requiring Docker:
 
 ```sh
 cargo test -p cf-gears-timescaledb-usage-collector-plugin --features postgres
@@ -1042,9 +1006,9 @@ Without the feature, only unit tests run (no Docker needed). The target suites, 
 
 | Suite | Covers |
 | --- | --- |
-| Contract conformance | The DESIGN §3.3 SPI contract suite from the SDK — the acceptance criterion for the port; the keyset obligations are covered by the query suite. |
-| Record ingest | Ingest: dedup outcomes (absorb / conflict), the write-time acceptance-slack check, `xact_id`/`id` feed-position assignment, at most one invalidation as a dedup outcome, a record and its invalidation with the same key and covered period both persisting, a record retry and an invalidation retry each absorbed against its own row, a batch holding retries of both a stored record and its invalidation resolving each against its own row, and per-row batch outcomes aligned with input order (§3.6 `cpt-cf-uc-plugin-seq-ingest-dedup`, `-ingest-batch`). |
-| Record query | List, get and aggregate: the read paths, and the keyset obligations (`$orderby`, gateway-decoded keysets, page boundaries) the contract suite structurally cannot reach (§3.6 `cpt-cf-uc-plugin-seq-list-keyset`, `-query-aggregated`). |
+| Contract conformance | The DESIGN §3.3 SPI contract suite from the SDK — the acceptance criterion for the port; its `raw-page-keyset-walk` and `raw-page-caller-order` checks reach the keyset obligations too, dispatched through the SPI trait rather than against the store directly. |
+| Record ingest | Ingest: dedup outcomes (absorb / conflict), the write-time acceptance-slack check, `xact_id`/`id` feed-position assignment, at most one invalidation as a dedup outcome, a record and its invalidation with the same key and covered period both persisting, a record retry and an invalidation retry each absorbed against its own row, a batch holding retries of both a stored record and its invalidation resolving each against its own row, and per-row batch outcomes aligned with input order (§3.6 `cpt-cf-uc-plugin-seq-ingest-batch`). |
+| Record query | List, get and aggregate against `PgRecordStore` directly, below the SPI trait: the read paths, and keyset-obligation specifics no contract-suite fixture constructs — every one of `KEYSET_SAFE_RECORD_FIELDS` as an admissible `$orderby` field, a keyset walked across a page boundary in both directions, and a page boundary falling between an invalidation and its target (§3.6 `cpt-cf-uc-plugin-seq-list-keyset`, `-query-aggregated`). |
 | Feed and reconciliation | Feed pages and reconciliation reads (§3.6 `cpt-cf-uc-plugin-seq-feed-page`, `cpt-cf-uc-plugin-seq-reconciliation`), including that an out-of-scope entry is absent from pages and positions. |
 | Rollup aggregate | The rollup read path against the exact scan over the same data, proving the equivalence §4.1 item 4 states (§3.6 `cpt-cf-uc-plugin-seq-query-aggregated`). |
 | Retention sweep | The retention sweep against a stub retention source whose values a test can amend between sweeps (§2.2 Data Retention, §3.6 `cpt-cf-uc-plugin-seq-retention-sweep`). |
@@ -1055,16 +1019,16 @@ Without the feature, only unit tests run (no Docker needed). The target suites, 
 
 Several suites also drive counter series they assert on by name. Each name is checked against the instrument names the metrics module declares, not hand-copied, so a renamed instrument fails those assertions rather than silently reading back a stale name.
 
-The crate compiles against the SDK trait, which gives compile-time type conformance once the trait carries the target SPI.
+The crate compiles against the SDK trait, which carries the target SPI and so gives compile-time type conformance to it.
 
 ## 5. Traceability
 
 - **Plugin PRD**: [`PRD.md`](./PRD.md)
 - **Gear PRD**: [`PRD.md`](../../../docs/PRD.md)
 - **Gear DESIGN**: [`DESIGN.md`](../../../docs/DESIGN.md) — §2.1 cursor gateway ownership, §3.1 invariants, §3.3 SPI and obligations, §3.7 delegates table shapes here, §3.10 the consistency profile, §3.11 budgets and the metric namespace
-- **Operator guide**: [`README.md`](../README.md) — predates §3.5 (§4.5); §3.5 and §4 above are normative
-- **SPI trait**: [`usage-collector-sdk/src/plugin_api.rs`](../../../usage-collector-sdk/src/plugin_api.rs) — predates the target SPI (§4.5)
-- **Schema on this branch** (predates §3.7, see §4.5): [`migrations/0001_init.sql`](../migrations/0001_init.sql), [`migrations/0002_rename_uuid_to_id.sql`](../migrations/0002_rename_uuid_to_id.sql)
+- **Operator guide**: [`README.md`](../README.md) — §3.5 and §4 above are normative
+- **SPI trait**: [`usage-collector-sdk/src/plugin_api.rs`](../../../usage-collector-sdk/src/plugin_api.rs)
+- **Schema**: [`migrations/0001_init.sql`](../migrations/0001_init.sql) (§3.7), [`migrations/0002_usage_rollup.sql`](../migrations/0002_usage_rollup.sql)
 - **Reference wiring**: [`plugins/noop-usage-collector-plugin/src/module.rs`](../../noop-usage-collector-plugin/src/module.rs)
 - **ADRs**: [`0002 pluggable storage`](../../../docs/ADR/0002-cpt-cf-usage-collector-adr-pluggable-storage.md), [`0004 mandatory idempotency`](../../../docs/ADR/0004-cpt-cf-usage-collector-adr-mandatory-idempotency.md), [`0006 consistency contract`](../../../docs/ADR/0006-cpt-cf-usage-collector-adr-consistency-contract.md), [`0007 record identity derivation`](../../../docs/ADR/0007-cpt-cf-usage-collector-adr-record-identity-derivation.md), [`0008 registry-owned typing`](../../../docs/ADR/0008-cpt-cf-usage-collector-adr-registry-owned-typing.md), [`0009 declared fold`](../../../docs/ADR/0009-cpt-cf-usage-collector-adr-declared-fold.md), [`0010 append-only invalidation`](../../../docs/ADR/0010-cpt-cf-usage-collector-adr-append-only-invalidation.md), [`0011 feed/aggregate split`](../../../docs/ADR/0011-cpt-cf-usage-collector-adr-feed-aggregate-split.md), [`0014 window-end selection`](../../../docs/ADR/0014-cpt-cf-usage-collector-adr-window-end-selection.md)
 - **Gateway assumptions**: §2.2 Gateway-Owned Cursors, §3.6 `cpt-cf-uc-plugin-seq-feed-page` (Head position, Retention refusal) and `cpt-cf-uc-plugin-seq-reconciliation`, and §4.1 items 1 and 6 state the gateway-side assumptions and shortfalls this design relies on; plugin PRD §13 lists the open questions.

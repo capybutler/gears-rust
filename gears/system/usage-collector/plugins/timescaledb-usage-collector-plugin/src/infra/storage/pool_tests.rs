@@ -56,27 +56,61 @@ fn connect_options_rejects_malformed_dsn() {
 }
 
 #[test]
-fn connection_gucs_bind_statement_and_fixed_lock_timeout() {
-    // The statement timeout is config-driven (seconds -> `<n>s`); the lock timeout
-    // is a fixed constant so a contended row lock fails fast rather than blocking.
-    let gucs = connection_gucs(45);
-    assert_eq!(gucs[0], ("statement_timeout", "45s".to_owned()));
-    assert_eq!(gucs[1], ("lock_timeout", LOCK_TIMEOUT.to_owned()));
+fn connection_gucs_bind_both_timeouts_the_lock_timeout_and_the_isolation_level() {
+    // Both the statement and the transaction timeout are config-driven
+    // (seconds -> `<n>s`) and distinct values are passed so one cannot stand in
+    // for the other; the lock timeout is a fixed constant so a contended lock
+    // fails fast rather than blocking. `default_transaction_isolation` is not a
+    // bound at all but a correctness dependency of the write path's conflict
+    // read-back ([`DEFAULT_TRANSACTION_ISOLATION`]).
+    // Compared whole, as slices, rather than index by index: a GUC added to the
+    // set would otherwise slip past assertions that only pin the entries already
+    // there, and comparing as slices makes the added entry a test failure naming
+    // it rather than a type error on the array length.
+    assert_eq!(
+        connection_gucs(45, 90).as_slice(),
+        [
+            ("statement_timeout", "45s".to_owned()),
+            ("transaction_timeout", "90s".to_owned()),
+            ("lock_timeout", LOCK_TIMEOUT.to_owned()),
+            (
+                "default_transaction_isolation",
+                DEFAULT_TRANSACTION_ISOLATION.to_owned()
+            ),
+        ]
+        .as_slice()
+    );
 }
 
 #[test]
-fn pool_connect_options_sets_statement_and_lock_timeouts() {
-    // The request-path connect options must carry both GUCs as `-c` startup
+fn pool_connect_options_sets_both_timeouts_the_lock_timeout_and_the_isolation_level() {
+    // The request-path connect options must carry the GUCs as `-c` startup
     // parameters so every pooled connection is bounded at connect time.
-    let opts = pool_connect_options("postgres://u:p@h/db?sslmode=require", 45).expect("valid dsn");
+    let opts =
+        pool_connect_options("postgres://u:p@h/db?sslmode=require", 45, 90).expect("valid dsn");
     let applied = opts.get_options().expect("runtime options must be set");
     assert!(
         applied.contains("statement_timeout=45s"),
         "statement_timeout GUC missing; got: {applied}"
     );
     assert!(
+        applied.contains("transaction_timeout=90s"),
+        "transaction_timeout GUC missing; got: {applied}"
+    );
+    assert!(
         applied.contains("lock_timeout=5s"),
         "lock_timeout GUC missing; got: {applied}"
+    );
+    // Pinned in its **escaped** spelling, not as the bare value. The `options`
+    // startup parameter is space-separated, so the space in `read committed`
+    // has to reach the server as `\ ` or the server reads a second, malformed
+    // option. sqlx escapes it (`PgOptionsWriteEscaped`), and this is the
+    // assertion that notices if that ever stops being true: a bare-space
+    // spelling would connect, silently drop the GUC, and leave the write path's
+    // conflict read-back on whatever the server defaults to.
+    assert!(
+        applied.contains(r"default_transaction_isolation=read\ committed"),
+        "default_transaction_isolation GUC missing or unescaped; got: {applied}"
     );
     // TLS enforcement from `connect_options` still applies through the same builder.
     assert!(

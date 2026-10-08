@@ -7,31 +7,44 @@
 # STATUS: unreleased. This file describes the Phase 2 metering model
 # (registry-owned GTS type declarations, declared aggregation folds,
 # invalidation-only corrections, interval usage windows, usage feed,
-# isolated backfill, reconciliation). It is the *target* contract, not the
-# served one: the routes registered today, `usage-collector-sdk`, and the
-# TimescaleDB plugin all still implement the superseded Phase 1 surface.
+# isolated backfill, reconciliation). The marker stays `unreleased` because
+# the surface is not yet frozen for downstream consumers, not because it is
+# unverified: the REST routes now register the Phase 2 operation set, and
+# `usage-collector-sdk` and the TimescaleDB plugin are the two sides this
+# document does not describe and does not check.
 #
-# The divergence is deliberate and expected. This gear moves its
-# specification first and lets the implementation follow, so the document
-# leads the code for one cycle by decision rather than by neglect; the debt
-# is carried in DESIGN.md 3.12.2.
+# This gear moved its specification first and let the implementation
+# follow, by decision rather than by neglect; the remaining debt is carried
+# in DESIGN.md 3.12.2.
 #
-# What that costs, stated plainly: for as long as the marker below reads
-# `unreleased`, the six checks in `openapi_contract_tests.rs` that compare
-# this document against the registered routes are `#[ignore]`d, so no CI
-# job diffs the two. Do not generate a client from this file and expect it
-# to work against a running gear. The YAML-internal checks (every `$ref`
-# resolves) and the registry-internal checks stay live, so neither side is
-# free to rot on its own, and both operation counts are pinned, so the gap
-# can neither widen nor close unnoticed.
+# What is enforced, stated plainly: `openapi_contract_tests.rs` carries 13
+# tests and **no** `#[ignore]` — the only `ignore` in the file is a doc
+# comment arguing against using one — and every one of them runs on every
+# CI job while this marker still reads `unreleased`. They diff this
+# document against what `OperationBuilder` actually registers: the
+# operation set and both counts (7 and 7), methods, operation ids, tags,
+# parameters by name / location / required, request bodies, 2xx responses,
+# the canonical error set, the per-operation authentication posture, and
+# that every component the runtime publishes is documented — alongside the
+# YAML-internal check that every `$ref` resolves.
+#
+# Where the two sides still disagree, the disagreement is enumerated
+# rather than waived: `UNDOCUMENTED_PARAMETERS` names the `$top` spelling
+# and the `metadata.<key>` side channel, which OpenAPI cannot declare.
+# The list is itself guarded by a test that fails the moment one of its
+# entries stops being a real gap, so it cannot become a standing exemption
+# and the gap can neither widen nor close unnoticed.
 
 openapi: 3.1.0
 
 # Machine-readable form of the STATUS note above, so a reader of the
 # document alone — a client generator, a downstream gear — sees the same
-# thing a reader of the test module does. Flipping this to `released` is
-# the same edit as removing those six `#[ignore]`s: a live test holds the
-# two together.
+# thing a reader of the test module does. Flipping this to `released`
+# records that the surface is frozen for downstream consumers; it is
+# **not** a change of enforcement, because the document-vs-code comparison
+# is already live either way. What the flip has to be paired with is
+# emptying `UNDOCUMENTED_PARAMETERS`, since a frozen surface cannot keep
+# an enumerated divergence from the code that serves it.
 x-contract-status: unreleased
 info:
   title: Usage Collector API
@@ -160,6 +173,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateUsageRecordsResponse"
+        "429":
+          $ref: "#/components/responses/QuotaExceeded"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -175,8 +190,9 @@ paths:
 
         An entry is selected when the end of its covered period falls in
         the requested range (`from <= window_end < to`), whatever the length
-        of that period. Pagination is keyset-stable over `(window_end, id)`,
-        which a caller `$orderby` prefixes rather than replaces.
+        of that period. Pagination is keyset-stable over an order naming
+        both `window_end` and `id`, which a caller `$orderby` extends
+        rather than replaces (DESIGN.md §3.1, Order admissibility).
 
         Declared metadata properties are filtered by repeated
         `metadata.<key>=<value>` query parameters, for example
@@ -239,6 +255,61 @@ paths:
         entry itself, each contribute nothing to the selected set. Because
         the invalidation carries the target's covered period, no requested
         range selects one of the pair without the other.
+
+        Declared metadata properties are filtered by repeated
+        `metadata.<key>=<value>` query parameters, for example
+        `?metadata.region=eu&metadata.region=us&metadata.tier=gold`. Each
+        distinct `<key>` forms one filter and its repetitions form that
+        filter's value set. `MetadataFilter` is the normative definition of
+        the predicate they build, and it bounds them. These parameters are
+        specified here rather than under `parameters` below because OpenAPI
+        cannot declare a parameter whose name carries a placeholder.
+
+        The covered period travels in `AggregationRequest.time_range` on
+        this operation, not in `from` / `to`: this operation declares
+        neither, and the gear refuses both if a caller sends them. (The
+        shared `Filter` parameter below carries a description written for
+        `GET /records`, where the period genuinely is carried by `from` /
+        `to` — not here.)
+
+        `gts_type_id` and `$filter`, published below as query parameters,
+        and the `metadata.<key>` side channel above, were all three body
+        properties of `AggregationRequest` (as `gts_type_id`, `filter` and
+        `metadata_filter`) before this operation's contract was corrected to
+        match the gear; narrowing `AggregationRequest` to the two properties
+        the DTO actually carries removed all three, and with them,
+        `metadata_filter`'s `maxItems: 16` — the only machine-checkable cap
+        this correction is recorded as costing until now.
+
+        **The real cost is five constraints, not one.** `MetadataFilter`
+        names `values.maxItems: 32`, `values.minItems: 1`, `key.minLength: 1`,
+        `required: [key, values]` and `additionalProperties: false`; deleting
+        `metadata_filter` removed the only `$ref` anywhere in this document
+        that pointed at `MetadataFilter`, so none of the five is a schema
+        check on any path any more, and what covers each now differs.
+        `values.maxItems: 32` is enforced on every read path by
+        `MAX_METADATA_FILTER_VALUES` (`usage-collector/src/domain/query.rs`),
+        alongside the per-request `MAX_METADATA_FILTERS` count cap (16;
+        neither this nor any other schema can express a cap on parameter
+        *repetitions*). `key.minLength: 1` is enforced too, by the REST
+        handler's own empty-key check
+        (`usage-collector/src/api/rest/handlers/usage_records.rs`,
+        `parse_metadata_filters`) ahead of `MetadataKey::new`. `values.minItems: 1`
+        cannot be violated by a REST caller at all — the query-string parser
+        structurally cannot produce a key with zero values — but
+        `MetadataFilter::new` still enforces it for any other caller.
+        `required: [key, values]` and `additionalProperties: false` describe
+        a JSON object this document no longer has anywhere to publish:
+        before this correction they were schema-checkable on the aggregate
+        body's now-removed `metadata_filter` array, the one JSON
+        representation of this shape a caller could ever send.
+        `MetadataFilter`'s own `Deserialize` impl
+        (`usage-collector-sdk/src/models.rs`) still enforces both, but only
+        in-process — nothing on the wire deserializes a `MetadataFilter` any
+        more, so no REST caller can violate or satisfy either.
+      parameters:
+        - $ref: "#/components/parameters/GtsTypeIdQuery"
+        - $ref: "#/components/parameters/Filter"
       requestBody:
         required: true
         content:
@@ -280,6 +351,17 @@ paths:
         The bound refuses only what lies past it, so a covered period
         ending exactly at the window is admitted.
 
+        **Not implemented as specified.** The backfill-window rejection
+        described in the preceding paragraph does not exist in the gear: an
+        entry whose covered period ends further back than the configured
+        window is admitted, and the window instead selects which PEP action
+        the entry is authorized against (`backfill` past it, `create` inside
+        it). The divergence, its evidence and the design decision it waits
+        on are recorded in full on `domain/covered_period.rs`'s
+        `ingestion_action`, which is the window's only functional reader in
+        the gear. Do not read this route's `PAST_WINDOW` specification as a
+        description of current behaviour.
+
         The route takes measurements and invalidation entries alike, mixed
         in one batch, under the same per-entry rules `POST /records`
         applies. Every persisted entry carries `origin: backfill`, the
@@ -309,6 +391,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateUsageRecordsResponse"
+        "429":
+          $ref: "#/components/responses/QuotaExceeded"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -358,7 +442,7 @@ paths:
             items:
               $ref: "#/components/schemas/GtsTypeId"
         - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/FeedCursor"
         - $ref: "#/components/parameters/Until"
       responses:
         "200":
@@ -506,8 +590,9 @@ components:
         uniform-direction, never-null keyset.
 
         Absent `$orderby` the order is `(window_end, id)`. Supplied, the
-        effective order is the caller's keys followed by that pair, which
-        the server appends in the caller's direction.
+        server appends whichever of that pair the caller did not name, in
+        the caller's direction; a key the caller named keeps its position
+        (DESIGN.md §3.1, Order admissibility).
       schema:
         type: string
     Limit:
@@ -526,13 +611,29 @@ components:
       required: false
       description: |
         Opaque cursor token. Forward-only; callers MUST NOT parse or
-        modify. It binds the order and the full query scope it was
-        minted under — every filtering and scoping parameter, `$filter`
-        and `metadata.<key>` included: a malformed token, any change to
-        that scope, or an accompanying `$orderby` is rejected `400` with
-        a `cursor` field violation (`INVALID_CURSOR`, `FILTER_MISMATCH`,
-        `ORDER_WITH_CURSOR`).
-        Continue a page by resending the same query, cursor apart.
+        modify. Continue a page by resending the same query, cursor
+        apart: the token is bound to the query it was minted under, and
+        any difference is rejected `400` with a `cursor` field violation
+        (`INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`).
+        What the binding covers, and the condition behind each code, are
+        specified in DESIGN.md §3.3 (Cursor & Pagination).
+      schema:
+        type: string
+        maxLength: 4096
+    FeedCursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque feed cursor token this feed issued. Forward-only; callers
+        MUST NOT parse or modify. Continue a page by resending the same
+        subscription, cursor apart: a malformed, over-length, or
+        backward-directed token is rejected `400` with a `cursor` field
+        violation (`INVALID_CURSOR`), and one minted under a different
+        `gts_type_id` set `400` (`FILTER_MISMATCH`). Omit it to begin at
+        the oldest position the subscription still serves. What the
+        binding covers is specified in DESIGN.md §3.3 (Cursor &
+        Pagination).
       schema:
         type: string
         maxLength: 4096
@@ -552,6 +653,22 @@ components:
   responses:
     Problem:
       description: RFC 9457 `application/problem+json` envelope.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    QuotaExceeded:
+      description: |
+        Per-subject ingestion allowance exhausted. The retry delay rides
+        both `context.violations[0].retry_after_seconds` in the body and
+        the `Retry-After` response header — one quantity on two transports.
+      headers:
+        Retry-After:
+          description: |
+            Seconds until a submission of this size could be admitted.
+          schema:
+            type: integer
+            format: int64
       content:
         application/problem+json:
           schema:
@@ -617,7 +734,6 @@ components:
         - tenant_id
         - resource_id
         - resource_type
-        - entry_type
         - origin
         - window_start
         - window_end
@@ -633,8 +749,14 @@ components:
         fail one of those three tests — `resource_ref` is an object,
         `quantity` is a decimal carried as a string (so `"9"` sorts after
         `"42.5"`), `idempotency_key` is opaque, and `gts_type_id` is
-        reserved and holds one value per request. Optional fields are
-        excluded by the nullable-keyset rule.
+        reserved and holds one value per request. `entry_type` is excluded
+        on a fifth ground: its value is present on every entry but is a
+        function of the optional `invalidates`, so the storage contract
+        carries no such attribute of its own and obliges no plugin to
+        materialize a non-null column for it — a key the contract cannot
+        promise is sound is not an order key, whatever column a given
+        plugin happens to build. Optional fields are excluded by the
+        nullable-keyset rule.
 
     Timestamp:
       type: string
@@ -665,6 +787,14 @@ components:
         significant digits; where the two disagree, this bound is
         normative. Fidelity across the range is DESIGN.md §3.1 (Quantity
         fidelity).
+
+        A quantity that does not match the pattern, carries more than 28
+        significant digits, or is a negative zero — which no backend reads
+        back digit for digit — is rejected `400` with
+        `context.field_violations[N].reason = QUANTITY_OUT_OF_RANGE` and
+        `.field` naming `quantity`. The rejection quotes the published
+        pattern, so a caller need not infer which of the three bounds it
+        crossed.
 
     AggregatedQuantity:
       type: string
@@ -929,9 +1059,11 @@ components:
         covered period, so an error in any of those is rejected as a
         missing target rather than as a field mismatch; a mismatch in
         resource, subject (presence against absence included), quantity,
-        or metadata is rejected naming the field that differs. The target
-        is always a `record`, so an invalidation of an invalidation cannot
-        be expressed.
+        or metadata is rejected `400` with
+        `context.field_violations[0].reason = INVALIDATION_FIELD_MISMATCH`
+        and `.field` naming the one that differs. The target is always a
+        `record`, so an invalidation of an invalidation cannot be
+        expressed.
       properties:
         entry_type:
           $ref: "#/components/schemas/EntryType"
@@ -1023,6 +1155,31 @@ components:
         tenant, GTS type, idempotency key, and covered period, since an
         error in any of those surfaces as not-found rather than as a field
         mismatch.
+
+        Validation rejections carry `context.field_violations[N].reason`,
+        with `.field` naming what the rejection is attributed to:
+
+        - `QUANTITY_OUT_OF_RANGE` on `quantity` — outside the published
+          range or precision, see `UsageQuantity`.
+        - `METADATA_VALIDATION` on `metadata` — the entry's serialized
+          metadata exceeded the operator-configured per-record size cap.
+          The rejection states the size and the cap.
+        - `UNKNOWN_METADATA_KEY` on `metadata` — a metadata key the
+          referenced meter's resolved declaration does not carry in its
+          closed `metadata_fields` shape. `context.resource_name` carries
+          the offending `gts_type_id`. The same code is attributed to
+          `group_by` when an aggregation names an undeclared key as a
+          grouping dimension.
+        - `INVALID_BASE_GTS_ID` on `gts_type_id` — the identifier is
+          malformed, built on a base other than the usage-record type, or
+          carries more segments than one derived type.
+        - `INVALIDATION_FIELD_MISMATCH` on the one field that differs, see
+          `UsageRecordInput`.
+        - `FUTURE_WINDOW` or `PAST_WINDOW` on the covered period, see the
+          ingestion and backfill routes.
+        - `VALIDATION` where no finer code applies — request shape, batch
+          size, a validating newtype, or a closed-kind enum parse.
+
         Dedup rejections carry `context.reason`: `IDEMPOTENCY_CONFLICT`;
         `ALREADY_INVALIDATED`, whose `context` names the target,
         `invalidated_by`, and the stored `reason_code`; or
@@ -1054,7 +1211,7 @@ components:
       type: object
       additionalProperties: false
       required: [items, page_info]
-      description: Cursor-paginated page of ledger entries, keyset-stable over `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces.
+      description: Cursor-paginated page of ledger entries, keyset-stable over an order naming both `window_end` and `id`, which a caller `$orderby` extends rather than replaces (DESIGN.md §3.1, Order admissibility).
       properties:
         items:
           type: array
@@ -1102,11 +1259,27 @@ components:
         - A query carries at most 16 filters, each with at most 32 values.
         - The predicate is part of the query scope a `cursor` is bound to.
 
-        The aggregation path carries these objects in its request body. The
-        raw read path carries the same predicate as repeated
-        `metadata.<key>=<value>` query parameters, because OpenAPI cannot
-        declare a parameter whose name carries a placeholder. The two
-        spellings denote one predicate with one meaning.
+        Both read paths — the raw list and the aggregate query alike — carry
+        this predicate the same way, as repeated `metadata.<key>=<value>`
+        query parameters, because OpenAPI cannot declare a parameter whose
+        name carries a placeholder. Neither spelling is a body array; the
+        aggregate path's body-array spelling (`AggregationRequest.metadata_filter`)
+        was removed when its contract was corrected to match the gear.
+
+        This schema is referenced from neither parameter — no `$ref` anywhere
+        in this document points at it, because a repeated query parameter has
+        no component to point with — and that is by design, not an
+        oversight: it remains the normative definition of the predicate both
+        prose descriptions above point back to, and the only way to publish
+        the predicate's shape at all once neither wire spelling can `$ref`
+        it.
+
+        **Nothing protects this component from deletion.** `every_ref_resolves`
+        only resolves references forward, from an operation to a schema, and
+        `every_registered_component_is_documented` only compares the
+        registry's components against the document, so a reader who deletes
+        this schema because nothing forward-links to it anymore would leave
+        every contract test green.
       properties:
         key:
           type: string
@@ -1139,7 +1312,7 @@ components:
     AggregationRequest:
       type: object
       additionalProperties: false
-      required: [gts_type_id, time_range]
+      required: [time_range]
       description: |
         Aggregation request. **There is no aggregation parameter** — the
         fold is resolved from the queried type's declaration, which is what
@@ -1147,27 +1320,13 @@ components:
         free to pick a different fold over the same entries could obtain a
         second defensible answer with nothing recording which one a charge
         derived from.
+
+        `gts_type_id`, `$filter` and the `metadata.<key>` side channel are
+        query parameters on this operation, not body properties — see
+        `parameters` above.
       properties:
-        gts_type_id:
-          allOf:
-            - $ref: "#/components/schemas/GtsTypeId"
-          description: The single GTS type to aggregate.
         time_range:
           $ref: "#/components/schemas/TimeRange"
-        filter:
-          type: string
-          description: |
-            OData `$filter` over the fixed field set. Declared metadata
-            properties are filtered by `metadata_filter`, not here; the two
-            are AND-ed. The covered period is carried by `time_range`.
-        metadata_filter:
-          type: array
-          maxItems: 16
-          description: |
-            Metadata predicate, AND-ed with `filter`. Semantics and bounds
-            are defined by `MetadataFilter`.
-          items:
-            $ref: "#/components/schemas/MetadataFilter"
         group_by:
           type: array
           uniqueItems: true
@@ -1382,3 +1541,38 @@ components:
             `violations`, `resource_type`, and `resource_name`. A quota
             rejection carries its retry delay on
             `violations[0].retry_after_seconds`.
+
+            Reason codes are published with the behavior each one
+            describes rather than as one enumeration here.
+            `field_violations[N].reason` on an `InvalidArgument` carries
+            `QUANTITY_OUT_OF_RANGE`, `METADATA_VALIDATION`,
+            `UNKNOWN_METADATA_KEY`, `INVALID_BASE_GTS_ID`,
+            `INVALIDATION_FIELD_MISMATCH`, `FUTURE_WINDOW`, `PAST_WINDOW`,
+            `AGGREGATION_RESULT_TOO_LARGE`, `CURSOR_BEYOND_RETENTION`, or
+            `VALIDATION` as the catch-all where no finer code applies; a
+            continuation token refused upstream carries that refusal's own
+            code instead. `context.reason` on an `Aborted` carries
+            `IDEMPOTENCY_CONFLICT`, `ALREADY_INVALIDATED`, or
+            `TARGET_NOT_CONVERGED`. Both sets are additive within this
+            major version, so a consumer matches the codes it models and
+            preserves any other verbatim rather than failing on it.
+
+            **Reserved codes this version never emits.** Four further
+            `field_violations[N].reason` values are modeled by the
+            published SDK and may be decoded off a stored or foreign
+            envelope, but no operation of this API raises one — a consumer
+            must not wait on any of them as a rejection of its own
+            request. `SEMANTICS_VIOLATION` is retired: it named a rule
+            keyed on the sign of a quantity, which this contract forbids
+            outright (`UsageQuantity` never constrains the sign), so the
+            rejection it reported no longer exists.
+            `INVALID_METADATA_FIELDS_EMPTY_STRING`,
+            `INVALID_METADATA_FIELDS_INVALID_KEY`, and
+            `INVALID_METADATA_FIELDS_DUPLICATE` report a malformed entry in
+            a **meter type declaration's** `metadata_fields` list — a
+            surface this gear resolves but never owns, mints, or
+            validates — so they belong to whichever surface accepts a
+            declaration, not to this one. A metadata key rejected against a
+            declaration at ingestion is `UNKNOWN_METADATA_KEY` above, and a
+            `group_by` dimension repeated in one request is `VALIDATION`,
+            neither of which is one of these four.

@@ -13,45 +13,34 @@
 //! runtime publishes is documented, and that every `$ref` in the
 //! document resolves.
 //!
-//! Deferred: the six checks that compare the documented contract to
-//! the registered routes are `#[ignore]`d while the Phase 2 document
-//! runs ahead of the implementation. That lead is deliberate — this gear
-//! moves its specification first and lets the code follow — and it is
-//! carried as debt in `DESIGN.md` 3.12.2 rather than left to be
-//! rediscovered here. The document says so on its own
-//! face through `x-contract-status: unreleased`, which
-//! [`the_document_declares_itself_unreleased`] pins to this deferral, so
-//! the two cannot be lifted separately. The YAML-internal and
-//! registry-internal checks stay live, so neither side is free to rot
-//! on its own, and [`harness_sees_the_whole_rest_surface`] pins both
-//! surface counts, so the gap can neither widen nor close unnoticed.
+//! Scope: the comparison checks run against every operation the gear
+//! registers. [`UNDOCUMENTED_PARAMETERS`] narrows what is compared for
+//! registered query parameters that the contract does not document, and its
+//! guard test fails when a listed gap closes, so it cannot become a standing
+//! exemption. Everything else is compared on every run.
 //!
-//! Comparison side: every check below reads `OperationSpec` fields, and
-//! no client is served an `OperationSpec` — `/cf/openapi.json` carries
-//! what `build_openapi` emits from them, after transformations of its
-//! own. Where a transformation can change what this suite compares, the
-//! rule is mirrored at the point it applies rather than left implicit:
-//! [`registry_ops`] keys on the emitted path spelling,
+//! Comparison side: every check below reads `OperationSpec` fields, and no
+//! client is served an `OperationSpec` — `/cf/openapi.json` carries what
+//! `build_openapi` emits from them, after transformations of its own. Where a
+//! transformation can change what this suite compares, the rule is mirrored at
+//! the point it applies: [`registry_ops`] keys on the emitted path spelling,
 //! [`registry_params`] applies the path-parameter `required` rule, and
 //! [`registry_keys_match_the_generated_document`] pins the whole key set
-//! against a document actually built from the registry. The one
-//! transformation that cannot be mirrored — `operationId` defaulting to
-//! a derived `handler_id` — is instead put out of reach by requiring
-//! every route to name its own (see [`operation_identity_matches`]).
+//! against a document actually built from the registry. The one transformation
+//! that cannot be mirrored — `operationId` defaulting to a derived
+//! `handler_id` — is instead put out of reach by requiring every route to name
+//! its own (see [`operation_identity_matches`]).
 //!
-//! Component naming: the document names a component after the wire shape
-//! it describes, while the Rust DTO behind it carries a `Dto` suffix by
-//! convention (`UsageRecord` / `UsageRecordDto`, `Page_UsageRecord` /
-//! `Page_UsageRecordDto`). That suffix is the *only* admitted difference
-//! — [`contract_name`] strips it and everything else must match
-//! character for character, so there is no per-name exemption list that
-//! can grow a row per divergence, and
-//! [`every_registered_component_is_documented`] holds the nested
-//! components to the same rule. The document additionally declares
-//! finer-grained documentary components (`Timestamp`, `UsageValue`,
-//! `IdempotencyKey`, …) that the generated document inlines into the
-//! fields using them; the runtime has no component for those, so nothing
-//! here compares them.
+//! Component naming: the document names a component after the wire shape it
+//! describes, while the Rust DTO behind it carries a `Dto` suffix
+//! (`UsageRecord` / `UsageRecordDto`). That suffix is the *only* admitted
+//! difference — [`contract_name`] strips it and everything else must match
+//! character for character, so there is no per-name exemption list, and
+//! [`every_registered_component_is_documented`] holds the nested components to
+//! the same rule. The document additionally declares finer-grained documentary
+//! components (`Timestamp`, `UsageValue`, `IdempotencyKey`, …) that the
+//! generated document inlines into the fields using them; the runtime has no
+//! component for those, so nothing here compares them.
 //!
 //! Deliberately NOT enforced: descriptions, summaries, examples,
 //! field-level schema contents, response headers (`ResponseSpec` carries
@@ -74,11 +63,10 @@ const YAML: &str = include_str!("../../../../../docs/usage-collector-v1.yaml");
 
 /// Build a registry populated by the gear's full REST surface.
 ///
-/// Goes through the same [`super::register_api_routes`] composition
-/// production uses, so this harness cannot fall behind it. Calling the
-/// per-resource registrars here instead would reintroduce exactly the
-/// drift this module exists to catch: a registrar added to production
-/// alone would be invisible to every check below, and if the document
+/// Goes through the same [`super::register_api_routes`] composition production
+/// uses, so this harness cannot fall behind it. Calling the per-resource
+/// registrars here would reintroduce the drift this module catches: a registrar
+/// added to production alone would be invisible below, and if the document
 /// missed the same routes the set-equality assertions would compare two
 /// incomplete views and pass.
 fn registry() -> OpenApiRegistryImpl {
@@ -97,20 +85,60 @@ fn op_key(method: &str, path: &str) -> String {
     format!("{} {}", method.to_uppercase(), path)
 }
 
+/// `(operation key, parameter name)` pairs the gear registers and the
+/// contract does not document.
+///
+/// Each row's reasoning is recorded at the registration site: `$top` because
+/// the toolkit `OData` extractor binds page size from `$top` or `limit` onto one
+/// slot and publishing one spelling under-reports the accepted surface;
+/// `metadata.<key>` on both read paths because `OpenAPI` cannot declare a
+/// parameter whose name carries a placeholder, so each operation describes the
+/// side channel in prose instead.
+///
+/// **This list only ever excuses registered-but-undocumented query parameters.**
+/// The reverse — documented but unregistered — is the dangerous direction and is
+/// never excused here. An input the contract carries in the request body instead
+/// is a placement disagreement, not an undocumented parameter.
+///
+/// The two sides are filtered differently, because they are asked different
+/// questions. On the **documented** side absence is checked across *every*
+/// parameter location rather than just `query`: stricter than the row needs, so
+/// it can only retire a row early, and [`parameters_match`] immediately catches
+/// anything the retirement exposes. Filtering to `query` there would let a
+/// contract documenting the input in another location keep the row alive.
+///
+/// On the **registered** side the filter goes the other way: the question is not
+/// "has the contract started covering this?" but "is the gear still serving the
+/// thing this row excuses?". A parameter moved from the query string to a header
+/// is no longer that thing, and matching on the name alone would go on excusing
+/// it in a location nobody chose — while [`parameters_match`] subtracts by name
+/// and would not compare it either. So **this list structurally excuses query
+/// parameters only**: a header or cookie exemption would match nothing and
+/// excuse nothing, and needs a location column first.
+///
+/// Self-cleaning: [`undocumented_parameters_are_really_undocumented`] fails on
+/// any row whose gap has closed.
+const UNDOCUMENTED_PARAMETERS: &[(&str, &str)] = &[
+    ("GET /usage-collector/v1/records", "$top"),
+    ("GET /usage-collector/v1/records", "metadata.<key>"),
+    (
+        "POST /usage-collector/v1/records/aggregate",
+        "metadata.<key>",
+    ),
+];
+
 /// The registered operations, keyed the way the *served* document keys
 /// them.
 ///
-/// The path goes through [`axum_to_openapi_path`] because
-/// `build_openapi` does the same before emitting it
-/// (`openapi_registry.rs:289`): axum spells a wildcard segment `{*rest}`
-/// and `OpenAPI` spells it `{rest}`. Keying on `OperationSpec.path`
-/// instead would make the document have to name the axum spelling to
-/// satisfy [`operation_identity_matches`], while clients fetching
-/// `/cf/openapi.json` would be handed the other one — the document and
-/// the served surface disagreeing with this suite green. No route here
-/// uses a wildcard today, so the conversion is currently the identity;
-/// [`registry_keys_match_the_generated_document`] is what keeps it from
-/// silently stopping being one.
+/// The path goes through [`axum_to_openapi_path`] because `build_openapi` does
+/// the same before emitting it (`toolkit`'s `openapi_registry.rs`): axum spells
+/// a wildcard segment `{*rest}` and `OpenAPI` spells it `{rest}`. Keying on
+/// `OperationSpec.path` instead would make the document name the axum spelling
+/// to satisfy [`operation_identity_matches`] while clients fetching
+/// `/cf/openapi.json` got the other one, with this suite green. No route uses a
+/// wildcard today, so the conversion is the identity;
+/// [`registry_keys_match_the_generated_document`] keeps it from silently
+/// stopping being one.
 fn registry_ops(reg: &OpenApiRegistryImpl) -> BTreeMap<String, OperationSpec> {
     reg.operation_specs
         .iter()
@@ -133,15 +161,11 @@ fn yaml_ops(doc: &Value) -> BTreeMap<String, Value> {
     let paths = doc["paths"].as_object().expect("`paths` must be a map");
     for (path, item) in paths {
         let item = item.as_object().expect("path item must be a map");
-        // Path-item-level `parameters:` (e.g. the shared `{id}` / `{gts_id}`
-        // declared once per path) apply to every operation under that path
-        // per the `OpenAPI` spec -- *unless* the operation redeclares the
-        // same (name, in) pair, in which case OpenAPI 3.x says the
-        // operation-level entry overrides the path-level one rather than
-        // adding a second, conflicting parameter. Keying the merge on the
-        // resolved (name, in) pair and inserting path-level entries before
-        // operation-level ones (so the latter overwrite on a collision)
-        // implements exactly that override rule.
+        // Path-item-level `parameters:` apply to every operation under that
+        // path -- unless the operation redeclares the same (name, in) pair,
+        // which OpenAPI 3.x says overrides rather than adds. Keying the merge on
+        // the resolved (name, in) pair and inserting path-level entries first,
+        // so operation-level ones overwrite, implements that rule.
         let path_params = item.get("parameters").and_then(Value::as_array).cloned();
         for (method, op) in item {
             if HTTP_METHODS.contains(&method.as_str()) {
@@ -175,12 +199,10 @@ fn param_key(doc: &Value, param: &Value) -> (String, String) {
 
 /// The registry and the document each carry the whole surface.
 ///
-/// [`operation_identity_matches`] already compares the two *sets*, so
-/// this count adds exactly one thing: it fires when a route leaves both
-/// sides in the same commit, where set equality still holds vacuously.
-/// Deleting a route therefore has to be deliberate — this number must be
-/// edited too — instead of being a silent shrink. Kept for that reason;
-/// adding a route costs one line here.
+/// [`operation_identity_matches`] already compares the two *sets*, so this count
+/// adds one thing: it fires when a route leaves both sides in the same commit,
+/// where set equality holds vacuously. Deleting a route therefore has to be
+/// deliberate — this number must be edited too.
 #[test]
 fn harness_sees_the_whole_rest_surface() {
     let reg = registry();
@@ -188,63 +210,30 @@ fn harness_sees_the_whole_rest_surface() {
 
     assert_eq!(
         registry_ops(&reg).len(),
-        9,
-        "expected 9 registered operations across both registrars (the Phase 1 \
-         surface the routes still serve)",
-    );
-    assert_eq!(
-        yaml_ops(&doc).len(),
         7,
-        "expected 7 documented operations (the Phase 2 surface the contract \
-         describes; see `x-contract-status` in usage-collector-v1.yaml)",
+        "expected 7 registered operations (create, backfill, list, get, \
+         aggregate, feed, reconciliation); a withdrawal travels one of the \
+         two ingestion paths, so there is no dedicated correction endpoint. \
+         An old-enough withdrawal is submitted to `backfill`, which is an \
+         ingestion route and not a correction one",
     );
-}
-
-/// The contract admits its own unreleased state.
-///
-/// The six comparison checks below are `#[ignore]`d because the document
-/// runs ahead of the routes, and `#[ignore]` is invisible from the
-/// document: a client generator, or a downstream gear reading the YAML,
-/// is pointed at the contract and never at this file. The marker is what
-/// puts the caveat where those readers are, and this check is what stops
-/// the two statements from parting company — dropping the marker, or
-/// promoting it to `released` while the routes still serve Phase 1,
-/// fails here instead of quietly leaving a published contract that
-/// nothing verifies and nothing labels. Flipping it is therefore the
-/// same edit as retiring those `#[ignore]`s.
-#[test]
-fn the_document_declares_itself_unreleased() {
-    let doc = spec_doc();
-
-    assert_eq!(
-        doc["x-contract-status"].as_str(),
-        Some("unreleased"),
-        "usage-collector-v1.yaml documents the Phase 2 surface while the routes \
-         register Phase 1, so it must carry `x-contract-status: unreleased`. \
-         Retire the marker only in the change that re-enables the six \
-         `#[ignore]`d document-against-registry checks in this module",
-    );
+    assert_eq!(yaml_ops(&doc).len(), 7, "expected 7 documented operations");
 }
 
 /// The keys the rest of this suite compares on are the ones the served
 /// document actually uses.
 ///
-/// Everything else here reads `OperationSpec` fields, but no client ever
-/// sees an `OperationSpec`: `/cf/openapi.json` serves what
-/// `build_openapi` emits, and that step transforms as it goes. It
-/// rewrites the path (`{*rest}` → `{rest}`,
-/// `openapi_registry.rs:289`) and collapses any method it does not
-/// recognise onto `get` (`:279-286`). A key derived from the raw spec can
-/// therefore name an operation the document does not have — and then the
-/// yaml would have to carry the *spec's* spelling to satisfy
-/// [`operation_identity_matches`], while a client fetching the served
-/// document is handed the other one.
+/// Everything else here reads `OperationSpec` fields, but no client sees one:
+/// `/cf/openapi.json` serves what `build_openapi` emits, and that step rewrites
+/// the path (`{*rest}` → `{rest}`) and collapses an unrecognised method onto
+/// `get` (both in `toolkit`'s `openapi_registry.rs`). A key derived from the raw
+/// spec can therefore name an operation the document does not have, after which
+/// the yaml would have to carry the *spec's* spelling to satisfy
+/// [`operation_identity_matches`] while a client got the other one.
 ///
-/// Comparing the two key sets closes that without re-deriving either
-/// rule here. Both transformations are inert today — no route uses a
-/// wildcard segment, and `OperationBuilder` exposes no constructor
-/// outside `get`/`post`/`put`/`delete`/`patch` — which is why this is a
-/// cheap guard rather than a live bug fix.
+/// Comparing the two key sets closes that without re-deriving either rule here.
+/// Both transformations are inert today, which makes this a cheap guard rather
+/// than a live bug fix.
 #[test]
 fn registry_keys_match_the_generated_document() {
     let reg = registry();
@@ -277,13 +266,136 @@ fn registry_keys_match_the_generated_document() {
     );
 }
 
+/// The documented operation a list row names, or a panic that names the row.
+///
+/// Mirrors [`spec_for`] on the document side: every guard below walks a
+/// constant's rows and looks the documented operation up, so a row naming an
+/// operation the contract does not carry reaches here. A bare `.expect()` would
+/// report an unwrap on `None` and nothing else — no path, no method, no clue
+/// which list holds the row.
+fn documented_op<'a>(documented: &'a BTreeMap<String, Value>, list: &str, key: &str) -> &'a Value {
+    documented.get(key).unwrap_or_else(|| {
+        panic!(
+            "{key}: listed in `{list}` but usage-collector-v1.yaml documents no \
+             such operation; remove the row"
+        )
+    })
+}
+
+/// `(component name, property names)` of the contract's request body for
+/// `op`, or `None` when the operation declares no request body at all.
+///
+/// Goes through [`yaml_request_body`], which already resolves the body's
+/// `$ref` through [`ref_name`] and panics on a dangling one, so both callers
+/// reach `components.schemas` the same way `body_schemas_match` does instead
+/// of re-deriving the pointer.
+fn yaml_body_properties(doc: &Value, key: &str, op: &Value) -> Option<(String, BTreeSet<String>)> {
+    let (_, _, schema_name) = yaml_request_body(doc, key, op)?;
+    let properties = doc
+        .pointer(&format!("/components/schemas/{schema_name}/properties"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{key}: `{schema_name}` must declare a `properties` map"));
+    let names = properties.keys().cloned().collect();
+    Some((schema_name, names))
+}
+
+/// Every `UNDOCUMENTED_PARAMETERS` row names a parameter that is really
+/// registered, really absent from the document, and really a *documentation*
+/// gap rather than a misfiled placement disagreement. Each condition expires the
+/// row on its own: if the gear stops registering it the row excuses nothing; if
+/// the yaml documents it the row hides a comparison that would now pass; if the
+/// contract carries the input in the request body, the row is not a
+/// documentation gap at all.
+///
+/// That last one matters because `yaml_params` reads only an operation's
+/// `parameters:` array, so a body property is invisible to it. Without the
+/// cross-check, a client-breaking body/query placement disagreement could be
+/// filed as an undocumented parameter and hidden from `parameters_match`.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
+fn undocumented_parameters_are_really_undocumented() {
+    let reg = registry();
+    let doc = spec_doc();
+    let registered = registry_ops(&reg);
+    let documented = yaml_ops(&doc);
+
+    for (key, param) in UNDOCUMENTED_PARAMETERS {
+        let spec = spec_for(&registered, key);
+        let registered_query: BTreeSet<String> = registry_params(spec)
+            .into_iter()
+            .filter(|(_, location, _)| location == "query")
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            registered_query.contains(*param),
+            "{key}: no longer registers `{param}` as a query parameter, which \
+             is what its `UNDOCUMENTED_PARAMETERS` row excuses; delete the row",
+        );
+
+        let op = documented_op(&documented, "UNDOCUMENTED_PARAMETERS", key);
+        let documented_names: BTreeSet<String> = yaml_params(&doc, op)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !documented_names.contains(*param),
+            "{key}: usage-collector-v1.yaml now documents `{param}`; delete the \
+             row from `UNDOCUMENTED_PARAMETERS` so `parameters_match` compares it",
+        );
+
+        // Skipped for an operation with no request body -- the `GET` case,
+        // which cannot be placing anything in one.
+        if let Some((schema_name, body_properties)) = yaml_body_properties(&doc, key, op) {
+            assert!(
+                !body_properties.contains(*param),
+                "{key}: usage-collector-v1.yaml declares `{param}` as a property \
+                 of `{schema_name}`, this operation's request body, so the \
+                 contract does carry this input and the disagreement is about \
+                 *where* it travels; remove it from `UNDOCUMENTED_PARAMETERS` \
+                 and fix the placement disagreement explicitly. Note this check \
+                 matches on the name alone: if the contract carries the input in \
+                 the body under a *different* name (`$filter` in the query \
+                 against `filter` in the body), nothing here can see it",
+            );
+        }
+    }
+}
+
+/// `POST /records/aggregate` documents exactly the surface the gear
+/// implements: `gts_type_id` and `$filter` as query parameters, and
+/// `AggregationRequest` carrying exactly `{time_range, group_by}` as body
+/// properties — nothing more, nothing less, on either side.
+///
+/// Pins the aggregate body's property set directly. Without it the narrowing
+/// would be pinned only by `dto_tests.rs`'s serde tests over the DTO alone, with
+/// nothing holding the yaml side or the pairing between them.
+#[test]
+fn the_aggregate_operation_documents_exactly_the_query_and_body_surface_the_gear_implements() {
+    let doc = spec_doc();
+    let documented = yaml_ops(&doc);
+    let key = "POST /usage-collector/v1/records/aggregate";
+    let op = documented_op(&documented, "this test", key);
+
+    let documented_query: BTreeSet<String> = yaml_params(&doc, op)
+        .into_iter()
+        .filter(|(_, location, _)| location == "query")
+        .map(|(name, _, _)| name)
+        .collect();
+    assert_eq!(
+        documented_query,
+        BTreeSet::from(["gts_type_id".to_owned(), "$filter".to_owned()]),
+        "{key}: must document exactly its two query parameters",
+    );
+
+    let (schema_name, body_properties) = yaml_body_properties(&doc, key, op)
+        .unwrap_or_else(|| panic!("{key}: declares no request body"));
+    assert_eq!(
+        body_properties,
+        BTreeSet::from(["time_range".to_owned(), "group_by".to_owned()]),
+        "{key}: `{schema_name}` must declare exactly the two properties the DTO carries",
+    );
+}
+
+#[test]
 fn operation_identity_matches() {
     let reg = registry();
     let doc = spec_doc();
@@ -300,18 +412,14 @@ fn operation_identity_matches() {
     for (key, op) in &documented {
         let spec = spec_for(&registered, key);
 
-        // Every route must name its own operation id. `build_openapi`
-        // falls back to `OperationSpec.handler_id` when it is absent
-        // (`openapi_registry.rs:126`), and `handler_id` is a derived
-        // string — `get:_usage-collector_v1_records` for this route
-        // (`operation_builder.rs:462-466`). Comparing `spec.operation_id`
-        // straight against the document would then compare `None` to the
-        // documented id and fail, and the obvious repair — deleting
-        // `operationId` from the document — is the wrong one: it leaves
-        // the document silent while `/cf/openapi.json` still advertises
-        // the derived id, with this suite green. Requiring the explicit
-        // call removes the fallback from reach instead of trying to
-        // model it.
+        // Every route must name its own operation id. `build_openapi` falls
+        // back to the derived `OperationSpec.handler_id` when it is absent
+        // (`toolkit`'s `openapi_registry.rs`), so comparing `spec.operation_id`
+        // straight against the document would compare `None` to the documented
+        // id and fail — and the obvious repair, deleting `operationId` from the
+        // document, leaves it silent while `/cf/openapi.json` still advertises
+        // the derived id, with this suite green. Requiring the explicit call
+        // removes the fallback from reach.
         assert!(
             spec.operation_id.is_some(),
             "{key}: the route must declare `.operation_id(…)`; without it \
@@ -339,16 +447,15 @@ fn operation_identity_matches() {
 
 /// The registered operation for a documented one.
 ///
-/// Every test walks the documented operations and looks the registered
-/// side up, so a yaml-only operation reaches this function. Indexing
-/// would report `no entry found for key` — no path, no method, no file.
-/// Tests run independently, so `operation_identity_matches` cannot be
-/// relied on to fail first (`cargo test parameters_match` never runs it).
+/// Every test walks the documented operations and looks the registered side up,
+/// so a yaml-only operation reaches here. Indexing would report `no entry found
+/// for key` — no path, no method, no file. Tests run independently, so
+/// `operation_identity_matches` cannot be relied on to fail first.
 fn spec_for<'a>(registered: &'a BTreeMap<String, OperationSpec>, key: &str) -> &'a OperationSpec {
     registered.get(key).unwrap_or_else(|| {
         panic!(
             "{key}: documented in usage-collector-v1.yaml but no route registers it \
-             (see `register_usage_record_routes` / `register_usage_type_routes`)"
+             (see `register_usage_record_routes`)"
         )
     })
 }
@@ -398,11 +505,9 @@ fn collect_refs(node: &Value, out: &mut Vec<String>) {
 
 /// Every `$ref` in the document points at something that exists.
 ///
-/// `deref` and `ref_name` only reach the references hanging directly off
-/// an operation, which is the minority of them: the rest are nested
-/// inside `components` (`Page_UsageRecord.items`, every field of
-/// `UsageRecord`), and a dangling reference there makes the document
-/// undereferenceable just as completely.
+/// `deref` and `ref_name` only reach the references hanging directly off an
+/// operation; the rest are nested inside `components`, where a dangling
+/// reference makes the document just as undereferenceable.
 #[test]
 fn every_ref_resolves() {
     let doc = spec_doc();
@@ -448,16 +553,14 @@ fn yaml_params(doc: &Value, op: &Value) -> BTreeSet<ParamTriple> {
 /// The registered parameters, projected the way the *served* document
 /// projects them.
 ///
-/// `required` is not read straight off the spec: `build_openapi` forces
-/// it true for every path parameter whatever the spec holds
-/// (`openapi_registry.rs:192-193`), because a path parameter that is not
-/// required has no meaning — the route would not match without it.
-/// Reading the raw flag would let the document promise
-/// `required: false` on a path parameter that the served surface calls
-/// required. `path_param()` already sets the flag
-/// (`operation_builder.rs:587`), so the two agree today; mirroring the
-/// rule is what keeps them agreeing if another way to declare a path
-/// parameter ever appears.
+/// `required` is not read straight off the spec: `build_openapi` forces it true
+/// for every path parameter whatever the spec holds (`toolkit`'s
+/// `openapi_registry.rs`), a path parameter that is not required having no
+/// meaning. Reading the raw flag would let the document promise
+/// `required: false` where the served surface says required.
+/// `OperationBuilder::path_param` already sets it, so the two agree today;
+/// mirroring the rule keeps them agreeing if another way to declare a path
+/// parameter appears.
 fn registry_params(spec: &OperationSpec) -> BTreeSet<ParamTriple> {
     spec.params
         .iter()
@@ -475,12 +578,6 @@ fn registry_params(spec: &OperationSpec) -> BTreeSet<ParamTriple> {
 }
 
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn parameters_match() {
     let reg = registry();
     let doc = spec_doc();
@@ -488,12 +585,49 @@ fn parameters_match() {
 
     for (key, op) in yaml_ops(&doc) {
         let spec = spec_for(&registered, &key);
+        let mut registered_params = registry_params(spec);
+        // Parameters the gear serves and the contract does not document.
+        // Removed from the registered side rather than added to the
+        // documented one: adding would assert the document says something it
+        // does not, and this suite exists to compare the two documents as
+        // they are.
+        registered_params.retain(|(name, _, _)| {
+            !UNDOCUMENTED_PARAMETERS
+                .iter()
+                .any(|(gap_key, gap_param)| *gap_key == key && *gap_param == name.as_str())
+        });
         assert_eq!(
             yaml_params(&doc, &op),
-            registry_params(spec),
+            registered_params,
             "{key}: documented parameters differ from the registered ones",
         );
     }
+}
+
+/// The reconciliation route registers no filter, grouping, ordering or
+/// paging parameter.
+///
+/// `cpt-cf-usage-collector-dod-reconciliation-single-scope` forbids all four,
+/// and an unpinned prohibition is what let this roadmap's own "bounded band"
+/// survive two slices. Asserted against the registered
+/// `OperationSpec` rather than the source, so it reads what
+/// [`parameters_match`] reads — a parameter added through any builder method
+/// is caught, not just one spelled a way this test guessed.
+#[test]
+fn the_reconciliation_route_registers_only_its_five_scope_and_range_parameters() {
+    let reg = registry();
+    let registered = registry_ops(&reg);
+    let spec = spec_for(&registered, "GET /usage-collector/v1/reconciliation");
+    let names: BTreeSet<String> = registry_params(spec)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["scope", "gts_type_id", "tenant_id", "from", "to"].map(str::to_owned)),
+        "the reconciliation surface accepts no filter, no grouping dimension, no ordering \
+         and no paging parameter: the scope parameters and the range are the whole request"
+    );
 }
 
 /// The document's name for the component the server registers as
@@ -673,12 +807,6 @@ fn registry_success_responses(key: &str, spec: &OperationSpec) -> BTreeSet<Respo
 }
 
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn body_schemas_match() {
     let reg = registry();
     let doc = spec_doc();
@@ -744,24 +872,20 @@ fn assert_problem_envelope(doc: &Value, key: &str, label: &str, response: &Value
 /// The canonical error surface every route in this gear registers, read
 /// back from the toolkit instead of transcribed.
 ///
-/// `OperationBuilder.spec` is private, so the set is obtained by
-/// registering a throwaway probe that makes exactly the two calls every
-/// route here makes — `.standard_errors()` and `.error_503()` — into a
-/// scratch registry, then reading the `application/problem+json` statuses
-/// off the registered spec.
+/// `OperationBuilder.spec` is private, so the set is obtained by registering a
+/// throwaway probe making the same calls every route makes —
+/// `.standard_errors()` and `.error_503()` — into a scratch registry, then
+/// reading the `application/problem+json` statuses off the registered spec.
 ///
-/// Derivation matters more than it looks. A transcribed list is kept
-/// equal to the toolkit only by a comment, and it fails in the direction
-/// that hurts: a status *added* to `standard_errors` would be absent from
-/// the copy, so no assertion would fire and every route could quietly
-/// stop declaring it. The toolkit's own rustdoc for that method has
-/// already drifted this way — `operation_builder.rs:1495` and `:1529`
-/// advertise a 422 that the body deliberately omits.
+/// Derivation matters: a transcribed list is kept equal to the toolkit only by a
+/// comment, and it fails in the direction that hurts — a status *added* to
+/// `standard_errors` would be absent from the copy, so no assertion would fire
+/// and every route could quietly stop declaring it. The toolkit's own rustdoc
+/// for that method has already drifted this way.
 ///
-/// 503 is in the set because all nine routes call `.error_503(openapi)`.
-/// The document makes no explicit 503 promise — the status rides
-/// `default:` — so this is a registry-side requirement only, which is
-/// what [`every_operation_declares_the_standard_error_set`] already is.
+/// 503 is in the set because every route calls `.error_503(openapi)`. The
+/// document makes no explicit 503 promise — the status rides `default:` — so
+/// this is a registry-side requirement only.
 fn canonical_error_statuses() -> BTreeSet<u16> {
     async fn probe() -> &'static str {
         ""
@@ -812,26 +936,26 @@ fn missing_standard_errors(expected: &BTreeSet<u16>, spec: &OperationSpec) -> Ve
 
 /// Every operation carries the canonical error surface on both sides.
 ///
-/// This is deliberately an unconditional requirement rather than a
-/// yaml↔code agreement check. Any handler on a canonical route can
-/// produce the whole set [`canonical_error_statuses`] derives — the
-/// gateway middleware alone accounts for 401, 403, and 429, and every
-/// route dispatches to a plugin that can be unavailable (503) — so an
-/// operation without it is wrong, not merely undocumented. Phrasing it as
-/// agreement would leave the check disarmed by the one edit most likely
-/// to happen: dropping `.standard_errors(openapi)` from a route and
-/// `default:` from its operation together, after which "both sides
-/// agree" holds vacuously and the document promises nothing.
+/// Deliberately an unconditional requirement rather than a yaml↔code agreement
+/// check. Any handler on a canonical route can produce the whole set
+/// [`canonical_error_statuses`] derives — the gateway middleware accounts for
+/// 401 and 403, and every route dispatches to a plugin that can be unavailable
+/// (503) — so an operation without it is wrong, not merely undocumented.
 ///
-/// A route that genuinely cannot produce these has to say so by editing
-/// this test.
+/// **429 is not the gateway's alone**: DESIGN §3.2's admission control makes the
+/// ingestion routes originate one from the gear's own per-subject quota. This
+/// test cannot see the difference, asserting that the status set is *present*
+/// rather than where it comes from, which is why
+/// `api/rest/handlers/usage_records_tests.rs`'s
+/// `an_over_quota_submission_is_answered_with_a_429_the_gear_itself_originated`
+/// exists: it drives the handler with no middleware in the stack.
+///
+/// Phrasing it as agreement would leave the check disarmed by the likeliest
+/// edit: dropping `.standard_errors(openapi)` from a route and `default:` from
+/// its operation together, after which "both sides agree" holds vacuously. A
+/// route that genuinely cannot produce these has to say so by editing this
+/// test.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn every_operation_declares_the_standard_error_set() {
     let reg = registry();
     let doc = spec_doc();
@@ -891,14 +1015,12 @@ fn every_operation_declares_the_standard_error_set() {
 /// rules: an operation-level `security` array *replaces* the root-level
 /// one, and an empty array means "this operation is public".
 ///
-/// The entries of that array are alternatives, OR-ed. An **empty
-/// requirement object** is the spec's way of spelling "no credentials
-/// needed" as one of those alternatives (`OpenAPI` 3.1.0, Security
-/// Requirement Object: "To make Security optional, an empty Security
-/// Requirement (`{}`) can be included in the array"), so a single `{}`
-/// anywhere in the array makes
-/// the operation public whatever the other entries name. Reading only the
-/// array's length would let `security: [{}]` on an `.authenticated()`
+/// The entries of that array are alternatives, OR-ed, and an **empty
+/// requirement object** spells "no credentials needed" as one of them (`OpenAPI`
+/// 3.1.0, Security Requirement Object: "To make Security optional, an empty
+/// Security Requirement (`{}`) can be included in the array"), so a single `{}`
+/// anywhere makes the operation public whatever the other entries name. Reading
+/// only the array's length would let `security: [{}]` on an `.authenticated()`
 /// route advertise anonymous access with every test green.
 fn yaml_operation_authenticated(doc: &Value, key: &str, op: &Value) -> bool {
     let requirements = match op.get("security") {
@@ -940,21 +1062,13 @@ fn yaml_operation_authenticated(doc: &Value, key: &str, op: &Value) -> bool {
 /// name.
 ///
 /// `body_schemas_match` only reaches the components an operation *body*
-/// references, which leaves every nested one — `ResourceRef`,
-/// `AggregationOp`, the element type of each `Page` — free to drift. This
-/// is what makes the `Dto`-suffix rule a rule instead of a comment.
+/// references, leaving every nested one free to drift. This is what makes the
+/// `Dto`-suffix rule a rule instead of a comment.
 ///
-/// Containment is deliberately one-way: the document also declares
-/// documentary refinements (`Timestamp`, `UsageValue`, the two
-/// `CreateUsageRecordResult` branches, …) that the runtime emits inline
-/// and so has no component for.
+/// Containment is deliberately one-way: the document also declares documentary
+/// refinements (`Timestamp`, `UsageValue`, …) that the runtime emits inline and
+/// so has no component for.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn every_registered_component_is_documented() {
     let reg = registry();
     let doc = spec_doc();
@@ -991,12 +1105,6 @@ fn every_registered_component_is_documented() {
 /// root says, and the route registering it would still be
 /// `.authenticated()`.
 #[test]
-#[ignore = "Phase 2 documentation landed ahead of its implementation: \
-           usage-collector-v1.yaml describes the target contract (adds \
-           /records/backfill, /feed and /reconciliation, renames {gts_id} to \
-           {gts_type_id}, drops /deactivate and the whole usage-type surface) while the \
-           routes still register the Phase 1 surface. Re-enable as Phase 2 \
-           implementation lands."]
 fn security_matches_authenticated_routes() {
     let reg = registry();
     let doc = spec_doc();

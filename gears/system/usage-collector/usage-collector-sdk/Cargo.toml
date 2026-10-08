@@ -37,3 +37,13 @@ toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-odata-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+# The DESIGN §3.3 plugin contract suite. Off by default: a production build
+# of a plugin has no use for it. The in-memory reference backend the suite is
+# validated against is not shipped by this feature at all — it is `cfg(test)`,
+# so it is unreachable from any consumer whether the feature is on or off.
+contract = []

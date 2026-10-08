@@ -8,26 +8,44 @@ use bigdecimal::BigDecimal;
 use chrono::TimeZone;
 
 use toolkit_odata::filter::{FieldKind, FilterField, FilterNode, FilterOp};
-use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir};
+use toolkit_odata::{ODataOrderBy, OrderKey, SortDir};
 use usage_collector_sdk::UsageRecordFilterField;
 
 use super::super::bind::{SqlBind, odata_value_to_bind};
-use super::super::keyset::{
-    cursor_key_to_bind, ensure_forward_cursor, keyset_predicate, render_order_by,
+use super::super::keyset::{cursor_key_to_bind, keyset_predicate, render_order_by, uniform_dir};
+use super::{
+    ODataValue, SqlCtx, filter_fields, record_column, record_field_kind, translate_record_filter,
+    translate_scope,
 };
-use super::{ODataValue, SqlCtx, record_column, translate_record_filter, usage_type_column};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// A field name deliberately absent from [`record_column`]. Shared by the
+/// allowlist test and [`UnmappedField`] so the two stay in agreement about what
+/// "not a column" means.
+const UNMAPPED_FIELD_NAME: &str = "definitely_not_a_column";
+
+/// A [`FilterField`] whose `name()` is [`UNMAPPED_FIELD_NAME`], so a test can
+/// reach the translator's fail-closed identifier guard. `FilterField::from_name`
+/// resolves only real schema fields, so no parsed query can produce this shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UnmappedField;
+
+impl FilterField for UnmappedField {
+    const FIELDS: &'static [Self] = &[Self];
+
+    fn name(&self) -> &'static str {
+        UNMAPPED_FIELD_NAME
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::String
+    }
+}
 
 fn rec_field(name: &str) -> UsageRecordFilterField {
     <UsageRecordFilterField as FilterField>::from_name(name)
         .unwrap_or_else(|| panic!("unknown record field `{name}`"))
-}
-
-/// Resolve a record field name to its declared [`FieldKind`] — the keyset bind
-/// resolver the record store passes to [`keyset_predicate`].
-fn rec_kind(name: &str) -> Option<FieldKind> {
-    <UsageRecordFilterField as FilterField>::from_name(name).map(|f| f.kind())
 }
 
 /// Fail-closed "is this record field a never-null (keyset-safe) column"
@@ -52,30 +70,185 @@ fn dt_val() -> ODataValue {
     ODataValue::DateTime(chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap())
 }
 
-// ── Column allowlist ─────────────────────────────────────────────────────────
+/// The published `$filter` field set, transcribed from
+/// `usage-collector-v1.yaml`'s `Filter` parameter description. Every one of
+/// these must resolve to a column, or a valid request is answered with an
+/// `Internal`.
+///
+/// **Hand-copied on purpose.** The other allowlist tests iterate SDK constants,
+/// so they are coupled to the code and structurally cannot see the code and the
+/// published contract drifting apart. This list is transcribed from the YAML, a
+/// different source, and so it is the only thing in this tree that catches that
+/// drift. Refresh it from the YAML, never from the SDK.
+///
+/// **It guards one direction only.** Nothing here notices the YAML growing a new
+/// `$filter` field and this transcription not being refreshed: it would stay
+/// green while the contract moved out from under it.
+const PUBLISHED_FILTER_FIELDS: &[&str] = &[
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "subject_id",
+    "subject_type",
+    "entry_type",
+    "origin",
+    "invalidates",
+];
+
+/// The YAML transcription above against the SDK constant the gear's guard
+/// actually tests, which is the whole point of keeping a transcription: this is
+/// the one assertion in either tree that fires when the published contract and
+/// the code disagree.
+///
+/// Order included, because
+/// [`usage_collector_sdk::UsageCollectorError::unpublished_filter_field`]
+/// renders the constant into a caller-facing `detail` in its declared order.
+#[test]
+fn the_yaml_transcription_matches_the_sdk_published_set() {
+    assert_eq!(
+        PUBLISHED_FILTER_FIELDS,
+        usage_collector_sdk::PUBLISHED_FILTER_FIELDS,
+        "`usage-collector-v1.yaml`'s $filter parameter and \
+         `usage_collector_sdk::PUBLISHED_FILTER_FIELDS` have drifted apart; the \
+         YAML is the contract, so refresh the constant, not this list"
+    );
+}
 
 #[test]
+fn every_published_filter_field_resolves_to_a_column() {
+    for field in PUBLISHED_FILTER_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`$filter={field} eq ...` is a predicate the published contract names \
+             and the gear's reject_unpublished_filter_fields guard admits, so an \
+             allowlist that drops it answers a valid request with a 500"
+        );
+    }
+}
+
+#[test]
+fn every_keyset_safe_field_resolves_to_a_column() {
+    for field in usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS {
+        assert!(
+            record_column(field).is_some(),
+            "`{field}` is an admissible `$orderby` key, and the canonical \
+             (window_end, id) keyset cannot render at all unless it resolves"
+        );
+    }
+}
+
+/// [`record_column`]'s sibling check for [`record_field_kind`] — resolving to a
+/// column is necessary but not sufficient, because `keyset_predicate` also needs
+/// a [`FieldKind`] to parse a cursor's boundary string back into a typed bind,
+/// and that is a third, independently maintained vocabulary.
+///
+/// Caught a real gap: `accepted_at` resolved through `record_column` and
+/// `record_row_key` from the day it was admitted, but `PgRecordStore::list`'s
+/// dispatch into `keyset_predicate` passed a bare
+/// `UsageRecordFilterField::from_name` closure, which has no variant for a field
+/// that was never added to the filterable schema. A first page ordered by
+/// `accepted_at` served `200` and minted a cursor; the continuation it promised
+/// 500'd on `keyset_predicate`'s own `"keyset field has no known kind"`.
+#[test]
+fn every_keyset_safe_field_resolves_a_kind() {
+    for field in usage_collector_sdk::KEYSET_SAFE_RECORD_FIELDS {
+        assert!(
+            record_field_kind(field).is_some(),
+            "`{field}` is an admissible `$orderby` key, and a continuation ordered by it \
+             cannot bind a boundary value without a FieldKind to parse it as"
+        );
+    }
+}
+
+/// The invariant the other tests approximate. `translate_filter` resolves a
+/// conjunct with `col(field.name())`, so *every* declared `FilterField` has to
+/// map — a newly added SDK field would answer a valid `$filter` with a 500
+/// exactly as `origin` did, and neither the published-field list nor
+/// `KEYSET_SAFE_RECORD_FIELDS` would necessarily name it. This also asserts the
+/// identity the function's doc claims as a general property rather than as a set
+/// of hand-written equalities.
+#[test]
+fn every_declared_filter_field_maps_to_its_own_column() {
+    for field in <UsageRecordFilterField as FilterField>::FIELDS {
+        assert_eq!(
+            record_column(field.name()),
+            Some(field.name()),
+            "`{}` is a declared filter field, so a conjunct naming it reaches \
+             `col(field.name())` and must resolve to its own column, since \
+             the map is documented as the identity",
+            field.name()
+        );
+    }
+}
+
+/// The closed half of the boundary. `record_column` is documented as *the*
+/// security boundary, and the `$orderby` path (`render_order_by(&query.order,
+/// record_column)`) hands it an arbitrary caller-supplied string, unlike the
+/// `$filter` path where `FilterField` has already bounded the input. These are
+/// real `usage_records` columns, so an arm added for any of them would render
+/// valid SQL and widen the boundary silently.
+///
+/// `accepted_at` is not here: it is still not a filter field — it has no
+/// `UsageRecordFilterField` variant — but it is an admissible `$orderby` key, so
+/// `record_column` must resolve it, and
+/// `every_keyset_safe_field_resolves_to_a_column` below pins that it does. This
+/// test's claim is narrower than its name suggests: "not a filter field" is not
+/// the same claim as "does not resolve".
+#[test]
+fn a_real_column_that_is_not_a_filter_field_does_not_resolve() {
+    for column in [
+        "reason_code",
+        "gts_type_uuid",
+        "quantity",
+        "idempotency_key",
+        "xact_id",
+        "metadata",
+    ] {
+        assert!(
+            record_column(column).is_none(),
+            "`{column}` is a real usage_records column but not a filter field"
+        );
+    }
+}
+
+#[test]
+fn no_retired_model_field_resolves_to_a_column() {
+    for field in ["created_at", "corrects_id", "status"] {
+        assert!(
+            record_column(field).is_none(),
+            "`{field}` was removed from the model by slices 3 and 4; an \
+             allowlist that still maps it lets a `$filter` naming it past the \
+             boundary and fail against the table"
+        );
+    }
+}
+
+// ── Column allowlist ─────────────────────────────────────────────────────────
+
+// The tests above ask only whether a field resolves. This one names the
+// column each field resolves TO: the map is the identity, so a mis-pointed arm
+// (`"origin" => Some("tenant_id")`) would satisfy them and silently filter the
+// wrong column.
+#[test]
 fn record_field_columns_are_allowlisted() {
-    // The record identity column was renamed `uuid` -> `id` (migration 0002),
-    // so `id` maps to itself and bare `uuid` is not an allowlisted field name.
+    // The record identity column is `id`; bare `uuid` is not an allowlisted
+    // field name.
     assert_eq!(record_column("id"), Some("id"));
     assert_eq!(record_column("uuid"), None);
-    assert_eq!(record_column("created_at"), Some("created_at"));
     assert_eq!(record_column("tenant_id"), Some("tenant_id"));
     assert_eq!(record_column("resource_id"), Some("resource_id"));
     assert_eq!(record_column("resource_type"), Some("resource_type"));
     assert_eq!(record_column("subject_id"), Some("subject_id"));
     assert_eq!(record_column("subject_type"), Some("subject_type"));
-    assert_eq!(record_column("corrects_id"), Some("corrects_id"));
-    assert_eq!(record_column("status"), Some("status"));
-    assert_eq!(record_column("definitely_not_a_column"), None);
-}
-
-#[test]
-fn usage_type_columns_are_allowlisted() {
-    assert_eq!(usage_type_column("gts_id"), Some("gts_id"));
-    assert_eq!(usage_type_column("kind"), Some("kind"));
-    assert_eq!(usage_type_column("gts_id; DROP TABLE"), None);
+    assert_eq!(record_column("entry_type"), Some("entry_type"));
+    assert_eq!(record_column("origin"), Some("origin"));
+    assert_eq!(record_column("invalidates"), Some("invalidates"));
+    assert_eq!(record_column("window_start"), Some("window_start"));
+    assert_eq!(record_column("window_end"), Some("window_end"));
+    assert_eq!(record_column(UNMAPPED_FIELD_NAME), None);
+    // An identifier that would be catastrophic if it were ever interpolated
+    // rather than rejected.
+    assert_eq!(record_column("id; DROP TABLE usage_records"), None);
 }
 
 // ── Value conversion ─────────────────────────────────────────────────────────
@@ -137,15 +310,83 @@ fn numeric_out_of_decimal_range_is_rejected() {
 #[test]
 fn binary_eq_renders_single_placeholder_and_one_bind() {
     let node = binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
+        ODataValue::String("record".to_owned()),
     );
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "status = $1");
+    assert_eq!(sql, "entry_type = $1::usage_entry_type");
     assert_eq!(ctx.binds.len(), 1);
-    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "active"));
+    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "record"));
+}
+
+/// The cast lands on the bound literal, on the one column whose type no
+/// `SqlBind` variant matches, and on nothing else.
+///
+/// `entry_type` is a `PostgreSQL` enum and every bind here is a [`SqlBind`],
+/// no variant of which is that enum, so `usage_records.entry_type = $1` with a
+/// `text` parameter has no operator to resolve to and `PostgreSQL` refuses the
+/// statement. The column stays bare because this plugin's
+/// `DESIGN.md` §3.7 puts the cast on the literal, and because two other
+/// modules document `record_column` as returning bare column names.
+///
+/// The `origin` half is the "and on nothing else": a cast applied to every
+/// comparison would pass the entry-type half alone.
+#[test]
+fn only_the_enum_column_casts_its_bound_literal() {
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &binary(
+            "entry_type",
+            FilterOp::Eq,
+            ODataValue::String("invalidation".to_owned()),
+        ),
+        &mut ctx,
+    )
+    .unwrap();
+    // Written out rather than built from `ENTRY_TYPE_ENUM`, and deliberately: an
+    // oracle derived from the constant under test cannot see a rename that moves
+    // the constant, because both sides move together. A literal reds here
+    // instead, in the `--lib` lane. What the const buys is one spelling in
+    // *production* Rust: `bind_cast` reads it from `record_store::ENTRY_TYPE_ENUM`
+    // rather than hardcoding the name a second time, and the const's own spelling
+    // is held to the migration by
+    // `record_store_tests::each_inserted_column_is_bound_as_the_type_the_migration_declares`.
+    assert_eq!(sql, "entry_type = $1::usage_entry_type");
+
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &binary(
+            "origin",
+            FilterOp::Eq,
+            ODataValue::String("backfill".to_owned()),
+        ),
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        sql, "origin = $1",
+        "`origin` is a text column; a bound text value needs no cast"
+    );
+
+    let mut ctx = SqlCtx::new(1);
+    let sql = translate_record_filter(
+        &FilterNode::InList {
+            field: rec_field("entry_type"),
+            values: vec![
+                ODataValue::String("record".to_owned()),
+                ODataValue::String("invalidation".to_owned()),
+            ],
+        },
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        sql, "entry_type IN ($1::usage_entry_type, $2::usage_entry_type)",
+        "a membership test compares through the same operator, so every \
+         literal in it needs the cast too"
+    );
 }
 
 #[test]
@@ -154,12 +395,12 @@ fn composite_and_renders_grouped_predicate_with_two_binds() {
         op: FilterOp::And,
         children: vec![
             binary("tenant_id", FilterOp::Eq, uuid_val()),
-            binary("created_at", FilterOp::Ge, dt_val()),
+            binary("window_end", FilterOp::Ge, dt_val()),
         ],
     };
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "(tenant_id = $1 AND created_at >= $2)");
+    assert_eq!(sql, "(tenant_id = $1 AND window_end >= $2)");
     assert_eq!(ctx.binds.len(), 2);
     assert!(matches!(&ctx.binds[0], SqlBind::Uuid(_)));
     assert!(matches!(&ctx.binds[1], SqlBind::DateTime(_)));
@@ -187,10 +428,10 @@ fn comparison_operators_render_their_exact_sql() {
         (FilterOp::Lt, "<"),
         (FilterOp::Le, "<="),
     ] {
-        let node = binary("created_at", op, dt_val());
+        let node = binary("window_end", op, dt_val());
         let mut ctx = SqlCtx::new(1);
         let sql = translate_record_filter(&node, &mut ctx).unwrap();
-        assert_eq!(sql, format!("created_at {sql_op} $1"), "op {op:?}");
+        assert_eq!(sql, format!("window_end {sql_op} $1"), "op {op:?}");
     }
 }
 
@@ -200,20 +441,23 @@ fn composite_or_joins_children_with_or_inside_parens() {
         op: FilterOp::Or,
         children: vec![
             binary(
-                "status",
+                "entry_type",
                 FilterOp::Eq,
-                ODataValue::String("active".to_owned()),
+                ODataValue::String("record".to_owned()),
             ),
             binary(
-                "status",
+                "entry_type",
                 FilterOp::Eq,
-                ODataValue::String("inactive".to_owned()),
+                ODataValue::String("invalidation".to_owned()),
             ),
         ],
     };
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "(status = $1 OR status = $2)");
+    assert_eq!(
+        sql,
+        "(entry_type = $1::usage_entry_type OR entry_type = $2::usage_entry_type)"
+    );
     assert_eq!(ctx.binds.len(), 2);
 }
 
@@ -231,41 +475,38 @@ fn empty_in_list_is_rejected() {
 #[test]
 fn not_wraps_inner_predicate() {
     let node = FilterNode::Not(Box::new(binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("inactive".to_owned()),
+        ODataValue::String("invalidation".to_owned()),
     )));
     let mut ctx = SqlCtx::new(1);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "NOT (status = $1)");
+    assert_eq!(sql, "NOT (entry_type = $1::usage_entry_type)");
 }
 
 #[test]
 fn placeholder_numbering_honors_start_offset() {
     let node = binary(
-        "status",
+        "entry_type",
         FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
+        ODataValue::String("record".to_owned()),
     );
     let mut ctx = SqlCtx::new(3);
     let sql = translate_record_filter(&node, &mut ctx).unwrap();
-    assert_eq!(sql, "status = $3");
+    assert_eq!(sql, "entry_type = $3::usage_entry_type");
 }
 
-// `FilterField::from_name` resolves only schema fields, so an unmapped field
-// is rejected at the AST boundary. We still guard the translator against a
-// field whose `name()` is not on the column allowlist by exercising the
-// usage-type column path against a record field that maps to no catalog
-// column (`status`).
+// The translator must fail closed on a field whose `name()` is not on the
+// column allowlist, rather than interpolating it into the SQL.
 #[test]
-fn record_filter_rejects_unmapped_field_against_catalog_allowlist() {
-    let node = binary(
-        "status",
-        FilterOp::Eq,
-        ODataValue::String("active".to_owned()),
-    );
+fn record_filter_rejects_field_not_on_column_allowlist() {
+    let node = FilterNode::Binary {
+        field: UnmappedField,
+        op: FilterOp::Eq,
+        value: ODataValue::String("active".to_owned()),
+    };
     let mut ctx = SqlCtx::new(1);
-    let err = super::translate_usage_type_filter(&node, &mut ctx).unwrap_err();
+    let err = translate_record_filter(&node, &mut ctx).unwrap_err();
     assert!(err.contains("not allowlisted"), "got: {err}");
 }
 
@@ -289,9 +530,9 @@ fn composite_with_non_and_or_operator_is_rejected() {
     let node = FilterNode::Composite {
         op: FilterOp::Eq,
         children: vec![binary(
-            "status",
+            "entry_type",
             FilterOp::Eq,
-            ODataValue::String("active".to_owned()),
+            ODataValue::String("record".to_owned()),
         )],
     };
     let mut ctx = SqlCtx::new(1);
@@ -301,10 +542,13 @@ fn composite_with_non_and_or_operator_is_rejected() {
 
 // ── Order-by + keyset ────────────────────────────────────────────────────────
 
-fn order_created_at_id() -> ODataOrderBy {
+/// The canonical page order this backend renders: `(window_end, id)`, the
+/// tiebreaker the published `$orderby` contract appends to every raw-path
+/// order.
+fn order_window_end_id() -> ODataOrderBy {
     ODataOrderBy(vec![
         OrderKey {
-            field: "created_at".to_owned(),
+            field: "window_end".to_owned(),
             dir: SortDir::Asc,
         },
         OrderKey {
@@ -314,10 +558,71 @@ fn order_created_at_id() -> ODataOrderBy {
     ])
 }
 
+/// `(window_end ASC, id DESC)` — the shape the SPI guarantees never arrives,
+/// and the one every entry point that acts on a direction has to refuse.
+fn mixed_direction_order() -> ODataOrderBy {
+    ODataOrderBy(vec![
+        OrderKey {
+            field: "window_end".to_owned(),
+            dir: SortDir::Asc,
+        },
+        OrderKey {
+            field: "id".to_owned(),
+            dir: SortDir::Desc,
+        },
+    ])
+}
+
+/// The rule itself, at the one place all three entry points now resolve a
+/// direction. The other entry points check emptiness first with their own
+/// message, so `render_order_by` is the one relying on the empty arm here — see
+/// [`render_order_by_rejects_empty_order`], which pins the composed behaviour.
+/// The mixed arm, and an empty order reached by a direct caller, are nameable
+/// only here.
+#[test]
+fn uniform_dir_accepts_one_direction_and_refuses_a_mixed_or_empty_order() {
+    assert_eq!(uniform_dir([SortDir::Asc, SortDir::Asc]), Ok(SortDir::Asc));
+    assert_eq!(
+        uniform_dir([SortDir::Desc, SortDir::Desc]),
+        Ok(SortDir::Desc)
+    );
+
+    let err = uniform_dir([SortDir::Asc, SortDir::Desc]).unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
+    // The message states a requirement of the call, not the gateway's promise:
+    // it prints through `UsageCollectorError::internal` to a caller who cannot
+    // see the gateway, and would be asserting that promise exactly when it was
+    // broken.
+    assert!(
+        !err.contains("guarantees"),
+        "the reject must not cite a guarantee it is evidence against; got: {err}"
+    );
+
+    let err = uniform_dir([]).unwrap_err();
+    assert!(err.contains("must not be empty"), "got: {err}");
+}
+
+// `render_order_by` runs on the *first* page, before any cursor exists. Mapping
+// each key's direction independently renders `window_end ASC, id DESC` and
+// serves it, leaving `keyset_predicate` to refuse on the continuation — one
+// page too late, and as a 500 over an already-wrong page.
+#[test]
+fn render_order_by_refuses_a_mixed_direction_order() {
+    let err = render_order_by(&mixed_direction_order(), record_column).unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
+}
+
+// `encode_next_cursor_refuses_a_mixed_direction_order` was deleted — property
+// MOVED. That mint site is gone, but the plugin still builds a `Keyset` at
+// `record_store.rs`'s `build_list_page`, which resolves direction through
+// `uniform_dir` on the same reasoning. The successor in this crate is
+// `record_store_tests::a_mixed_direction_order_refuses_the_keyset_rather_than_pick_the_leading_key`;
+// the gear-side guards cover the order *arriving* mixed-direction.
+
 #[test]
 fn render_order_by_renders_allowlisted_columns() {
-    let sql = render_order_by(&order_created_at_id(), record_column).unwrap();
-    assert_eq!(sql, "created_at ASC, id ASC");
+    let sql = render_order_by(&order_window_end_id(), record_column).unwrap();
+    assert_eq!(sql, "window_end ASC, id ASC");
 }
 
 #[test]
@@ -329,6 +634,10 @@ fn render_order_by_rejects_unknown_column() {
     assert!(render_order_by(&order, record_column).is_err());
 }
 
+/// `render_order_by` has no empty guard of its own: [`uniform_dir`] sees the
+/// order first and refuses it there. A duplicate guard here emitted the
+/// byte-identical message, so this test passed whether or not it existed —
+/// it discriminates the composed path only now that there is one path.
 #[test]
 fn render_order_by_rejects_empty_order() {
     let err = render_order_by(&ODataOrderBy(vec![]), record_column).unwrap_err();
@@ -344,7 +653,7 @@ fn keyset_predicate_rejects_empty_order_pairs() {
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
@@ -356,14 +665,14 @@ fn keyset_predicate_rejects_empty_order_pairs() {
 fn keyset_predicate_rejects_key_order_arity_mismatch() {
     // Two order pairs but a single cursor key: the tuple comparison would be
     // ill-formed, so it must fail closed rather than emit a truncated tuple.
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", true)];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", true)];
     let keys = vec!["2026-01-02T03:04:05Z".to_owned()];
     let mut ctx = SqlCtx::new(1);
     let err = keyset_predicate(
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
@@ -373,7 +682,7 @@ fn keyset_predicate_rejects_key_order_arity_mismatch() {
 
 #[test]
 fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", true)];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", true)];
     let keys = vec![
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
@@ -383,12 +692,12 @@ fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "(created_at, id) > ($1, $2)");
+    assert_eq!(sql, "(window_end, id) > ($1, $2)");
     assert_eq!(ctx.binds.len(), 2);
     assert!(matches!(&ctx.binds[0], SqlBind::DateTime(_)));
     assert!(matches!(&ctx.binds[1], SqlBind::Uuid(_)));
@@ -396,7 +705,7 @@ fn keyset_predicate_ascending_renders_tuple_comparison_with_two_binds() {
 
 #[test]
 fn keyset_predicate_descending_uses_less_than() {
-    let pairs: &[(&str, bool)] = &[("created_at", false), ("id", false)];
+    let pairs: &[(&str, bool)] = &[("window_end", false), ("id", false)];
     let keys = vec![
         "2026-01-02T03:04:05Z".to_owned(),
         uuid::Uuid::from_u128(0x1234).to_string(),
@@ -406,41 +715,91 @@ fn keyset_predicate_descending_uses_less_than() {
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "(created_at, id) < ($1, $2)");
+    assert_eq!(sql, "(window_end, id) < ($1, $2)");
 }
 
+// The SPI guarantees the two canonical names are *present* in `query.order`,
+// not that either is last: "a caller ordering by `id` is handed on as `(id,
+// window_end)`. A plugin MUST read the order it is given rather than assume a
+// position for either key." Sorting the pairs into a canonical shape, or
+// hard-coding one, still renders a well-formed tuple and still binds two values,
+// so the breakage is silent: the emitted columns stop lining up with the cursor
+// keys. Lead with `id` so a canonicalising implementation cannot render the same
+// SQL.
+#[test]
+fn the_predicate_follows_the_order_it_is_given_rather_than_a_canonical_position() {
+    let pairs: &[(&str, bool)] = &[("id", true), ("window_end", true)];
+    let keys = vec![
+        uuid::Uuid::from_u128(0x1234).to_string(),
+        "2026-01-02T03:04:05Z".to_owned(),
+    ];
+    let mut ctx = SqlCtx::new(1);
+    let sql = keyset_predicate(
+        pairs,
+        &keys,
+        record_column,
+        record_field_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .expect("an id-led order is admissible; the SPI guarantees presence, not position");
+    assert_eq!(
+        sql, "(id, window_end) > ($1, $2)",
+        "the tuple's columns follow the order handed in, not a canonical one"
+    );
+    assert_eq!(ctx.binds.len(), 2);
+    assert!(
+        matches!(&ctx.binds[0], SqlBind::Uuid(_)),
+        "the first bind is the first order key's, got {:?}",
+        ctx.binds[0]
+    );
+    assert!(
+        matches!(&ctx.binds[1], SqlBind::DateTime(_)),
+        "the second bind is the second order key's, got {:?}",
+        ctx.binds[1]
+    );
+}
+
+// A mixed-direction order rendered as a uniform tuple comparison returns the
+// wrong rows and reports nothing, so the rule is fail-closed and its violation
+// is silent. Both cursor keys must therefore be *parseable* for their field's
+// kind: with an unparseable one (`"x"` for the `Uuid`-kinded `id`) the call
+// errors inside `cursor_key_to_bind` whatever the directions are, and deleting
+// the direction rule outright leaves the assertion green. Assert on the message.
 #[test]
 fn keyset_predicate_rejects_mixed_directions() {
-    let pairs: &[(&str, bool)] = &[("created_at", true), ("id", false)];
-    let keys = vec!["2026-01-02T03:04:05Z".to_owned(), "x".to_owned()];
+    let pairs: &[(&str, bool)] = &[("window_end", true), ("id", false)];
+    let keys = vec![
+        "2026-01-02T03:04:05Z".to_owned(),
+        uuid::Uuid::from_u128(1).to_string(),
+    ];
     let mut ctx = SqlCtx::new(1);
-    assert!(
-        keyset_predicate(
-            pairs,
-            &keys,
-            record_column,
-            rec_kind,
-            rec_keyset_safe,
-            &mut ctx
-        )
-        .is_err()
-    );
+    let err = keyset_predicate(
+        pairs,
+        &keys,
+        record_column,
+        record_field_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(err.contains("mixed-direction"), "got: {err}");
 }
 
 #[test]
 fn keyset_predicate_rejects_a_nullable_ordering_column() {
-    // Defence-in-depth backstop for finding #3: `subject_type` is an
-    // allowlisted, kind-resolvable column, but it is nullable
-    // (`subject_ref: Option<_>`). A row-value tuple keyset over it would
-    // silently drop NULL-`subject_type` rows, so `keyset_predicate` must fail
-    // closed rather than emit `(subject_type) > ($1)` — even though the gateway
-    // already rejects such an `$orderby` with a 400, a crafted cursor could
-    // still smuggle it in here.
+    // Defence-in-depth backstop: `subject_type` is an allowlisted,
+    // kind-resolvable column, but it is nullable (`subject_ref: Option<_>`).
+    // A row-value tuple keyset over it would silently drop
+    // NULL-`subject_type` rows, so `keyset_predicate` must fail closed rather
+    // than emit `(subject_type) > ($1)` — even though the gateway already
+    // rejects such an `$orderby` with a 400, a crafted cursor could still
+    // smuggle it in here.
     let pairs: &[(&str, bool)] = &[("subject_type", true)];
     let keys = vec!["vm".to_owned()];
     let mut ctx = SqlCtx::new(1);
@@ -448,7 +807,7 @@ fn keyset_predicate_rejects_a_nullable_ordering_column() {
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
@@ -462,10 +821,10 @@ fn keyset_predicate_rejects_a_nullable_ordering_column() {
 
 #[test]
 fn keyset_predicate_binds_uuid_column_as_uuid_not_text() {
-    // `tenant_id` is a uuid column whose name is neither `id` nor
-    // `corrects_id`. Typing the cursor key by column NAME (the old behaviour)
-    // bound it as text, producing a `uuid > text` runtime error. Typing by the
-    // field's declared `FieldKind` binds it as Uuid.
+    // `tenant_id` is a uuid column that is not one of the `*_id`-shaped names a
+    // name-based heuristic recognizes; such a heuristic binds it as text,
+    // producing a `uuid > text` runtime error. Typing by the field's declared
+    // `FieldKind` binds it as Uuid.
     let pairs: &[(&str, bool)] = &[("tenant_id", true)];
     let keys = vec![uuid::Uuid::from_u128(7).to_string()];
     let mut ctx = SqlCtx::new(1);
@@ -473,7 +832,7 @@ fn keyset_predicate_binds_uuid_column_as_uuid_not_text() {
         pairs,
         &keys,
         record_column,
-        rec_kind,
+        record_field_kind,
         rec_keyset_safe,
         &mut ctx,
     )
@@ -509,54 +868,28 @@ fn cursor_key_to_bind_dispatches_on_field_kind() {
     assert!(cursor_key_to_bind(FieldKind::I64, "5").is_err());
 }
 
-#[test]
-fn ensure_forward_cursor_rejects_backward_direction() {
-    let mk = |d: &str| CursorV1 {
-        k: vec!["x".to_owned()],
-        o: SortDir::Asc,
-        s: "+created_at".to_owned(),
-        f: None,
-        d: d.to_owned(),
-    };
-    assert!(
-        ensure_forward_cursor(&mk("fwd")).is_ok(),
-        "a forward cursor is accepted"
-    );
-    // The keyset comparison operator is derived from the sort direction, not
-    // from `d`, so a backward cursor would silently be walked forward. It must
-    // be rejected fail-closed until backward paging is actually implemented.
-    assert!(
-        ensure_forward_cursor(&mk("bwd")).is_err(),
-        "a backward cursor is rejected"
-    );
-}
+// `ensure_forward_cursor_rejects_backward_direction` was deleted — property
+// moved. It unit-tested `ensure_forward_cursor` in isolation, already
+// unreachable from `record_store.rs`: the gateway strips `query.cursor` before
+// every dispatch, so this plugin never sees a `CursorV1` to check. The live
+// enforcement point is `query::require_forward_cursor` in the gear, proved
+// end-to-end by
+// `service_tests::read_path_keyset_floor_tests::a_backward_cursor_never_reaches_the_plugin`.
 
-// ── Cursor round-trip ────────────────────────────────────────────────────────
+// `encode_then_decode_cursor_round_trips_keys_and_order` was deleted —
+// guarantee retired, not moved. It round-tripped a token through this plugin's
+// own `encode_next_cursor` + `decode_cursor`; nothing in this crate calls either
+// on a production path now, since the gateway never hands the plugin a wire
+// cursor. The mint→encode→decode round trip is re-established against the gear's
+// own mint by
+// `service_tests::gateway_owned_cursor_tests::the_gateway_mints_the_continuation_and_the_plugin_receives_a_keyset`.
 
-#[test]
-fn encode_then_decode_cursor_round_trips_keys_and_order() {
-    let order = order_created_at_id();
-    let keys = vec![
-        "2026-01-02T03:04:05Z".to_owned(),
-        uuid::Uuid::from_u128(0x1234).to_string(),
-    ];
-    let token = super::super::keyset::encode_next_cursor(&order, &keys, Some("hash")).unwrap();
-    let decoded = super::super::keyset::decode_cursor(&token).unwrap();
-    assert_eq!(decoded.k, keys);
-    assert_eq!(decoded.s, "+created_at,+id");
-    assert_eq!(decoded.d, "fwd");
-    assert_eq!(decoded.f.as_deref(), Some("hash"));
-}
-
-#[test]
-fn encode_next_cursor_rejects_row_key_order_arity_mismatch() {
-    // A two-key order but a single last-row key: the cursor would encode fewer
-    // keys than the order it claims to follow, so it must fail closed.
-    let order = order_created_at_id();
-    let keys = vec!["2026-01-02T03:04:05Z".to_owned()];
-    let err = super::super::keyset::encode_next_cursor(&order, &keys, None).unwrap_err();
-    assert!(err.contains("does not match order arity"), "got: {err}");
-}
+// `encode_next_cursor_rejects_row_key_order_arity_mismatch` was deleted —
+// property moved. The mint-time arity check now lives gear-side as
+// `query::verify_returned_keyset`, exercised by
+// `query_tests::verify_returned_keyset_refuses_a_keyset_whose_arity_disagrees_with_the_dispatched_order`
+// and end-to-end by
+// `service_tests::returned_keyset_verification_tests::a_returned_keyset_of_the_wrong_arity_is_refused_as_internal`.
 
 #[test]
 fn decode_cursor_rejects_a_malformed_client_token() {
@@ -566,4 +899,154 @@ fn decode_cursor_rejects_a_malformed_client_token() {
     assert!(super::super::keyset::decode_cursor("").is_err());
     // Valid base64url, but the decoded bytes are not a `CursorV1` JSON payload.
     assert!(super::super::keyset::decode_cursor("bm90LWpzb24").is_err());
+}
+
+// ── The compiled-scope seam ────────────────────────────────────────────────
+//
+// `translate_scope` is the one road from the `ast::Expr` a read path is handed
+// to the SQL it may conjoin. The point lookup takes it today; `list` and
+// `aggregate` are to take it as they are ported. Everything the callers are
+// entitled to assume is asserted here rather than at each of them.
+
+/// Parse a filter string into the AST a read path is handed. The gateway's
+/// `authz::scope_to_odata_filter` builds the same `ast::Expr` from PDP
+/// constraints; a string is its readable spelling.
+fn scope_expr(raw: &str) -> toolkit_odata::ast::Expr {
+    toolkit_odata::parse_filter_string(raw)
+        .unwrap_or_else(|e| panic!("the test's own scope must parse: {e}"))
+        .into_expr()
+}
+
+#[test]
+fn translate_scope_parenthesizes_a_bare_comparison() {
+    // A bare comparison is already safe to conjoin, so this is not the shape
+    // the wrap exists for. It is the shape that makes the wrap *observable*:
+    // the walker adds no parentheses to a `Binary` — `translate_record_filter`
+    // returns `tenant_id = $1` bare — so any parentheses seen on one are
+    // demonstrably this function's.
+    let mut ctx = SqlCtx::new(1);
+
+    let sql = translate_scope(
+        &scope_expr("tenant_id eq 11111111-1111-1111-1111-111111111111"),
+        &mut ctx,
+    )
+    .expect("a tenant-pinned scope must render");
+
+    assert_eq!(sql, "(tenant_id = $1)");
+    assert_eq!(ctx.binds.len(), 1);
+}
+
+#[test]
+fn translate_scope_survives_being_conjoined_after_another_predicate() {
+    // The property every caller relies on, stated the way a caller uses it.
+    // `AND` binds tighter than `OR`, so a disjunctive scope conjoined without
+    // its own parentheses reads as `(leading AND A) OR B` and answers every row
+    // matching the last disjunct. The expectation is transcribed by hand.
+    let mut ctx = SqlCtx::new(2);
+
+    let sql = translate_scope(
+        &scope_expr(
+            "tenant_id eq 11111111-1111-1111-1111-111111111111 or \
+             tenant_id eq 22222222-2222-2222-2222-222222222222",
+        ),
+        &mut ctx,
+    )
+    .expect("a disjunctive scope must render");
+
+    assert_eq!(
+        format!("gts_id = $1 AND {sql}"),
+        "gts_id = $1 AND ((tenant_id = $2 OR tenant_id = $3))",
+        "the whole scope has to sit inside the conjunction, not just its head"
+    );
+    assert_eq!(ctx.binds.len(), 2);
+}
+
+#[test]
+fn translate_scope_continues_the_callers_placeholder_numbering() {
+    // A caller seeds `ctx` past its own leading binds; the scope must take the
+    // next free slots rather than restart at `$1` and collide with them.
+    let mut ctx = SqlCtx::new(4);
+
+    let sql = translate_scope(
+        &scope_expr("resource_type eq 'vm' and resource_id eq 'i-1'"),
+        &mut ctx,
+    )
+    .expect("a conjunctive scope must render");
+
+    assert_eq!(sql, "((resource_type = $4 AND resource_id = $5))");
+}
+
+#[test]
+fn translate_scope_refuses_a_field_the_filterable_schema_does_not_carry() {
+    // First gate: `gts_type_uuid` is a typed SPI parameter, deliberately absent
+    // from `UsageRecordQuery`. A refusal, never a dropped conjunct — dropping
+    // one leaves the read unscoped.
+    let mut ctx = SqlCtx::new(1);
+
+    let err = translate_scope(&scope_expr("gts_type_uuid eq 'x'"), &mut ctx)
+        .expect_err("a field off the filterable schema must not render");
+
+    assert!(err.starts_with("invalid read predicate: "), "got: {err}");
+    assert!(
+        err.contains("gts_type_uuid"),
+        "the refusal names the field. got: {err}"
+    );
+    assert!(ctx.binds.is_empty(), "a refused scope binds nothing");
+}
+
+#[test]
+fn translate_scope_refuses_an_operator_the_second_gate_rejects() {
+    // Second gate. `contains` converts cleanly — `resource_id` is a string
+    // field, so the converter admits it — and dies at `op_sql`, which carries
+    // no `LIKE` family. Both refusal paths therefore carry the same prefix,
+    // which names neither half of the composed expression: on a collection
+    // path the caller's `$filter` and the compiled scope arrive already
+    // composed, so nothing here can attribute the refusal to one of them.
+    let mut ctx = SqlCtx::new(1);
+
+    let err = translate_scope(&scope_expr("contains(resource_id, 'abc')"), &mut ctx)
+        .expect_err("the scope vocabulary is exact-match only");
+
+    assert!(err.starts_with("invalid read predicate: "), "got: {err}");
+    assert!(err.contains("unsupported operator"), "got: {err}");
+}
+
+// ── filter_fields ──────────────────────────────────────────────────────────
+
+fn parsed(raw: &str) -> toolkit_odata::ast::Expr {
+    toolkit_odata::parse_filter_string(raw)
+        .unwrap_or_else(|e| panic!("the test's own filter must parse: {e}"))
+        .into_expr()
+}
+
+#[test]
+fn filter_fields_names_every_field_a_nested_filter_touches() {
+    let expr = parsed(
+        "tenant_id eq 11111111-1111-1111-1111-111111111111 \
+         or (origin eq 'live' and not (resource_id eq 'r1'))",
+    );
+    let fields = filter_fields(&expr).expect("a schema filter resolves");
+    assert_eq!(
+        fields.into_iter().collect::<Vec<_>>(),
+        ["origin", "resource_id", "tenant_id"]
+    );
+}
+
+#[test]
+fn filter_fields_reads_the_field_of_an_in_list() {
+    let expr = parsed(
+        "tenant_id in (11111111-1111-1111-1111-111111111111, 22222222-2222-2222-2222-222222222222)",
+    );
+    assert_eq!(
+        filter_fields(&expr)
+            .expect("resolves")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["tenant_id"]
+    );
+}
+
+#[test]
+fn filter_fields_refuses_a_field_off_the_schema() {
+    assert!(filter_fields(&parsed("gts_type_uuid eq 'x'")).is_err());
 }

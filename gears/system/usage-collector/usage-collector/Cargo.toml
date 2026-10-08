@@ -26,12 +26,21 @@ authz-resolver = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# The Feed Gateway's own position encoding inside `CursorV1::k` (ruling E9):
+# `toolkit_odata`'s matching alphabet lives in a private `mod base64_url`, so
+# this gear carries its own `URL_SAFE_NO_PAD` engine rather than reaching
+# into that module.
+base64 = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Compiles a meter's declared `metadata` subschema once per declaration and
+# validates entries against it (`domain::type_resolver::metadata`). Already a
+# workspace dependency shared by five other gears.
+jsonschema = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
@@ -51,31 +60,34 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
-# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
-# AuthzPermissionV1 instances into the toolkit-gts inventory that
-# types-registry aggregates at boot.
+# GTS schema and permission registration. See DESIGN §3.2/§3.7.
 toolkit-gts = { workspace = true }
-# Direct dep needed because `gts_instance!` expansions reference
-# `::gts::*` paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix
-# asserts). Without this the proc-macro emits `::gts::…` identifiers that
-# cannot be resolved.
 gts = { workspace = true }
 inventory = { workspace = true }
+schemars = { workspace = true }
+
+# Temporary declaration mirror DB. See ADR-0015.
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
 
 [dev-dependencies]
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-# `test-util` enables `#[tokio::test(start_paused = true)]` so the bounded
-# gauge-refresh timeout can be exercised without a wall-clock delay.
+# Paused-time tests.
 tokio = { workspace = true, features = ["test-util"] }
-# In-memory metric exporter + `SdkMeterProvider` for asserting emitted
-# instrument names / labels / buckets against DESIGN §3.11.5. Test-only —
-# the gear never constructs an exporter at runtime (ToolKit owns it).
+# In-memory metric assertions.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 toolkit-gts = { workspace = true }
-# Test-only: parses `docs/usage-collector-v1.yaml` for the OpenAPI contract
-# conformance test.
+# OpenAPI YAML contract tests.
 serde-saphyr = { workspace = true }
-# Test-only: `ServiceExt::oneshot` drives one request through the assembled
-# `Router` so `register_routes`' `Extension<Arc<Service>>` layer — invisible
-# to the OpenAPI registry — is pinned by dispatch.
+# Router `oneshot` tests.
 tower = { workspace = true }
+# Capturing tracing subscriber tests.
+tracing-subscriber = { workspace = true }
+# Trace-context test helper.
+toolkit-http = { workspace = true }
+# Postgres declaration-mirror integration tests.
+testcontainers-modules = { workspace = true }
+# Pinned Postgres test image.
+test-containers = { workspace = true }

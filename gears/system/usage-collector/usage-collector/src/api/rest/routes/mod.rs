@@ -11,8 +11,9 @@ use toolkit::api::OpenApiRegistry;
 use crate::api::rest::{dto, handlers};
 use crate::domain::Service;
 
+mod reconciliation;
+mod usage_feed;
 mod usage_records;
-mod usage_types;
 
 /// Compose every per-resource registrar onto `router`.
 ///
@@ -25,9 +26,23 @@ mod usage_types;
 /// composition in the test would leave that hole open: a third registrar
 /// added here and missing from the document would compare two incomplete
 /// views and stay green.
+///
+/// **This function's three registrars are the gear's whole REST surface**,
+/// which is what makes it the realizing site for
+/// `cpt-cf-usage-collector-dod-no-gear-local-privacy-workflow`'s first
+/// sentence — no fourth registrar exposing the clause's forbidden
+/// operation vocabulary exists here. (Its second sentence, binding the storage plugin
+/// interface, is realized separately at
+/// `usage_collector_sdk::plugin_api::UsageCollectorPluginV1` — a different
+/// seam, marked at its own declaration.) Pinned by
+/// `data_classification_tests::the_gear_exposes_no_privacy_workflow_operation`,
+/// which scans every production file under this crate's `src/`, including
+/// this one and the three it composes.
+// @cpt-dod:cpt-cf-usage-collector-dod-no-gear-local-privacy-workflow:p3
 fn register_api_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    router = usage_types::register_usage_type_routes(router, openapi);
     router = usage_records::register_usage_record_routes(router, openapi);
+    router = usage_feed::register_usage_feed_routes(router, openapi);
+    router = reconciliation::register_reconciliation_routes(router, openapi);
     router
 }
 
@@ -44,6 +59,10 @@ pub fn register_routes(
 ) -> Router {
     register_api_routes(router, openapi).layer(axum::Extension(service))
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod consistency_floor_tests;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

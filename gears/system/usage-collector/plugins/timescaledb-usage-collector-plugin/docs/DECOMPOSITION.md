@@ -1,382 +1,1119 @@
 # Decomposition: TimescaleDB Usage Collector Storage Plugin
 
-**Overall implementation status:**
-
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-status-overall`
+Splits the plugin's PRD and DESIGN scope into ten independently implementable
+and testable features, spanning schema provisioning, ingestion, query, the
+usage feed, retention, and the cross-cutting observability and error-contract
+concerns that bind them.
 
 <!-- toc -->
 
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
-  - [2.1 Foundation: Bootstrap, Schema & SPI Wiring ⏳ HIGH](#21-foundation-bootstrap-schema--spi-wiring--high)
-  - [2.2 Record Persistence & Lifecycle ⏳ HIGH](#22-record-persistence--lifecycle--high)
-  - [2.3 Query & Aggregation ⏳ HIGH](#23-query--aggregation--high)
-  - [2.4 Usage-Type Catalog & Referential Integrity ⏳ MEDIUM](#24-usage-type-catalog--referential-integrity--medium)
-  - [2.5 Data Retention ⏳ MEDIUM](#25-data-retention--medium)
-  - [2.6 Backend Observability & Metrics ⏳ MEDIUM](#26-backend-observability--metrics--medium)
-  - [2.7 Deliberate Omissions](#27-deliberate-omissions)
+  - [2.1 Registration & Schema Provisioning - HIGH](#21-registration--schema-provisioning---high)
+  - [2.2 Record Ingestion & Idempotency - HIGH](#22-record-ingestion--idempotency---high)
+  - [2.3 Invalidation Persistence - HIGH](#23-invalidation-persistence---high)
+  - [2.4 Aggregated Query & Rollup - HIGH](#24-aggregated-query--rollup---high)
+  - [2.5 Raw Query & Converged Lookup - HIGH](#25-raw-query--converged-lookup---high)
+  - [2.6 Usage Feed - HIGH](#26-usage-feed---high)
+  - [2.7 Per-Type Retention - HIGH](#27-per-type-retention---high)
+  - [2.8 Reconciliation Metadata - MEDIUM](#28-reconciliation-metadata---medium)
+  - [2.9 Observability & Metrics - MEDIUM](#29-observability--metrics---medium)
+  - [2.10 Error Classification & Transport Security - MEDIUM](#210-error-classification--transport-security---medium)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
 
+**Overall implementation status:**
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-status-timescaledb-usage-collector-plugin`
+
 ## 1. Overview
 
-The TimescaleDB Usage Collector Storage Plugin DESIGN is decomposed into six capability features that mirror the backend's distinct persistence and query responsibilities rather than its internal crate layering. The plugin is already implemented and merged; this is a brownfield decomposition that records the coverage of the existing backend against its PRD and DESIGN, so the checkboxes track feature-level acceptance/verification rather than code existence.
+This decomposition splits the TimescaleDB Usage Collector Storage Plugin into
+ten features. The plugin is a storage backend for the Usage Collector gear: it
+implements the gear's storage SPI (Service Provider Interface, the in-process
+Rust trait `UsageCollectorPluginV1`) on PostgreSQL with the TimescaleDB
+extension, and it is pure persistence and query. Every product-level rule --
+authentication, authorization, attribution, type resolution, the declared
+aggregation fold -- is enforced upstream by the gear core and is therefore not
+decomposed here.
 
-- **Foundation: Bootstrap, Schema & SPI Wiring** — gear `init`, typed config, TLS-required connection pool, idempotent schema provisioning, GTS + ClientHub registration, the SPI Storage Adapter shell with its backend-error classification, and the vendor-isolation and SPI-conformance guarantees every capability plugs into.
-- **Record Persistence & Lifecycle** — the write plane: single and batch insert with 4-tuple backend deduplication, append-only compensation rows, and the depth-1 atomic deactivation cascade.
-- **Query & Aggregation** — the read plane: pushed-down SUM/COUNT/MIN/MAX/AVG with grouping and keyset-paginated raw list, over injection-safe query translation.
-- **Usage-Type Catalog & Referential Integrity** — the catalog plane: usage-type create/get/list/delete with the in-database `ON DELETE RESTRICT` foreign key that makes orphaned records structurally impossible.
-- **Data Retention** — the declarative, event-time TimescaleDB chunk-drop retention policy for `usage_records`, and the retention-bounded dedup-key preservation it implies.
-- **Backend Observability & Metrics** — the `uc_timescaledb_*` OpenTelemetry metric inventory that instruments the other five features' backend-internal operation.
+**The checkboxes are the status, and nothing else here is.** DESIGN section 4.5
+is normative for the gear's six-method SPI and the crate is still catching up
+to it, so this document is part target and part record: an entry whose boxes are
+checked names work that has landed, and an unchecked box names work that has
+not. No prose summary of which is which is written here, because a summary is
+what goes stale between the checkbox and the reader. SPI-suite conformance is asserted by `tests/contract_conformance_pg.rs`, which
+runs the driven contract suite against a live backend and expects no violations.
 
-Splitting by capability rather than by SPI-method or file boundary keeps each feature mutually exclusive and lines the decomposition up with the plugin PRD's functional-requirement clusters (Record Persistence, Query & Aggregation, Usage-Type Catalog, Data Lifecycle, Plugin Integration). Foundation owns the cross-cutting plumbing — the Plugin Module, the SPI Storage Adapter, the Schema Migrations, and the SPI/security/registration contracts — once; capability features reference rather than duplicate them.
+Three absences this document once described as present are asserted rather than
+asserted-about: there is no usage-type catalog
+(`schema_integration_pg::there_is_no_usage_type_catalog`, read back from a live
+database), no superseded schema (the same suite reads the whole ledger back
+against DESIGN section 3.7), and no deactivation method: the SPI is the six
+methods of the SDK's `UsageCollectorPluginV1`, none of which deactivates
+anything, and the adapter that implements it adds no method of its own beyond
+its constructor.
 
-Dependencies flow outward from Foundation. Every capability feature builds on the foundation's schema, adapter, and registration handshake. Query & Aggregation additionally depends on Record Persistence & Lifecycle, because there is nothing to read until the write plane has accepted records. Data Retention is coupled to Record Persistence & Lifecycle through the dedup-key-preservation contract (dropping a chunk reclaims that chunk's dedup keys). Backend Observability & Metrics instruments the other capabilities but requires only the foundation's meter and pool to exist.
+**The split axis is the SPI surface, not the component model.** The plugin's
+eight DESIGN components do not partition cleanly into deliverable units: the
+Record Store and the Query component together serve all six SPI methods, and
+a feature that owned both would be six capabilities in one basket. Each entry
+below instead owns one behavior a test can drive through the SPI or through a
+background task, and pulls in whichever components that behavior needs. The Record Store is claimed once, by record ingestion (2.2),
+because that is where its write path lives; the read paths that also execute
+through it are claimed by the features that define their semantics, and name
+the sequences rather than the component. A component claim marks review and
+change-control ownership, not a build prerequisite: each entry adds its own
+statement builders to the component it names.
 
-This shape preserves the DESIGN's pure-persistence posture — the plugin performs no authentication, authorization, or business-delta computation — while keeping the write, read, catalog, lifecycle, and telemetry planes implementable and reviewable independently.
+Entry 2.1 is the foundation: nothing works until the schema exists and the
+backend is registered. Entries 2.2 and 2.3 build the write path. Entries 2.4
+through 2.8 are the read paths and the lifecycle sweep, each independently
+testable once the write path can produce entries. Entries 2.9 and 2.10 are
+cross-cutting: the metric inventory every other component records through, and
+the error vocabulary plus transport obligations every SPI call passes through.
+Each entry is a single-phase work package; sub-decomposition into milestones is
+deferred to its FEATURE document.
 
-**Decomposition Strategy**:
+**Why `Data: None` recurs, and why 2.1 differs.** Unlike the parent gear,
+which is storage-agnostic under `cpt-cf-usage-collector-adr-pluggable-storage`
+and defines no `db` or `dbtable` identifiers at all, this plugin owns a schema
+and four tables (DESIGN section 3.7). All five data identifiers belong to
+entry 2.1, because the schema is provisioned as one idempotent migration set
+at startup before any other feature can run. Every later entry reads or writes
+those same tables but provisions none of them, so each states `Data: None`
+with that reason named in place.
 
-- Cohesion by capability: each feature groups the DESIGN components, sequences, and data tables that collaborate to deliver one backend capability (e.g., Record Persistence & Lifecycle owns the Record Store component, the ingest/batch/deactivate sequences, and the `usage_records` table together).
-- Loose coupling via explicit `Depends On`: every feature declares its upstream features by ID. Foundation has no dependencies; downstream features list only the minimum upstream features they need.
-- 100% DESIGN/PRD element coverage: every `cpt-cf-uc-plugin-*` ID introduced by PRD.md and DESIGN.md is assigned to exactly one feature, or recorded as a deliberate omission with justification in [§2.7](#27-deliberate-omissions).
-- Mutual exclusivity at the capability layer: each DESIGN component and sequence is assigned to exactly one feature, and each `dbtable` has a single writer-owner. The `usage_records` DDL is created by Foundation's Schema Migrations but the table node is owned by its row-writer (Record Persistence & Lifecycle); Query & Aggregation and Data Retention read/expire it and note the shared usage rather than re-owning it. Cross-cutting elements (the SPI Storage Adapter, the Schema Migrations, the SPI and security contracts, the overall design and tech-stack nodes) are owned by Foundation and referenced — not duplicated — by dependent features.
-- Domain entities may appear under multiple features' "Domain Model Entities" lists because they cross feature boundaries by value (`UsageRecord` is written by Record Persistence, read by Query, and expired by Retention); this is reference, not duplicated ownership.
-- Write vs. read plane separation: the write-side (Record Persistence & Lifecycle) and read-side (Query & Aggregation) capabilities are split into distinct features so the ingestion-throughput and aggregation-query-latency NFRs can be sequenced and validated independently.
+**Open questions are recorded, not deferred silently.** PRD section 13 carries
+two open questions for the gateway and one known shortfall. The raw-list SPI
+return type is surfaced in entry 2.5, and the replay-horizon delivery question
+plus the long-transaction cursor shortfall are surfaced in entry 2.6. Each is
+an explicit scope caveat with a pointer back to PRD section 13, not a
+placeholder.
+
+**Inherited NFR exclusions.** PRD section 6.2's NFR exclusions are inherited,
+not decomposed. One of them is a published shortfall rather than an omission:
+the single connection pool entry 2.1 creates serves every path, so workload
+isolation is not realised and DESIGN section 4.1 item 1 publishes that.
+
+**Pre-release.** The Usage Collector subsystem and this plugin have no
+installations and no production data. No feature below carries a migration,
+backward-compatibility, or upgrade-path obligation; schema work is forward
+setup only.
 
 ## 2. Entries
 
-### 2.1 Foundation: Bootstrap, Schema & SPI Wiring ⏳ HIGH
+### 2.1 [Registration & Schema Provisioning](feature-registration-schema-provisioning/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-foundation`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
 
-- **Purpose**: Establish the plugin's runtime substrate and its single public surface — the storage SPI — so every capability plugs into one identical execution shape. At `#[toolkit::gear]` `init` the Plugin Module loads and validates the typed configuration, builds the TLS-required `sqlx` connection pool, runs the idempotent Schema Migrations, and performs the GTS handshake (`PluginV1::<UsageCollectorPluginSpecV1>::build_registration(...)`, publish to `types-registry`, `ClientHub::register_scoped::<dyn UsageCollectorPluginV1>` under the GTS instance scope, carrying the configured `vendor`/`priority`). The SPI Storage Adapter is the host's only entry point: it implements `UsageCollectorPluginV1`, routes record and catalog work to the stores, and owns translation of backend/SQL errors into the SDK's `UsageCollectorPluginError` vocabulary classified as `Transient` vs `Internal` plus the typed domain variants. Foundation also owns the pure-persistence and SPI-conformance guarantees, the TLS/credential-non-disclosure posture, the published single-node read-after-write consistency profile, and the vendor isolation that keeps all TimescaleDB-specific code in this crate with no dependency on the host gear.
+  Open on the one definition of done its feature document leaves unchecked:
+  the background loop's feed settled-horizon sampling.
 
-- **Depends On**: None
+- **Purpose**: Brings the backend into existence and makes it discoverable.
+  At startup the plugin loads and validates its configuration, creates the
+  connection pool, provisions the whole database schema idempotently, applies
+  the configuration-driven partitioning setup, and then registers itself as a
+  scoped SPI client under a GTS (Global Type System) instance identifier
+  carrying its configured vendor and priority. This is the discovery half of
+  `cpt-cf-usage-collector-adr-pluggable-storage`, which puts every persistence
+  and query call behind one SPI seam and lets operator configuration bind the
+  active backend. The schema deliberately holds no type catalog and no foreign
+  key to one, per `cpt-cf-usage-collector-adr-registry-owned-typing`:
+  declarations live in `types-registry` and never reach this plugin. The plugin
+  realizes the storage half of `cpt-cf-usage-collector-fr-pluggable-storage`
+  and provides the gear's registry contract
+  `cpt-cf-usage-collector-contract-gts-registry` through its own registration
+  contract `cpt-cf-uc-plugin-contract-gts-registration`.
+
+- **Depends On**: None (this is the foundation entry)
 
 - **Scope**:
-  - Overall backend design node (`cpt-cf-uc-plugin-design-timescaledb`) and the declared tech stack across the Wiring, Domain, and Infrastructure layers (`cpt-cf-uc-plugin-tech-stack`): `toolkit::gear` + `types-registry-sdk` wiring, `usage-collector-sdk` domain types, `sqlx`/TimescaleDB/`opentelemetry` infrastructure.
-  - Plugin Module lifecycle: config load, pool creation, migration invocation, and the GTS + ClientHub registration handshake; the module does not decide whether it is the active backend (selection is host-side) and does not implement SPI methods.
-  - SPI Storage Adapter: the single `UsageCollectorPluginV1` implementation, delegating record operations to the Record Store and catalog operations to the Catalog Store, holding no business logic or authorization, and owning backend-error classification and keyset cursor encoding.
-  - Schema Migrations: idempotent creation at `init` of the `timescaledb` extension, the `usage_type_catalog` table, the `usage_records` hypertable partitioned on event time with its 4-tuple dedup uniqueness constraint (the dedup authority), the `ON DELETE RESTRICT` foreign key to the catalog, the query-supporting indexes, and registration of the retention policy — all re-runnable as no-ops on restart.
-  - TLS-required, secret-wrapped DSN so the embedded Postgres password never reaches `Debug`, logs, or error output; the plugin refuses non-TLS connections.
-  - Published consistency profile: single-node PostgreSQL/TimescaleDB provides read-after-write visibility of a committed record; a read-replica deployment documents its staleness bound.
-  - Pure-persistence and SPI-conformance principles: no authentication, PDP authorization, attribution/shape validation, idempotency-key presence, or counter/gauge decisions; a malformed or unauthorized call reaching the SPI is a host-contract breach surfaced as `Internal`.
+  - Typed configuration load and validation, including the required
+    `database_url` and the rule that `transaction_timeout_secs` exceeds
+    `statement_timeout_secs`.
+  - Connection-pool creation over the operator-provisioned database that the
+    external contract `cpt-cf-uc-plugin-contract-timescaledb` describes, and
+    the startup durability checks that refuse to start when the server has
+    `fsync` or `full_page_writes` off.
+  - Idempotent schema migrations that build the ledger hypertable, the type-key
+    table, the feed retention marks table, and the hourly continuous aggregate,
+    so a restart re-runs provisioning as a no-op.
+  - Post-migration setup driven by configuration: the hypertable's chunk time
+    interval and type-key slice width, plus removal of any table-wide
+    declarative retention policy an earlier build may have registered.
+  - The GTS handshake: building the plugin registration, publishing it to
+    `types-registry`, and registering the SPI client in `ClientHub` under the
+    GTS instance scope with the configured vendor and priority.
+  - Keeping every backend-specific dependency, SQL statement and schema object
+    inside this crate, with no compile-time dependency on the host gear.
+  - Compile-time conformance to the six-method SPI trait -- the plugin's sole
+    public surface `cpt-cf-uc-plugin-interface-storage-spi`, realized as
+    `cpt-cf-uc-plugin-interface-spi` -- and a green run of the gear's full SPI
+    contract suite as the release gate.
 
 - **Out of scope**:
-  - Record insert, dedup, compensation, and deactivation semantics — owned by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle.
-  - Aggregation and keyset raw-list execution and injection-safe translation — owned by [§2.3](#23-query--aggregation--high) Query & Aggregation.
-  - Usage-type CRUD and FK-rejection lift — owned by [§2.4](#24-usage-type-catalog--referential-integrity--medium) Usage-Type Catalog & Referential Integrity.
-  - The declarative retention policy's expiry behavior and retention-bounded key preservation — owned by [§2.5](#25-data-retention--medium) Data Retention (the DDL that registers the policy is created here; its runtime effect is owned there).
-  - The `uc_timescaledb_*` metric inventory — owned by [§2.6](#26-backend-observability--metrics--medium) Backend Observability & Metrics.
-  - Database deployment topology (HA, sizing, region), backup/restore, and DR — owned by the operator's TimescaleDB deployment guide.
+  - Deciding which plugin the host binds; vendor and priority selection is
+    host-side.
+  - The rollup's refresh-policy application, which entry 2.4 owns even though
+    the Gear component invokes it during `init`.
+  - The content of any runtime query or retention decision, which the features
+    below own.
+  - Data migration from a prior release: the subsystem is pre-release, with no
+    installations and nothing to migrate.
 
 - **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-registration`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-schema-provisioning`
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-registration`
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-error-classification`
-  - [x] `p1` - `cpt-cf-uc-plugin-nfr-spi-stability`
-  - [x] `p1` - `cpt-cf-uc-plugin-nfr-transport-security`
-  - [x] `p1` - `cpt-cf-uc-plugin-nfr-consistency-profile`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-spi-stability`
+
+  The durable-acknowledgement requirement is covered twice on purpose: this
+  entry owns the startup check that refuses an unsafe server setting, and 2.2
+  owns the per-transaction commit guarantee.
+
+  One of the four stays open on something outside this entry's reach today:
+  `cpt-cf-uc-plugin-fr-registration` waits on the background loop's feed
+  settled-horizon sampling, which is slice 3's. `cpt-cf-uc-plugin-nfr-spi-stability`
+  is enforced by the contract suite running with no violations.
 
 - **Design Principles Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-principle-pure-persistence`
-  - [ ] `p2` - `cpt-cf-uc-plugin-principle-spi-conformance`
+
+  - [x] `p1` - `cpt-cf-uc-plugin-principle-spi-conformance`
+
+  Covered by the same contract-suite run as `cpt-cf-uc-plugin-nfr-spi-stability`.
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-vendor-isolation`
+
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-vendor-isolation`
 
 - **Domain Model Entities**:
-  - `UsageCollectorPluginV1` (SPI trait)
-  - `UsageCollectorPluginError` (error vocabulary)
-  - Typed plugin configuration and connection-pool handle (plugin-local)
+  - TimescaleDbPluginConfig
+  - TypeKeyCache
+  - Connection pool handle
 
 - **Design Components**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-component-module`
-  - [ ] `p2` - `cpt-cf-uc-plugin-component-adapter`
-  - [ ] `p2` - `cpt-cf-uc-plugin-component-migrations`
+
+  - [ ] `p2` - `cpt-cf-uc-plugin-component-gear`
+  - [x] `p1` - `cpt-cf-uc-plugin-component-migrations`
+
+  The Gear component stays open for the reason `cpt-cf-uc-plugin-fr-registration`
+  does: its background loop does not yet sample the feed's settled-horizon lag,
+  which is slice 3's.
 
 - **API**:
-  - [ ] `p1` - `cpt-cf-uc-plugin-interface-storage-spi`
-  - [ ] `p2` - `cpt-cf-uc-plugin-interface-spi`
-  - In-process async `UsageCollectorPluginV1` trait object (`async_trait`, `Send + Sync + 'static`), consumed by the Plugin Host via `ClientHub`. Ten SPI methods across the record group (`create_usage_record`, `create_usage_records`, `get_usage_record`, `query_aggregated_usage_records`, `list_usage_records`, `deactivate_usage_record`) and the catalog group (`create_usage_type`, `get_usage_type`, `list_usage_types`, `delete_usage_type`); their per-capability flows are owned by the features below. No REST or network-exposed surface.
+  - Gear `init` lifecycle hook (config load, pool, migrations, registration)
+  - Gear `start` / `stop` lifecycle hooks for the background task
+  - `UsageCollectorPluginV1` trait registration under the GTS instance scope
+  - No REST or network-exposed surface; the SPI is in-process only
 
-- **Sequences**:
-  - None (bootstrap and registration expose no runtime SPI sequence).
+- **Sequences**: None -- startup is the Gear component's `init` and is
+  described as a component responsibility in DESIGN section 3.2 rather than as
+  a numbered sequence.
 
 - **Data**:
-  - [ ] `p3` - `cpt-cf-uc-plugin-db-schema`
 
-- **Contracts**:
-  - [ ] `p1` - `cpt-cf-uc-plugin-contract-timescaledb`
-  - [ ] `p2` - `cpt-cf-uc-plugin-contract-gts-registration`
+  - [x] `p1` - `cpt-cf-uc-plugin-db-schema`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-records`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-type-key`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-rollup-1h`
+  - [x] `p1` - `cpt-cf-uc-plugin-dbtable-usage-feed-retention-marks`
 
-### 2.2 Record Persistence & Lifecycle ⏳ HIGH
+### 2.2 [Record Ingestion & Idempotency](feature-record-ingestion-idempotency/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-record-persistence`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
-- **Purpose**: Provide the backend write plane — the sole path into `usage_records`. Single and batch inserts resolve against the hypertable's 4-tuple dedup constraint as the atomic serialization authority: a fresh key inserts; on a dedup-key collision the canonical fields (`value`, `resource_ref`, `subject_ref`, `corrects_id`, `metadata`) are compared — all equal yields silent absorb of the stored row, any differ yields `IdempotencyConflict`. Because `created_at` is part of the dedup key rather than a compared field, a same-key submission with a different `created_at` is a distinct 4-tuple and a new record (ADR-0014). Batch writes return one positionally-aligned outcome per input record, and a conflict on one record never fails the others. Compensation rows (a caller-supplied signed `value` plus `corrects_id`) persist verbatim through the same insert path with no dedicated operation and no netting. Deactivation is a one-way `active → inactive` status flip that, in a single transaction, flips the target row and its depth-1 active compensations and mutates no other field.
+  Open on the throughput rate no suite here measures, and on nothing else:
+  every definition of done in its feature document is checked. Named under
+  Requirements Covered below.
 
-- **Depends On**: `cpt-cf-uc-plugin-feature-foundation`
+- **Purpose**: Delivers the plugin's write path: batch persistence of usage
+  entries, one entry or many, deduplicated in the backend on the gear's six-part
+  identity, acknowledged only once durable, with every caller-supplied value
+  stored verbatim. Deduplication at the storage boundary is what
+  `cpt-cf-usage-collector-adr-mandatory-idempotency` assigns to the plugin, so
+  that at-least-once emission from callers is safe for every declared fold.
+  The entry identifier the plugin stores is derived by the gateway as a UUIDv5
+  over that same identity, per
+  `cpt-cf-usage-collector-adr-record-identity-derivation`; the plugin mints no
+  identity of its own. This feature realizes the storage side of
+  `cpt-cf-usage-collector-fr-ingestion`,
+  `cpt-cf-usage-collector-fr-record-metadata`,
+  `cpt-cf-usage-collector-fr-idempotency` and
+  `cpt-cf-usage-collector-fr-record-quantity`.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
 
 - **Scope**:
-  - Single insert with 4-tuple dedup (exact-equality canonical-field comparison on conflict), `metadata` persisted byte-for-byte, `status = Active` on first accept.
-  - Batch insert as a single multi-row write returning per-record results in input order.
-  - Compensation persistence: signed `value` + optional `corrects_id` on the ordinary insert path; the plugin computes and validates no netting.
-  - Depth-1 atomic deactivation cascade: `UsageRecordNotFound` on a missing target, `UsageRecordAlreadyInactive` on an already-inactive target, otherwise flip target plus depth-1 active compensations.
-  - `get_usage_record` by `id` (the deterministic `UUIDv5` of the 4-tuple, ADR-0013/ADR-0014, resolving a single row).
-  - Bulk-ingestion throughput allocation through the batch write path within the parent throughput-profile envelope.
+  - One guarded statement that computes its own admission verdict from the
+    statement's timestamp, inserts only an admitted row, and reports whether
+    that row won its identity.
+  - Batch insert over the same guarded statement shape, with one result per
+    input entry positionally aligned to input order, so a conflict or rejection
+    on one entry never fails the others.
+  - Deduplication on the tenant, GTS type, idempotency key, covered period and
+    entry type, enforced by the ledger's unique constraint and its conflict
+    target, with the read-back keyed on the entry identifier.
+  - Resolution of a duplicate identity: identical caller-supplied fields are a
+    silent absorb returning the stored entry, divergent fields an idempotency
+    conflict carrying the stored entry.
+  - In-batch resolution of two same-identity entries, the later against the
+    earlier.
+  - Refusal, as a retryable error, of an entry whose acceptance instant differs
+    from the store's clock by more than the configured acceptance slack.
+  - The declared dedup level `linearizable` with a convergence bound of zero,
+    established from the store's commit order rather than from elapsed time,
+    including discarding a write whose caller was already answered.
+  - Durable acknowledgement: synchronous commit forced on every write
+    transaction, no in-memory buffering of acknowledged entries.
+  - Digit-for-digit quantity round-trip on every read path that returns an
+    entry, negative half included, with no conversion, scaling, rounding or
+    truncation.
+  - Per-type key assignment and caching on an entry's first write, resolved
+    before the write transaction opens (DESIGN section 3.2 lists the assignment
+    under the Retention component and the resolution under the Record Store; it
+    is claimed here because it runs on the write path).
 
 - **Out of scope**:
-  - Reading records back for aggregation or keyset list — owned by [§2.3](#23-query--aggregation--high) Query & Aggregation.
-  - Schema DDL for `usage_records` (hypertable, dedup UNIQUE, FK, indexes) — created by [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high) Foundation's Schema Migrations; this feature is the row-writer.
-  - Chunk expiry / retention of stored rows — owned by [§2.5](#25-data-retention--medium) Data Retention.
+  - Idempotency-key presence, attribution and metadata shape validation, all
+    enforced by the gear core before the call reaches the SPI.
+  - Persistence of a withdrawal entry and its at-most-one rule, which entry 2.3
+    owns even though it reuses this write path.
+  - Preservation of a dedup identity beyond the referenced type's declared
+    retention; that bound is entry 2.7's rule and the gear's adopted floor.
+  - The startup durability checks that refuse an unsafe server setting, which
+    entry 2.1 owns; `cpt-cf-uc-plugin-fr-durable-ack` is split between the two,
+    and this feature owns its per-transaction commit guarantee.
 
 - **Requirements Covered**:
+
   - [x] `p1` - `cpt-cf-uc-plugin-fr-record-persistence`
   - [x] `p1` - `cpt-cf-uc-plugin-fr-idempotent-dedup`
-  - [x] `p2` - `cpt-cf-uc-plugin-fr-compensation-persistence`
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-deactivation`
-  - [x] `p1` - `cpt-cf-uc-plugin-nfr-ingestion-throughput`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-durable-ack`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-quantity-fidelity`
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-dedup-level`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-ingestion-throughput`
+
+  One stays open. `cpt-cf-uc-plugin-nfr-ingestion-throughput` is a sustained
+  rate the repository runs no load test for, so no suite here can close it; the
+  batch-shape half of it is checked through
+  `cpt-cf-uc-plugin-dod-batch-positional-results`.
 
 - **Design Principles Covered**:
-  - None (realizes the pure-persistence principle owned by Foundation).
+
+  - [x] `p1` - `cpt-cf-uc-plugin-principle-pure-persistence`
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-dedup-key-preservation`
+
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-dedup-key-preservation`
 
 - **Domain Model Entities**:
-  - `UsageRecord`
+  - UsageRecord
+  - UsageRecordRow
+  - Transaction id (`xact_id`)
+  - Type key
 
 - **Design Components**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-component-record-store`
+
+  - [x] `p1` - `cpt-cf-uc-plugin-component-record-store`
 
 - **API**:
-  - `create_usage_record` — persist one record; dedup or `IdempotencyConflict`.
-  - `create_usage_records` — batch persist; per-record results in input order.
-  - `get_usage_record` — fetch one record by `id`.
-  - `deactivate_usage_record` — depth-1 atomic `active → inactive` set flip.
+  - `create_usage_records` (SPI)
 
 - **Sequences**:
-  - `p1` - `cpt-cf-uc-plugin-seq-ingest-dedup`
-  - `p1` - `cpt-cf-uc-plugin-seq-ingest-batch`
-  - `p1` - `cpt-cf-uc-plugin-seq-deactivate-cascade`
 
-- **Data**:
-  - `p1` - `cpt-cf-uc-plugin-dbtable-usage-records`
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-ingest-batch`
 
-### 2.3 Query & Aggregation ⏳ HIGH
+- **Data**: None -- the ledger and type-key tables this feature writes are
+  provisioned by 2.1; this feature adds no schema object of its own.
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-query-aggregation`
+### 2.3 [Invalidation Persistence](feature-invalidation-persistence/) - HIGH
 
-- **Purpose**: Provide the backend read plane, pushing analytical work into the backend so TimescaleDB's native acceleration does it. Aggregation executes SUM/COUNT/MIN/MAX/AVG with grouping over the requested dimensions inside the backend, applying the host-supplied filter and scope over the active-row set, and never returns raw rows for client-side aggregation. The raw list is keyset (seek) pagination over the canonical `(created_at, id)` order: it fetches one extra row to detect a next page, trims, and seeds the next `CursorV1` from the last in-page row, honoring the host order and cursor and refusing an order key on a nullable field so no matching record is silently dropped. All translation is injection-safe: comparison values (scope/tenant predicate, time bounds, cursor seek key, metadata key/value) are bound parameters, and any caller-influenced identifier is resolved through a closed allowlist of `usage_records` columns or rejected as `Internal`. This feature is the allocation target for the aggregation query-latency NFR (p95 ≤ 500 ms over a 30-day single-tenant range).
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-invalidation-persistence`
 
-- **Depends On**: `cpt-cf-uc-plugin-feature-foundation`, `cpt-cf-uc-plugin-feature-record-persistence`
+  Open on the withdrawal-reference lookup, named under Requirements Covered
+  below.
+
+- **Purpose**: Persists a withdrawal as an ordinary appended entry that names
+  the entry it withdraws and carries a reason code, never rewriting the
+  withdrawn entry, and admits at most one withdrawal per target. This is a
+  narrow feature on purpose. It reuses 2.2's write path, but it is its own
+  behavior with its own correctness rule: every withdrawal of one target shares
+  a single dedup identity -- the target's tenant, GTS type, idempotency key and
+  covered period with entry type `invalidation` -- so a second withdrawal
+  collides with the first, and the exactness of the fold's netting rests on
+  that bound. It mirrors the parent gear's record-invalidation feature at the
+  storage tier, and it is the storage realization of
+  `cpt-cf-usage-collector-adr-append-only-invalidation`, which makes a
+  correction a new fact rather than a mutation of history. It realizes
+  `cpt-cf-usage-collector-fr-record-invalidation` on the write side. Its
+  assertions land in the same target Record ingest suite as 2.2 (DESIGN section
+  4.6); the split is by correctness rule and review ownership, not by test
+  binary.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
 - **Scope**:
-  - Pushed-down aggregation (SUM/COUNT/MIN/MAX/AVG with grouping) over the active-row set with the host filter and scope applied.
-  - Keyset-paginated raw list over `(created_at, id)` honoring the supplied order and cursor, with a one-row look-ahead and next-cursor encoding; the effective page size is floored to 1.
-  - Injection-safe translation: comparison values are bound parameters and identifiers are allowlisted; metadata predicates bind both the metadata key and the compared value as parameters, so the open-ended metadata namespace needs no key enumeration.
-  - Fail-closed rejection of a `$orderby` on a domain-optional (nullable) field, so a crafted cursor cannot smuggle a nullable ordering key past the query boundary.
-  - Aggregation query-latency NFR allocation through server-side aggregation and time-bucketed hypertable indexes.
+  - Persisting a withdrawal through the ordinary insert path, with its
+    withdrawal reference and reason code stored as the gateway supplied them.
+  - The storage-enforced pairing rule 2.1's schema carries: the withdrawal
+    reference and the reason code are set exactly when the entry declares itself
+    an invalidation.
+  - At most one withdrawal per target, established by the shared dedup identity
+    rather than by a separate store-side rule.
+  - A record and its withdrawal persisting as two distinct entries under the
+    same idempotency key and covered period, each retry absorbed against its
+    own stored row.
+  - Withdrawal-reference lookups served by the ledger's withdrawal-reference
+    index that 2.1 provisions, which the fold's exclusion rule reads.
+  - Never mutating or deleting the withdrawn entry.
 
 - **Out of scope**:
-  - Writing, dedup, compensation, or deactivation of records — owned by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle.
-  - Catalog listing keyset pagination (`list_usage_types`) — reuses this same keyset pattern but is owned by [§2.4](#24-usage-type-catalog--referential-integrity--medium) Usage-Type Catalog & Referential Integrity against the Catalog Store.
-  - The `usage_records` table DDL and row-writer ownership — created by Foundation, written by Record Persistence & Lifecycle; this feature is a reader and re-owns neither.
+  - Faithful-copy validation of a withdrawal against its target, which the gear
+    core performs before dispatch.
+  - Excluding a withdrawn pair from a fold, which entry 2.4 owns, and ordering
+    a withdrawal after its target in the feed, which entry 2.6 owns.
+  - Resolving the target by lookup, which entry 2.5 owns.
 
 - **Requirements Covered**:
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-aggregated-query`
-  - [x] `p2` - `cpt-cf-uc-plugin-fr-raw-query`
-  - [x] `p1` - `cpt-cf-uc-plugin-nfr-query-latency`
 
-- **Design Principles Covered**:
-  - None (realizes the pure-persistence principle owned by Foundation).
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-invalidation-persistence`
 
-- **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-injection-safe-translation`
+  Open on the withdrawal-reference lookup alone. The index is provisioned by
+  2.1 and the fold's exclusion predicate reads the reference, but nothing
+  matches on the covered-period end beside it and no test reads a plan back, so
+  `cpt-cf-uc-plugin-algo-withdrawal-reference-lookup` and
+  `cpt-cf-uc-plugin-dod-withdrawal-reference-index` stay unchecked. They close
+  with the query rules of slice 7, which owns the read paths that issue the
+  lookup. Every other part of this entry is checked.
+
+- **Design Principles Covered**: None -- the write path's pure-persistence
+  principle is carried by 2.2, whose insert path this feature reuses unchanged.
+
+- **Design Constraints Covered**: None -- the dedup-key constraint that
+  produces the at-most-one bound is carried by 2.2; this feature applies it to
+  the withdrawal identity rather than restating it.
 
 - **Domain Model Entities**:
-  - `UsageRecord` (read)
-  - `AggregationSpec`
-  - `AggregationResult`
-  - `ODataQuery`
-  - `CursorV1`
-  - `Page`
+  - Invalidation
+  - UsageRecord (withdrawal entry)
+  - ReasonCode
 
-- **Design Components**:
-  - None (query execution lives in the Record Store component owned by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle; this feature owns its read-path sequences and the injection-safe translation constraint, referencing that component rather than re-owning it).
+- **Design Components**: None -- the withdrawal rides the Record Store insert
+  path claimed by 2.2; this feature adds behavior to that path rather than a
+  component of its own.
 
 - **API**:
-  - `query_aggregated_usage_records` — pushed-down SUM/COUNT/MIN/MAX/AVG + group-by.
-  - `list_usage_records` — keyset-paginated raw page.
+  - `create_usage_records` (SPI, entry type `invalidation`)
 
-- **Sequences**:
-  - `p1` - `cpt-cf-uc-plugin-seq-query-aggregated`
-  - `p2` - `cpt-cf-uc-plugin-seq-list-keyset`
+- **Sequences**: None -- a withdrawal follows the ingest sequences 2.2 owns;
+  its distinguishing rule is the shared dedup identity described in DESIGN
+  section 3.1, not a separate flow.
 
-- **Data**:
-  - `cpt-cf-uc-plugin-dbtable-usage-records` (reader; written by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle — shared usage, not re-owned).
+- **Data**: None -- the ledger table and its withdrawal-reference index are
+  provisioned by 2.1.
 
-### 2.4 Usage-Type Catalog & Referential Integrity ⏳ MEDIUM
+### 2.4 [Aggregated Query & Rollup](feature-aggregated-query-rollup/) - HIGH
 
-- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-usage-type-catalog`
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-aggregated-query-rollup`
 
-- **Purpose**: Own the sole store for the usage-type catalog and the in-database referential integrity between records and types. `create_usage_type` inserts a catalog row keyed on the `gts_id` primary key (a collision surfaces `UsageTypeAlreadyExists`); `get_usage_type` returns the row or `UsageTypeNotFound`; `list_usage_types` is keyset-paginated ordered by `gts_id`; `delete_usage_type` attempts the delete and lifts the `usage_records.gts_id → usage_type_catalog.gts_id` `ON DELETE RESTRICT` FK violation to `UsageTypeReferenced`. Because both tables live in the same database, the FK rejection is atomic with the delete attempt and orphaned records are structurally impossible. `kind` and `metadata_fields` are stored verbatim; the plugin derives and validates no semantics.
+- **Purpose**: Executes the host-supplied aggregation fold inside the backend,
+  with grouping, filtering and scope pushed down, and serves eligible queries
+  from an hourly materialised aggregate instead of scanning the ledger. The
+  plugin never chooses a fold: the fold is declared on the type and arrives as
+  a typed parameter, per `cpt-cf-usage-collector-adr-declared-fold`. Every
+  range predicate selects on the covered-period end alone, per
+  `cpt-cf-usage-collector-adr-window-end-selection`. The materialised aggregate
+  exists because `cpt-cf-usage-collector-adr-feed-aggregate-split` makes the
+  aggregate a derived view a plugin may materialise, while a charging consumer
+  reads the entry feed instead. This feature is the plugin's allocation target
+  for `cpt-cf-usage-collector-nfr-query-latency` and
+  `cpt-cf-usage-collector-nfr-aggregate-freshness`, and realizes
+  `cpt-cf-usage-collector-fr-query-aggregation`.
 
-- **Depends On**: `cpt-cf-uc-plugin-feature-foundation`
+- **Depends On**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`,
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`
 
 - **Scope**:
-  - Catalog create (insert; `gts_id` PK collision → `UsageTypeAlreadyExists`), storing `kind` and `metadata_fields` verbatim.
-  - Catalog point read (`get_usage_type`; absent → `UsageTypeNotFound`).
-  - Catalog keyset-paginated list ordered by `gts_id` (reusing the raw-list keyset pattern against the Catalog Store).
-  - Catalog delete with in-database FK rejection lifted to `UsageTypeReferenced`; the catalog is reference data and is not retention-bounded.
+  - Pushed-down `SUM`, `COUNT`, `MIN`, `MAX` and `LATEST` with grouping over
+    the requested dimensions, applying the host-supplied filter, scope and
+    metadata filter, and returning no raw rows for client-side aggregation.
+  - Exclusion of a withdrawn entry and the withdrawal that removed it from
+    every fold.
+  - The `LATEST` total order: greatest covered-period end, then latest
+    acceptance instant, then greatest entry identifier in byte order.
+  - Metadata filtering that ORs the values of one key and ANDs distinct keys.
+  - Bucket-key rendering: a tenant dimension as the lowercase hyphenated UUID,
+    every other dimension verbatim; grouping on subject identifier or subject
+    type excludes entries without a subject.
+  - Empty-selection values: zero under `SUM` and `COUNT`, null under `MAX`,
+    `MIN` and `LATEST`, with a group nothing survives in yielding no bucket.
+  - An unimplemented fold answered as an internal error, never by substituting
+    another fold.
+  - The five rollup-eligibility conditions, the split between whole-hour
+    rollup reads and partial-hour ledger edges, and reporting which path served
+    a query and why a fallback occurred.
+  - Idempotent application of the live and history continuous-aggregate refresh
+    policies at startup, each committing batch by batch, plus sampling of each
+    policy's last-run status and age since success.
+  - Publication of the acceptance-to-aggregate and withdrawal-propagation
+    bounds the aggregate path carries.
+  - Publication of the `LATEST` fold's memory bound: peak memory grows with the
+    row count of the largest group, and the caller's covered period is the only
+    thing that bounds it (DESIGN section 4.2).
 
 - **Out of scope**:
-  - Validation of metadata-key well-formedness or membership, and counter/gauge derivation — inherited pure-persistence posture owned by [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high) Foundation and enforced upstream by the gear core.
-  - The `usage_records` FK column definition (DDL) — created by Foundation's Schema Migrations; this feature owns the catalog-side delete behavior that the FK backs.
+  - Resolving which fold a type declares, owned by the gear core.
+  - Raw row retrieval and point lookup, covered by entry 2.5.
+  - Dropping rollup rows during a retention sweep, covered by entry 2.7, which
+    performs the drop using the materialisation-table name this feature
+    resolves.
 
 - **Requirements Covered**:
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-usage-type-catalog`
-  - [x] `p1` - `cpt-cf-uc-plugin-fr-referential-integrity`
 
-- **Design Principles Covered**:
-  - None (realizes the pure-persistence principle owned by Foundation).
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-aggregated-query`
+  - [ ] `p2` - `cpt-cf-uc-plugin-fr-rollup-aggregation`
+  - [ ] `p2` - `cpt-cf-uc-plugin-nfr-aggregate-freshness`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-query-latency`
+
+- **Design Principles Covered**: None -- the aggregate path adds no principle
+  beyond the pure-persistence rule 2.2 carries, which is why the fold arrives
+  as a parameter rather than being resolved here.
 
 - **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-fk-referential-integrity`
+
+  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-rollup-ledger-coupling`
 
 - **Domain Model Entities**:
-  - `UsageType`
+  - AggregationSpec
+  - AggregationResult
+  - AggregationFold
 
 - **Design Components**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-component-catalog-store`
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-component-query`
+  - [ ] `p1` - `cpt-cf-uc-plugin-component-rollup`
 
 - **API**:
-  - `create_usage_type` — insert catalog row.
-  - `get_usage_type` — fetch catalog row by `gts_id`.
-  - `list_usage_types` — keyset-paginated catalog page.
-  - `delete_usage_type` — delete; FK rejection → `UsageTypeReferenced`.
+  - `query_aggregated_usage_records` (SPI)
 
 - **Sequences**:
-  - `p1` - `cpt-cf-uc-plugin-seq-create-type`
-  - `p1` - `cpt-cf-uc-plugin-seq-delete-type-fk`
 
-- **Data**:
-  - `p1` - `cpt-cf-uc-plugin-dbtable-usage-type-catalog`
+  - [ ] `p1` - `cpt-cf-uc-plugin-seq-query-aggregated`
+  - [ ] `p1` - `cpt-cf-uc-plugin-seq-rollup-refresh`
 
-### 2.5 Data Retention ⏳ MEDIUM
+- **Data**: None -- the ledger table and the hourly continuous aggregate this
+  feature reads and refreshes are provisioned by 2.1.
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-feature-retention`
+### 2.5 [Raw Query & Converged Lookup](feature-raw-query-converged-lookup/) - HIGH
 
-- **Purpose**: Bound `usage_records` storage growth for the append-heavy time-series workload without a gear-side delete path. A declarative TimescaleDB retention policy — registered idempotently at startup by Schema Migrations and run as a backend background job — drops every chunk whose `created_at` window lies wholly outside the configured `retention_period` (default 365 days); the plugin issues no row-level delete for expiry. Retention is keyed on event time, so a row's eligibility follows its `created_at` independent of `ingested_at`. Because the dedup `UNIQUE` index rides the hypertable's chunk lifecycle, dropping a chunk also reclaims that chunk's dedup keys — which is why idempotency-key preservation is retention-bounded (chunk-granular) rather than permanent, a divergence tracked for upstream reconciliation. The `usage_type_catalog` is reference data and is not retained.
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-raw-query-converged-lookup`
 
-- **Depends On**: `cpt-cf-uc-plugin-feature-foundation`
+- **Purpose**: Serves the two exact read paths over the ledger: keyset-
+  paginated raw pages over the host-supplied order, and a scoped point lookup
+  by entry identifier that the gateway uses to resolve a withdrawal's target
+  before it accepts the correction. Both paths return what is stored, with no
+  derived view in between. The lookup's guarantees follow
+  `cpt-cf-usage-collector-adr-consistency-contract`, which sets a floor and
+  obliges every plugin to publish its own ceiling, its dedup level and its
+  convergence bound; on this plugin's single transactional primary both the
+  convergence bound and the query-path lag bound are zero, so a converged-only
+  read answers immediately and the not-converged variant never occurs. These
+  paths realize `cpt-cf-usage-collector-fr-query-raw` and the lookup half of
+  `cpt-cf-usage-collector-fr-record-invalidation` and
+  `cpt-cf-usage-collector-fr-record-identity`.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`
 
 - **Scope**:
-  - Declarative event-time retention policy on the `usage_records` hypertable, dropping wholly-expired chunks at the configured `retention_period`.
-  - Idempotent policy registration at `init` (no row-level expiry deletes), re-runnable as a no-op on restart.
-  - The retention-bounded dedup-key-preservation consequence and its operator sizing guidance (retention window must exceed the maximum client replay/backfill horizon).
+  - Keyset seek pagination from the structured keyset the gateway decoded, over
+    the effective order the host supplies, returning the page's rows together
+    with the keyset of its last row.
+  - Fetching one row beyond the page size to detect whether a next page exists.
+  - Never widening the host-supplied filter and never using an offset scan.
+  - An order key on a field that may be absent answered as an internal error,
+    because the seek predicate is a row-value comparison sound only over
+    non-null columns.
+  - Returning entries as persisted, so a withdrawn record and the withdrawal
+    that removed it both appear and are not guaranteed to land on one page.
+  - Point lookup by entry identifier with the host-supplied scope applied in
+    the same predicate, so an out-of-scope entry answers exactly as an absent
+    one.
+  - Converged-only semantics: a surviving entry returned once its identity has
+    converged, an acknowledged and retained entry never reported absent, and a
+    definite answer within the convergence bound plus the published query-path
+    lag bound.
+  - Publication of the full nine-item consistency profile, including the dedup
+    level, the convergence bound and the query-path lag bound, and the
+    obligation on a deployment outside the single-primary posture to republish
+    the affected items before serving traffic.
 
 - **Out of scope**:
-  - Creation of the `usage_records` hypertable and the registration call site — created by [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high) Foundation's Schema Migrations; this feature owns the policy's runtime expiry semantics and the key-preservation contract.
-  - The 4-tuple dedup-write behavior itself — owned by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle (coupled here via key preservation).
-  - Columnar compression of aging chunks and continuous-aggregate rollups — deferred post-v1 ([§2.7](#27-deliberate-omissions)).
+  - Encoding, decoding, signing or validating a wire cursor, which the gateway
+    owns and entry 2.6 states as a constraint.
+  - Aggregation over raw rows, covered by entry 2.4.
+  - Deriving the per-path bounds the profile carries: the dedup level and
+    convergence bound are 2.2's, the aggregate bounds 2.4's, the feed's
+    settled-horizon bound 2.6's. This feature assembles the published nine-item
+    profile from them.
+  - ~~**The raw-list SPI return type is an open question for the gateway**: the
+    gear's trait returns a page envelope while this plugin's raw-query sequence
+    returns a keyset. This feature follows the sequence, and the reconciliation
+    of the two shapes is recorded in PRD section 13 rather than settled
+    here.~~ **Closed by ruling H1**: the trait now takes
+    `keyset: Option<&Keyset>` and returns `usage_collector_sdk::RecordPage`, so
+    trait and sequence carry the same shape and the gateway owns the wire
+    token. Kept rather than deleted, as PRD §13 item 2 and
+    `raw-query-converged-lookup.md` §1.2 keep theirs.
 
 - **Requirements Covered**:
-  - [x] `p2` - `cpt-cf-uc-plugin-fr-retention`
 
-- **Design Principles Covered**:
-  - None.
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-raw-query`
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-converged-lookup`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-consistency-profile`
 
-- **Design Constraints Covered**:
-  - [ ] `p2` - `cpt-cf-uc-plugin-constraint-retention`
+- **Design Principles Covered**: None -- both read paths run under the
+  pure-persistence principle 2.2 carries; neither adds a principle of its own.
+
+- **Design Constraints Covered**: None -- the gateway-owned-cursor constraint
+  that governs the keyset handoff is carried by 2.6, which owns the feed's
+  position issuance as well; this feature consumes the rule rather than stating
+  it twice.
 
 - **Domain Model Entities**:
-  - `UsageRecord` (chunk-expired subject; not re-owned)
+  - ODataQuery
+  - Keyset
+  - RecordPage
+  - UsageRecord
 
-- **Design Components**:
-  - None (the retention policy is registered by the Schema Migrations component owned by [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high) Foundation and thereafter runs as a backend job; this feature owns the retention and dedup-key-preservation constraints, referencing that component rather than re-owning it).
+- **Design Components**: None -- the seek and point-read statements are built
+  by the Query component that 2.4 claims and executed by the Record Store that
+  2.2 claims; this feature defines their semantics.
 
 - **API**:
-  - None (declarative backend policy; no SPI method).
+  - `list_usage_records` (SPI)
+  - `get_usage_record` (SPI)
 
 - **Sequences**:
-  - None (backend background job; no host-facing SPI sequence).
 
-- **Data**:
-  - `cpt-cf-uc-plugin-dbtable-usage-records` (retention target; written by [§2.2](#22-record-persistence--lifecycle--high) Record Persistence & Lifecycle — shared usage, not re-owned).
+  - [ ] `p1` - `cpt-cf-uc-plugin-seq-list-keyset`
+  - [ ] `p1` - `cpt-cf-uc-plugin-seq-converged-lookup`
 
-### 2.6 Backend Observability & Metrics ⏳ MEDIUM
+- **Data**: None -- the ledger table and the indexes both paths read are
+  provisioned by 2.1.
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-feature-observability`
+### 2.6 [Usage Feed](feature-usage-feed/) - HIGH
 
-- **Purpose**: Emit the backend-internal telemetry the gear cannot see, under the plugin's own `uc_timescaledb_*` OpenTelemetry sub-namespace exported via OTLP, distinct from the gear's request-path signals. The inventory covers performance (insert/query/deactivate/pool-acquire duration histograms), efficiency (pool gauges, dedup-absorbed/stale counters, batch-row histogram), reliability (backend errors by classification, batch retries, idempotency conflicts, usage-type-referenced rejections, migration failures, and the plugin-local `uc_timescaledb_ready` health gauge), security (TLS handshake failures), and catalog/workload (catalog size, compensations, query-request mix). Histogram bucket layouts bracket the NFR p95 budgets and are part of the contract; instrument names are full literal Prometheus names with no unit hint; and unbounded identifiers (`tenant_id`, `gts_id`, `id`, `idempotency_key`, `corrects_id`, `request_id`, `trace_id`) are never used as labels. Each SPI dispatch records its SQL work under the host's ambient tracing span, so backend latency is attributable end-to-end through the host `trace_id`.
+- [ ] `p1` - **ID**: `cpt-cf-uc-plugin-feature-usage-feed`
 
-- **Depends On**: `cpt-cf-uc-plugin-feature-foundation`
+- **Purpose**: Serves replay-safe feed pages over a subscription of GTS types
+  under the host-supplied compiled scope, in the plugin's own deterministic
+  order below the instance-wide settled horizon. A charging consumer reads this
+  feed and derives its charges from entries, which is the split
+  `cpt-cf-usage-collector-adr-feed-aggregate-split` decides; that decision also
+  fixes that the gateway owns the wire cursor, that pages come in a
+  deterministic order the plugin chooses, and that a withdrawal follows the
+  entry it withdraws. Completeness and snapshot consistency are gear-level feed
+  guarantees (`cpt-cf-usage-collector-adr-consistency-contract` states the
+  snapshot guarantee as one the append-only ledger purchases); what this plugin
+  publishes above the eventual floor is its own freshness and lag bounds. The
+  feature realizes `cpt-cf-usage-collector-fr-billing-usage-feed`,
+  `cpt-cf-usage-collector-fr-billing-fields-on-read` and the refusal half of
+  `cpt-cf-usage-collector-fr-billing-retention-floor`, and is the allocation
+  target for `cpt-cf-usage-collector-nfr-billing-feed-freshness` and
+  `cpt-cf-usage-collector-nfr-replay-throughput`.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`,
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`
 
 - **Scope**:
-  - The `uc_timescaledb_*` metric inventory (performance, efficiency, reliability, security, catalog/workload groups) with bounded label cardinality and the SLO summary.
-  - The plugin-local `uc_timescaledb_ready` backend-health gauge (set after a successful pool build + migration, cleared on pool-acquire failure), distinct from the host-computed structural readiness gauge.
-  - Recording each SPI dispatch's SQL work under the host's ambient tracing span (the plugin opens no root span).
+  - Feed order by inserting-transaction identifier and then entry identifier,
+    served from the dedicated feed index, with the compiled scope applied as a
+    bound predicate so an out-of-scope entry is absent.
+  - The page protocol that fixes a snapshot before planning and re-checks the
+    retention marks authoritatively after commit (steps in DESIGN section 3.6
+    `cpt-cf-uc-plugin-seq-feed-page`).
+  - Completeness: no entry becoming visible at or before a returned position,
+    whatever the concurrency, commit order or number of gateway replicas, for
+    an unchanged compiled scope.
+  - Snapshot consistency across a paginated scan, and a bounded replay that
+    returns the same entries in the same order and no next position once its
+    bound is reached.
+  - A live head: a page that reaches the settled head returns a position at the
+    head even when it carries no entries.
+  - A named start: the oldest-entry start begins at the oldest entry the
+    subscription retains rather than at the head, and an unknown start mode a
+    later gear version adds fails loudly as an internal error.
+  - Retention refusal: a position after which retention has removed an entry of
+    a subscribed type is refused with the cursor-beyond-retention error, read
+    from the per-type retention marks rather than from the position's age, so a
+    position whose continuation is intact is served whatever its age.
+  - The acceptance-order slack derivation that the refusal argument rests on.
+  - Sustained bulk read rate sufficient for a consumer a day behind to reach
+    the head within the recovery window, via a per-type index-ordered read
+    across chunks, combined by a bounded outer sort, with the scope applied
+    as a filter inside each per-type read.
+  - Bounding acceptance-to-feed-visibility, which the oldest running write
+    transaction in the instance determines, and the horizon-lag gauge that
+    surfaces a long transaction.
 
 - **Out of scope**:
-  - The request-path `usage_collector.*` signals and the host-computed structural `usage_collector.plugin.ready` gauge — owned by the gear core.
-  - The operations being measured (insert, query, catalog, deactivation, retention) — owned by their respective features above; this feature instruments them cross-cuttingly.
+  - Deleting entries and raising the retention marks the refusal reads, which
+    entry 2.7 owns.
+  - Minting, encoding or interpreting a wire cursor, which the gateway owns;
+    the plugin issues only its own opaque position.
+  - **Two gateway-side items are recorded rather than resolved here**, both in
+    PRD section 13. First, the deployment supplies the replay horizon as plugin
+    configuration because the SPI does not carry it; whether it should reach
+    the plugin through the SPI instead is an open question. Second, a known
+    shortfall stands against the gateway's cursor zones: the mark check reads
+    settled entries only, so a transaction holding an identifier open for at
+    least the replay horizon can leave a position polled at the head refusable.
+    Nothing is silently truncated in either case.
 
 - **Requirements Covered**:
-  - [x] `p2` - `cpt-cf-uc-plugin-nfr-operational-visibility`
 
-- **Design Principles Covered**:
-  - None.
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-usage-feed`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-feed-freshness`
+  - [ ] `p2` - `cpt-cf-uc-plugin-nfr-replay-throughput`
+
+- **Design Principles Covered**: None -- the feed reads the ledger under the
+  pure-persistence principle 2.2 carries and adds no principle of its own.
 
 - **Design Constraints Covered**:
-  - None.
+
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-gateway-owned-cursors`
 
 - **Domain Model Entities**:
-  - None (OpenTelemetry instruments; no persisted entity).
+  - FeedPosition
+  - FeedPage
+  - FeedStart
+  - Settled horizon
 
-- **Design Components**:
-  - [ ] `p3` - `cpt-cf-uc-plugin-design-metric-inventory`
+- **Design Components**: None -- feed pages are read through the Record Store
+  that 2.2 claims and their statements built by the Query component that 2.4
+  claims; this feature defines the page protocol and its guarantees.
 
 - **API**:
-  - None (push-based OTLP export; no SPI method and no scrape endpoint).
+  - `read_feed_page` (SPI)
 
 - **Sequences**:
-  - None.
 
-- **Data**:
-  - None.
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-feed-page`
 
-### 2.7 Deliberate Omissions
+- **Data**: None -- the ledger table, its feed index and the retention-marks
+  table are provisioned by 2.1.
 
-The following DESIGN/PRD items are intentionally not assigned to a feature, each with justification:
+### 2.7 [Per-Type Retention](feature-per-type-retention/) - HIGH
 
-- **Columnar compression of aging chunks** and **continuous-aggregate (rollup) tables** — deferred post-v1 in DESIGN §4 and PRD §4.2; additive and non-breaking to the SPI surface, so they carry no v1 feature. To be introduced as additive features when scheduled.
-- **Product-level gear concerns** — authentication, PDP authorization, attribution and shape validation, idempotency-key presence, counter/gauge semantics, and data classification — owned by the parent Usage Collector gear (`cpt-cf-usage-collector-*`), not re-implemented here; surfaced only as the pure-persistence boundary in [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high) Foundation.
-- **Multi-region replication, HA topology, backup/restore, and DR (RPO/RTO)** — governed by the operator's TimescaleDB deployment guide, not by plugin features.
-- **Use-case IDs** (`cpt-cf-uc-plugin-usecase-*`) and **actor ID** (`cpt-cf-uc-plugin-actor-plugin-host`) from the PRD are requirement-framing artifacts, realized transitively by the features that cover their underlying FRs (ingest-dedup → [§2.2](#22-record-persistence--lifecycle--high); delete-referenced-type → [§2.4](#24-usage-type-catalog--referential-integrity--medium); bind-startup → [§2.1](#21-foundation-bootstrap-schema--spi-wiring--high)); they introduce no additional design element to own.
+- [x] `p1` - **ID**: `cpt-cf-uc-plugin-feature-per-type-retention`
+
+- **Purpose**: Enforces retention per GTS type from each type's current
+  declared retention policy, measured from the end of the covered period, by a
+  background sweep that drops whole storage chunks and raises the feed's
+  retention marks in the same transaction. No declarative database policy can
+  express this, because the retention trait lives in `types-registry` rather
+  than in the database. Retention is measured on the covered-period end, the
+  column every read-path range predicate already selects on
+  (`cpt-cf-usage-collector-adr-window-end-selection`). The feature realizes
+  `cpt-cf-usage-collector-fr-billing-retention-floor` on the deletion side, and
+  the mark it raises is what lets entry 2.6 refuse a position rather than serve
+  a silently truncated range.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-usage-feed` (the retention mark is
+  what lets the feed refuse a position)
+
+- **Scope**:
+  - The periodic sweep, admitted one replica at a time by an advisory lock held
+    on a detached connection so it releases on close whatever the outcome.
+  - Listing every ledger chunk with its covered-period and type-key ranges, and
+    resolving the current declared retention of every type in a chunk's key
+    range from the registry on every sweep, never cached, because retention is
+    mutable and `cpt-cf-usage-collector-adr-registry-owned-typing` keeps it off
+    the cacheable part of a declaration for that reason.
+  - The pure drop decision: a chunk drops only once every type sharing it has
+    passed its declared retention, and a type whose retention cannot be
+    resolved keeps the chunk and is counted.
+  - Two permitted over-retention effects -- whole-chunk granularity, and a
+    shared chunk held to the longest retention among the types in it -- with
+    under-retention never permitted.
+  - The single bounded transaction in which the mark raise, the chunk drop and
+    the rollup-row deletion commit together (DESIGN section 3.6
+    `cpt-cf-uc-plugin-seq-retention-sweep`).
+  - Dropping nothing in a cycle when the rollup's materialisation table cannot
+    be found, rather than cutting a chunk whose rollup rows have no table to
+    cut.
+  - Keeping the chunk and counting a drop failure when a lock wait times out or
+    the transaction is aborted, so the next sweep retries.
+
+- **Out of scope**:
+  - Per-entry purge or erasure; disposal is the chunk drop alone, and a
+    data-subject erasure is an operator database action outside the SPI.
+  - Refusing a feed position, which entry 2.6 owns and which reads the mark
+    this feature raises.
+  - Assigning and caching a type's partitioning key, which entry 2.2 owns
+    because it runs on the write path, even though DESIGN section 3.2 lists the
+    assignment under the Retention component this feature claims.
+  - Checking that a deployment declared enough retention for replay and dedup
+    preservation; that is a deployer obligation the plugin does not verify.
+
+- **Requirements Covered**:
+
+  - [x] `p1` - `cpt-cf-uc-plugin-fr-per-type-retention`
+
+- **Design Principles Covered**: None -- the sweep is a lifecycle process
+  rather than a request path, and no design principle in DESIGN section 2.1
+  binds it beyond what 2.2 already carries.
+
+- **Design Constraints Covered**:
+
+  - [x] `p1` - `cpt-cf-uc-plugin-constraint-retention`
+
+- **Domain Model Entities**:
+  - Retention policy
+  - Chunk drop decision
+  - Feed retention mark
+
+- **Design Components**:
+
+  - [x] `p1` - `cpt-cf-uc-plugin-component-retention`
+
+- **API**:
+  - Background retention sweep, started and stopped by the gear lifecycle
+  - No SPI method; the sweep is not caller-invoked
+
+- **Sequences**:
+
+  - [x] `p1` - `cpt-cf-uc-plugin-seq-retention-sweep`
+
+- **Data**: None -- the ledger chunks, the rollup's materialisation table and
+  the retention-marks table the sweep operates on are provisioned by 2.1.
+
+### 2.8 [Reconciliation Metadata](feature-reconciliation-metadata/) - MEDIUM
+
+- [x] `p2` - **ID**: `cpt-cf-uc-plugin-feature-reconciliation-metadata`
+
+- **Purpose**: Reports, for one tenant and GTS type per call, the count of
+  accepted entries in the requested range, a fold-appropriate quantity summary
+  over the same selection, and two watermarks that the range does not bound.
+  Revenue assurance compares emitter, gear and consumer totals with these
+  figures and spots a stalled emitter. The counters live in the plugin because
+  the gear is stateless. The summary follows whichever fold the host passes,
+  never one the plugin picks, per
+  `cpt-cf-usage-collector-adr-declared-fold`, and the range selects on the
+  covered-period end per
+  `cpt-cf-usage-collector-adr-window-end-selection`. It realizes
+  `cpt-cf-usage-collector-fr-reconciliation-metadata`.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`,
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`
+
+- **Scope**:
+  - The accepted count over entries whose covered-period end falls in the
+    requested range, counting every accepted entry, withdrawals included,
+    because it reports ingestion activity.
+  - The fold-appropriate summary: an accrued sum for a summing type, otherwise
+    an observation count and the latest observation by the same total order the
+    aggregate path uses, with withdrawn pairs excluded.
+  - The two watermarks, the latest acceptance instant and the latest
+    covered-period end, read through their dedicated indexes and unbounded by
+    the range.
+  - One entry per dedup identity in every figure.
+  - The host-supplied scope applied first, so a tenant outside it answers
+    exactly as one holding no entries: a zero count, an empty-selection
+    summary, and both watermarks absent.
+  - Defined empty-selection values: an accrual over an empty set is zero, an
+    observation over one is absent.
+
+- **Out of scope**:
+  - Any claim about feed completeness; these figures prove nothing about it.
+  - Paging, which the endpoint does not need, since the gear serves one scope
+    per call.
+  - Serving the summary from the materialised aggregate; the summary always
+    takes the exact scan.
+
+- **Requirements Covered**:
+
+  - [x] `p2` - `cpt-cf-uc-plugin-fr-reconciliation-metadata`
+
+- **Design Principles Covered**: None -- the reconciliation read runs under
+  the pure-persistence principle 2.2 carries and adds none of its own.
+
+- **Design Constraints Covered**: None -- no constraint in DESIGN section 2.2
+  binds this read beyond the injection-safe translation entry 2.10 states for
+  every host-supplied filter.
+
+- **Domain Model Entities**:
+  - ReconciliationMetadata
+  - AggregationFold
+
+- **Design Components**: None -- the reconciliation statements are built by
+  the Query component that 2.4 claims and executed by the Record Store that 2.2
+  claims.
+
+- **API**:
+  - `get_reconciliation_metadata` (SPI)
+
+- **Sequences**:
+
+  - [x] `p2` - `cpt-cf-uc-plugin-seq-reconciliation`
+
+- **Data**: None -- the ledger table and the watermark indexes this read uses
+  are provisioned by 2.1.
+
+### 2.9 [Observability & Metrics](feature-observability-metrics/) - MEDIUM
+
+- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-feature-observability-metrics`
+
+- **Purpose**: Provides the one OpenTelemetry instrument inventory every other
+  component records through, under the plugin's own metric sub-namespace,
+  distinct from the gear's request-path signals. The plugin owns the
+  backend-internal series the gear cannot see: how long an insert took, how a
+  deduplication resolved, which aggregate path served a query, how saturated
+  the pool is, how far the feed's settled horizon lags, and whether the backend
+  is ready. Because
+  `cpt-cf-usage-collector-adr-pluggable-storage` puts the backend entirely
+  behind the SPI seam, these signals exist nowhere else. It is the allocation
+  target for `cpt-cf-usage-collector-nfr-operational-visibility`.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
+
+- **Scope**:
+  - Declaration of every push-based counter, gauge and histogram the plugin
+    emits, in one module, so each instrument has exactly one name.
+  - At minimum: ingestion latency, deduplication outcomes, query latency,
+    connection-pool saturation, backend error rate by classification, and
+    backend readiness.
+  - The backend-specific series the other features feed: stale-acceptance
+    rejections, aggregate path and fallback reason, rollup refresh status and
+    age since success, retention drops, drop failures and chunks kept for an
+    unresolved type, feed cursor refusals, and the settled-horizon lag gauge.
+  - Bounded label cardinality: no unbounded identifier is ever used as a label.
+  - Test assertions that read instrument names from the declarations rather
+    than from hand-copied strings, so a rename fails loudly.
+
+- **Out of scope**:
+  - Deciding when a metric fires; that is each calling component's
+    responsibility, defined in the feature that owns the path.
+  - The gear's own request-path signals and the shared metric namespace above
+    this plugin's sub-namespace.
+  - Histogram bucket layouts for the feed-page and reconciliation duration
+    histograms, which DESIGN section 4.5 records as still open in the design.
+
+- **Requirements Covered**:
+
+  - [ ] `p2` - `cpt-cf-uc-plugin-nfr-operational-visibility`
+
+- **Design Principles Covered**: None -- metric emission states no design
+  principle; it observes the paths the other entries define.
+
+- **Design Constraints Covered**: None -- no constraint in DESIGN section 2.2
+  binds the instrument inventory.
+
+- **Domain Model Entities**:
+  - Metric instrument inventory
+  - Backend readiness signal
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-component-metrics`
+
+- **API**:
+  - Push-based OpenTelemetry export under the plugin's metric sub-namespace
+  - No SPI method; metrics are emitted, not queried
+
+- **Sequences**: None -- recording an instrument is a step inside the
+  sequences the other entries own rather than a flow of its own.
+
+- **Data**: None -- metrics are exported, not stored; the schema is
+  provisioned by 2.1 and this feature adds no table.
+
+### 2.10 [Error Classification & Transport Security](feature-error-classification-transport-security/) - MEDIUM
+
+- [ ] `p2` - **ID**: `cpt-cf-uc-plugin-feature-error-classification-transport-security`
+
+- **Purpose**: Owns the boundary every SPI call crosses: the adapter that
+  translates backend failures into the SPI's six-variant error vocabulary, and
+  the two security obligations that fall to this plugin alone. Because
+  `cpt-cf-usage-collector-adr-pluggable-storage` makes the SPI the single seam
+  to storage, the plugin is the only component in the gear-plus-plugin split
+  that holds a database credential, opens the connection, and translates
+  untrusted query shapes; transport confidentiality, credential
+  non-disclosure and injection safety are therefore its obligations, while
+  caller authentication and authorization remain gear-core concerns. A stable,
+  classified vocabulary is what lets the host apply retry and fail-closed
+  behavior without backend-specific parsing, realizing
+  `cpt-cf-usage-collector-nfr-plugin-contract-stability` at the storage tier.
+
+- **Depends On**: `cpt-cf-uc-plugin-feature-registration-schema-provisioning`
+
+- **Scope**:
+  - The six-variant error vocabulary returned from every SPI method, with each
+    backend error classified as transient and retryable or internal and
+    non-retryable.
+  - A retry hint on a transient raised because the connection pool was
+    saturated, so a caller can tell a busy backend from a failed one, and no
+    hint on a transient from another cause.
+  - The cursor-beyond-retention variant raised by the feed read alone, and the
+    not-converged variant declared unreachable at this plugin's level.
+  - A malformed or unauthorized call reaching the SPI surfaced as internal,
+    because it is a host-contract breach.
+  - TLS by default on every database connection: the silent-fallback SSL modes
+    raised to require, a stronger operator choice preserved, and an explicit
+    disable honoured as the one plaintext path with a warning emitted once per
+    pool built.
+  - The connection string held in a redacted secret wrapper so credentials
+    never reach logs, error messages or debug output.
+  - Injection-safe translation: every comparison value bound as a parameter and
+    every SQL identifier mapped through a closed column allowlist, with an
+    unrecognized identifier rejected as internal rather than emitted.
+  - Metadata predicates parameterizing both the key and the compared value,
+    without validating the key against the type's declared metadata fields.
+
+- **Out of scope**:
+  - Caller authentication, authorization and attribution enforcement, all
+    performed by the gear core before every SPI call.
+  - At-rest encryption, key management and masking, delegated to the operator's
+    database deployment.
+  - Closed-shape metadata validation, which stays upstream.
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-fr-error-classification`
+  - [ ] `p1` - `cpt-cf-uc-plugin-nfr-transport-security`
+
+- **Design Principles Covered**: None -- the SPI-conformance principle that
+  fixes the error vocabulary is carried by 2.1, which gates release on the
+  contract suite; this feature implements the classification behind it.
+
+- **Design Constraints Covered**:
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-constraint-injection-safe-translation`
+
+- **Domain Model Entities**:
+  - UsageCollectorPluginError
+  - Redacted connection secret
+  - SqlBind
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-uc-plugin-component-adapter`
+
+  The claim covers the adapter's error-translation and transport
+  responsibilities. Each SPI method arm the adapter carries is delivered by the
+  feature that owns that method, so this entry does not wait on them.
+
+- **API**:
+  - All six `UsageCollectorPluginV1` methods (error contract applies to each)
+  - Database connection over the PostgreSQL wire protocol, TLS by default
+
+- **Sequences**: None -- error translation and parameter binding are steps
+  inside every sequence the other entries own rather than a flow of their own.
+
+- **Data**: None -- the schema and the column allowlist's source of truth are
+  provisioned by 2.1.
+
+---
 
 ## 3. Feature Dependencies
 
 ```text
-cpt-cf-uc-plugin-feature-foundation
-    ↓
-    ├─→ cpt-cf-uc-plugin-feature-record-persistence
-    │       └─→ cpt-cf-uc-plugin-feature-query-aggregation      (also ← foundation)
-    ├─→ cpt-cf-uc-plugin-feature-usage-type-catalog
-    ├─→ cpt-cf-uc-plugin-feature-retention                      (dedup-key preservation ⇢ record-persistence)
-    └─→ cpt-cf-uc-plugin-feature-observability                  (instruments record-persistence, query-aggregation, usage-type-catalog, retention)
+cpt-cf-uc-plugin-feature-registration-schema-provisioning   (foundation; owns the whole schema and the registration handshake)
+    |
+    +-- cpt-cf-uc-plugin-feature-record-ingestion-idempotency
+    |       |
+    |       +-- cpt-cf-uc-plugin-feature-invalidation-persistence
+    |       |       |
+    |       |       +-- cpt-cf-uc-plugin-feature-aggregated-query-rollup      (also <- record-ingestion-idempotency)
+    |       |       +-- cpt-cf-uc-plugin-feature-reconciliation-metadata      (also <- record-ingestion-idempotency)
+    |       |       +-- cpt-cf-uc-plugin-feature-usage-feed                   (also <- record-ingestion-idempotency)
+    |       |               |
+    |       |               +-- cpt-cf-uc-plugin-feature-per-type-retention
+    |       |
+    |       +-- cpt-cf-uc-plugin-feature-raw-query-converged-lookup
+    |
+    +-- cpt-cf-uc-plugin-feature-observability-metrics
+    +-- cpt-cf-uc-plugin-feature-error-classification-transport-security
 ```
 
 **Dependency Rationale**:
 
-- `cpt-cf-uc-plugin-feature-record-persistence` requires `cpt-cf-uc-plugin-feature-foundation`: the write path runs against the `usage_records` hypertable, dedup `UNIQUE`, and connection pool created by Foundation's Schema Migrations and Plugin Module, and returns errors through the adapter's classification.
-- `cpt-cf-uc-plugin-feature-query-aggregation` requires `cpt-cf-uc-plugin-feature-foundation`: read execution uses the pool, the adapter's cursor encoding, and the injection-safe translation surface anchored on the schema's column allowlist, all established by Foundation.
-- `cpt-cf-uc-plugin-feature-query-aggregation` requires `cpt-cf-uc-plugin-feature-record-persistence`: aggregation and raw list scan `usage_records`, which is written exclusively by the write plane — there is nothing to read until Record Persistence & Lifecycle has accepted records.
-- `cpt-cf-uc-plugin-feature-usage-type-catalog` requires `cpt-cf-uc-plugin-feature-foundation`: catalog CRUD runs against the `usage_type_catalog` table and the `ON DELETE RESTRICT` FK created by Foundation's Schema Migrations, and reuses the adapter's keyset pattern.
-- `cpt-cf-uc-plugin-feature-retention` requires `cpt-cf-uc-plugin-feature-foundation`: the declarative retention policy is registered at `init` by Foundation's Schema Migrations against the `usage_records` hypertable; this feature owns its runtime expiry and key-preservation semantics.
-- `cpt-cf-uc-plugin-feature-retention` is coupled to `cpt-cf-uc-plugin-feature-record-persistence` via **dedup-key preservation**: dropping an expired chunk also drops that chunk's entries in `usage_records_dedup_uniq`, so a replay of the now-recordless 4-tuple is accepted as a fresh insert. This is a runtime coupling (the retention window bounds the dedup guarantee), not an implementation prerequisite — retention operates on rows the write plane produces but does not require it to be built first.
-- `cpt-cf-uc-plugin-feature-observability` requires `cpt-cf-uc-plugin-feature-foundation`: metrics are emitted from within the adapter and stores using the meter and pool established by Foundation; the feature instruments the other capabilities cross-cuttingly but requires only the foundation to exist.
-- `cpt-cf-uc-plugin-feature-usage-type-catalog`, `cpt-cf-uc-plugin-feature-retention`, and `cpt-cf-uc-plugin-feature-observability` are independent of each other and of Query & Aggregation, and can be developed in parallel once Foundation exists (Query & Aggregation additionally waits on Record Persistence & Lifecycle for data to read).
+- `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` requires
+  `cpt-cf-uc-plugin-feature-registration-schema-provisioning`: the write path
+  inserts into the ledger hypertable and resolves a type key from the type-key
+  table, and the dedup identity is enforced by a unique constraint. All three
+  are schema objects 2.1 provisions. There is nothing to write into until
+  provisioning has run.
+- `cpt-cf-uc-plugin-feature-invalidation-persistence` requires
+  `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`: a withdrawal is
+  inserted through the same guarded statement, and its at-most-one bound is the
+  dedup identity that feature establishes, applied with the entry type set to
+  invalidation. It is separated out because the shared-identity rule is its own
+  correctness property with its own tests, not because it needs a second write
+  path.
+- `cpt-cf-uc-plugin-feature-aggregated-query-rollup` requires both
+  `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` and
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`: it folds stored entries,
+  and its exclusion rule and the rollup's signed netting are both defined over
+  a record and the withdrawal that removed it. Neither can be tested until both
+  kinds of entry can be persisted.
+- `cpt-cf-uc-plugin-feature-raw-query-converged-lookup` requires
+  `cpt-cf-uc-plugin-feature-record-ingestion-idempotency`: it reads the entries
+  that path writes, and its converged-only semantics are stated against the
+  dedup level that path declares. It does not depend on invalidation
+  persistence, because the raw path returns the ledger as persisted and applies
+  no withdrawal rule.
+- `cpt-cf-uc-plugin-feature-usage-feed` requires both
+  `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` and
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`: feed order is keyed on
+  the inserting transaction identifier the write path stamps, and the guarantee
+  that a withdrawal follows the entry it withdraws holds only because the
+  gateway accepts a withdrawal after its target has converged, so the
+  withdrawal's transaction identifier is larger.
+- `cpt-cf-uc-plugin-feature-per-type-retention` requires
+  `cpt-cf-uc-plugin-feature-usage-feed`. This is the one dependency that runs
+  against intuition, since deletion looks independent of reading. It does not
+  hold in the other direction either: the sweep's drop transaction reads each
+  type's highest feed position from the feed index and raises a retention mark
+  in the same transaction that drops the chunk, and that mark exists only so
+  the feed can refuse a position. The feed defines both the order the sweep
+  reads and the refusal the mark drives, so retention is built on top of it.
+- `cpt-cf-uc-plugin-feature-reconciliation-metadata` requires both
+  `cpt-cf-uc-plugin-feature-record-ingestion-idempotency` and
+  `cpt-cf-uc-plugin-feature-invalidation-persistence`: its accepted count
+  includes withdrawals while its summary excludes withdrawn pairs, so the
+  figures are only well-defined once both kinds of entry exist.
+- `cpt-cf-uc-plugin-feature-observability-metrics` requires
+  `cpt-cf-uc-plugin-feature-registration-schema-provisioning`: the instrument
+  inventory is created during startup and the readiness signal is a property of
+  the bound pool. It depends on nothing else, because it records what it is
+  told and never decides when a metric fires.
+- `cpt-cf-uc-plugin-feature-error-classification-transport-security` requires
+  `cpt-cf-uc-plugin-feature-registration-schema-provisioning`: the SSL-mode
+  resolution and the redacted connection secret are properties of the pool 2.1
+  builds, and the column allowlist is defined over the schema 2.1 provisions.
+  It does not depend on the read and write paths it classifies errors for; the
+  adapter's translation is written against the backend's error surface, not
+  against any one path.
+- `cpt-cf-uc-plugin-feature-aggregated-query-rollup` and
+  `cpt-cf-uc-plugin-feature-raw-query-converged-lookup` are independent of each
+  other and can be developed in parallel, as can
+  `cpt-cf-uc-plugin-feature-observability-metrics` and
+  `cpt-cf-uc-plugin-feature-error-classification-transport-security`.
+
+**Parallelization**:
+
+- Tier 0 -- `registration-schema-provisioning` -- is the only feature with no
+  prerequisite and must land first.
+- Tier 1 -- `record-ingestion-idempotency`, `observability-metrics` and
+  `error-classification-transport-security` -- can be built in parallel once
+  tier 0 lands; none reads the others' output.
+- Tier 2 -- `invalidation-persistence` and `raw-query-converged-lookup` -- can
+  be built in parallel once ingestion lands. Each reuses ingestion's write path
+  or reads its output independently of the other.
+- Tier 3 -- `aggregated-query-rollup`, `usage-feed` and
+  `reconciliation-metadata` -- can be built in parallel once invalidation
+  persistence lands.
+- Tier 4 -- `per-type-retention` -- is the only leaf below tier 3, waiting on
+  the usage feed for the order it reads and the mark it raises.

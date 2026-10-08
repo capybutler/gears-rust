@@ -1,14 +1,35 @@
 //! `OpenTelemetry` metric inventory for the `TimescaleDB` storage plugin.
 //!
-//! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory` (`DESIGN.md`
-//! §Observability): every backend-internal series the plugin owns under the
-//! `uc_timescaledb_` sub-namespace. Instrument names are the **full literal**
-//! Prometheus names (snake_case, `_total` on counters, `_seconds` on duration
-//! histograms) with **no** `.with_unit(...)` hint, so the rendered series name is
-//! identical whether the downstream collector runs with `add_metric_suffixes` on
-//! or off — matching the parent gateway (`usage-collector/src/infra/metrics.rs`)
-//! and the wider application-gear convention. Histogram bucket layouts bracket the
-//! NFR p95 budgets in `DESIGN.md` §1.2 and are part of the contract.
+//! Realizes design ID `cpt-cf-uc-plugin-design-metric-inventory`: every
+//! backend-internal series the plugin owns under the `uc_timescaledb_`
+//! sub-namespace. The gear's `DESIGN.md` §3.11.5 owns the request-path `uc_`
+//! inventory and delegates the rest, verbatim in its §3.11.5:
+//!
+//! > Plugins may expose backend-internal metrics under their own prefix. Those
+//! > series are owned by the plugin's deployment guide.
+//!
+//! **§3.11.5 names no instrument for a storage plugin** — every "Emitting
+//! component" cell in its tables is a gateway, the type-resolver, the
+//! plugin-host or a PDP enforcer — so the rules it binds this crate by are the
+//! naming convention below and the bounded-label rule further down.
+//!
+//! The clause delegates ownership to the plugin's **deployment guide**; no such
+//! document exists under that name here, and `docs/DESIGN.md` §4 is the closest
+//! thing this crate has to one. **The code below is what the plugin actually
+//! emits, and §4.3 is not a second opinion on it** — the series it tabulates
+//! and this module does not declare arrive with the read paths that emit them.
+//!
+//! Instrument names are the **full literal** Prometheus names (snake_case,
+//! `_total` on counters, `_seconds` on duration histograms) with **no**
+//! `.with_unit(...)` hint, so the rendered series name is identical whether the
+//! downstream collector runs with `add_metric_suffixes` on or off.
+//! `metrics_tests` asserts that shape over the whole exported inventory, off
+//! each instrument's **kind** rather than its spelling.
+//!
+//! Histogram bucket layouts bracket the p95 budget of
+//! `cpt-cf-usage-collector-nfr-query-latency` and the write envelope of
+//! `cpt-cf-usage-collector-nfr-throughput` against the gear's `DESIGN.md`
+//! §3.11.2 Latency Budgets, and are part of the contract.
 //!
 //! All labels are bounded to enumerated value sets (see the `label` module):
 //! unbounded identifiers (`tenant_id`, `gts_id`, `id`, ...) MUST NOT appear as
@@ -28,13 +49,18 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, ObservableGauge};
 use opentelemetry::{InstrumentationScope, KeyValue, global};
 use sqlx::PgPool;
 
+use crate::domain::retention::KeepReason;
+use crate::infra::storage::query::rollup::FallbackReason;
+use crate::infra::storage::rollup_maintenance::RefreshJobStatus;
+
 /// `OpenTelemetry` instrumentation scope (meter name) for every plugin series.
 const SCOPE_NAME: &str = "uc.timescaledb";
 
 /// Explicit histogram bucket boundaries (seconds) for backend operation
 /// durations. The `OTel` SDK defaults are count-oriented and meaningless for a
-/// seconds-valued duration; these brackets the §1.2 p95 budgets with finer
-/// low-end resolution so client-side percentiles stay comparable.
+/// seconds-valued duration; these bracket the gear `DESIGN.md` §3.11.2 p95
+/// budgets with finer low-end resolution so client-side percentiles stay
+/// comparable.
 const DURATION_BOUNDARIES_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
@@ -47,16 +73,13 @@ const BATCH_ROW_BOUNDARIES: &[f64] = &[1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.
 /// Bounded metric label keys and values.
 ///
 /// Centralizing the `&'static str` constants keeps every call site on the
-/// enumerated value sets from `DESIGN.md` §Observability and prevents an
-/// accidental high-cardinality label from leaking in.
+/// enumerated sets declared in this module — the gear `DESIGN.md` §3.11.5
+/// "Label cardinality" rule, which bounds every label and bars unbounded
+/// identifiers outright — and prevents an accidental high-cardinality label
+/// from leaking in.
+// @cpt-algo:cpt-cf-uc-plugin-algo-label-cardinality-admission:p2
+// @cpt-dod:cpt-cf-uc-plugin-dod-bounded-label-cardinality:p2
 pub mod label {
-    /// Label key for the insert mode dimension.
-    pub const MODE: &str = "mode";
-    /// `mode` value: a single-row ingest.
-    pub const MODE_SINGLE: &str = "single";
-    /// `mode` value: a batch (multi-row) ingest.
-    pub const MODE_BATCH: &str = "batch";
-
     /// Label key for the query-kind dimension.
     pub const QUERY_KIND: &str = "query_kind";
     /// `query_kind` value: a raw (keyset) record listing.
@@ -70,27 +93,32 @@ pub mod label {
     pub const ERROR_CATEGORY_TRANSIENT: &str = "transient";
     /// `error_category` value: a non-retryable internal backend failure.
     pub const ERROR_CATEGORY_INTERNAL: &str = "internal";
-}
 
-/// Insert-mode dimension behind the `mode` label of
-/// `uc_timescaledb_insert_duration_seconds`. A closed enum so a call site cannot pass an
-/// arbitrary string into the bounded label set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertMode {
-    /// A single-row ingest (`mode = "single"`).
-    Single,
-    /// A batch (multi-row) ingest (`mode = "batch"`).
-    Batch,
-}
+    /// Label key for the retention-sweep outcome dimension.
+    pub const SWEEP_OUTCOME: &str = "outcome";
+    /// `outcome` value: the sweep held the lock and walked every chunk.
+    pub const SWEEP_OUTCOME_COMPLETED: &str = "completed";
+    /// `outcome` value: another replica held the sweep lock.
+    pub const SWEEP_OUTCOME_SKIPPED_LOCKED: &str = "skipped_locked";
+    /// `outcome` value: a catalog or connection error ended the sweep.
+    pub const SWEEP_OUTCOME_FAILED: &str = "failed";
 
-impl InsertMode {
-    /// The bounded `mode` label value for this mode.
-    const fn as_label(self) -> &'static str {
-        match self {
-            Self::Single => label::MODE_SINGLE,
-            Self::Batch => label::MODE_BATCH,
-        }
-    }
+    /// Label key for the kept-unresolved reason dimension.
+    pub const KEEP_REASON: &str = "reason";
+
+    /// Label key for which read served an aggregate.
+    pub const AGGREGATE_PATH: &str = "path";
+    /// `path` value: whole hours from the rollup plus ledger edges.
+    pub const AGGREGATE_PATH_ROLLUP: &str = "rollup";
+    /// `path` value: the exact ledger scan.
+    pub const AGGREGATE_PATH_SCAN: &str = "scan";
+    /// Label key for why an aggregate took the scan.
+    pub const FALLBACK_REASON: &str = "reason";
+    /// `reason` value on `path="rollup"`.
+    pub const FALLBACK_REASON_NONE: &str = "none";
+
+    /// Label key for which rollup refresh policy a series describes.
+    pub const REFRESH_POLICY: &str = "policy";
 }
 
 /// Query-kind dimension behind the `query_kind` label of
@@ -135,6 +163,27 @@ impl ErrorClass {
     }
 }
 
+/// How one retention sweep ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOutcome {
+    /// The sweep held the lock and walked every chunk.
+    Completed,
+    /// Another replica held the sweep lock; nothing was read.
+    SkippedLocked,
+    /// A catalog or connection error ended the sweep.
+    Failed,
+}
+
+impl SweepOutcome {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Completed => label::SWEEP_OUTCOME_COMPLETED,
+            Self::SkippedLocked => label::SWEEP_OUTCOME_SKIPPED_LOCKED,
+            Self::Failed => label::SWEEP_OUTCOME_FAILED,
+        }
+    }
+}
+
 /// The full `OpenTelemetry` metric inventory for the plugin.
 ///
 /// Built once via [`Metrics::new`] and shared through an `Arc<Metrics>`; the
@@ -144,19 +193,32 @@ impl ErrorClass {
 /// The two observable pool gauges store their [`ObservableGauge`] handles: the
 /// registered callback is dropped — and thus unregistered — when the handle is
 /// dropped, so the handles must outlive the meter provider.
+// @cpt-dod:cpt-cf-uc-plugin-dod-single-instrument-inventory:p2
+// @cpt-dod:cpt-cf-uc-plugin-dod-minimum-signal-set:p2
+// @cpt-dod:cpt-cf-uc-plugin-dod-backend-specific-series:p2
 #[derive(Debug)]
 pub struct Metrics {
     // --- Histograms (seconds, unless noted) ---
-    /// `uc_timescaledb_insert_duration_seconds` — labelled by `mode`.
+    /// `uc_timescaledb_insert_duration_seconds` — unlabelled.
     insert_duration: Histogram<f64>,
     /// `uc_timescaledb_query_duration_seconds` — labelled by `query_kind`.
     query_duration: Histogram<f64>,
-    /// `uc_timescaledb_deactivate_duration_seconds`.
-    deactivate_duration: Histogram<f64>,
     /// `uc_timescaledb_pool_acquire_duration_seconds`.
     pool_acquire_duration: Histogram<f64>,
+    /// `uc_timescaledb_feed_page_duration_seconds` — **no explicit bucket
+    /// layout**: ruling I3 fixes this instrument's name and labels only and
+    /// leaves the layout open with the design (`docs/DESIGN.md` §4.5, "Open
+    /// in this design"). Do not reach for [`DURATION_BOUNDARIES_SECS`] here —
+    /// it is a sibling's layout, and using it would be inventing one by
+    /// borrowing, which is the thing ruling I3 forbids.
+    feed_page_duration: Histogram<f64>,
+    /// `uc_timescaledb_reconciliation_duration_seconds` — no explicit bucket
+    /// layout, for the same reason as [`Self::feed_page_duration`] above.
+    reconciliation_duration: Histogram<f64>,
     /// `uc_timescaledb_batch_rows` — row-count distribution per batch write.
     batch_rows: Histogram<f64>,
+    /// `uc_timescaledb_retention_sweep_duration_seconds`.
+    retention_sweep_duration: Histogram<f64>,
 
     // --- Counters ---
     /// `uc_timescaledb_dedup_absorbed_total`.
@@ -165,33 +227,154 @@ pub struct Metrics {
     backend_error: Counter<u64>,
     /// `uc_timescaledb_idempotency_conflicts_total`.
     idempotency_conflict: Counter<u64>,
-    /// `uc_timescaledb_usage_type_referenced_total`.
-    usage_type_referenced: Counter<u64>,
     /// `uc_timescaledb_migration_failures_total`.
     migration_failure: Counter<u64>,
-    /// `uc_timescaledb_compensations_total`.
-    compensation: Counter<u64>,
+    /// `uc_timescaledb_invalidations_total`.
+    invalidation: Counter<u64>,
     /// `uc_timescaledb_dedup_stale_total`.
     dedup_stale: Counter<u64>,
+    /// `uc_timescaledb_stale_acceptance_rejections_total`.
+    stale_acceptance_rejection: Counter<u64>,
+    /// `uc_timescaledb_dedup_late_convergence_total` — writes discarded after their dedup identity converged. Always zero: this plugin is `linearizable`, so no write is decided after convergence.
+    _dedup_late_convergence: Counter<u64>,
     /// `uc_timescaledb_batch_retries_total` — bounded in-process `create_batch`
-    /// retries after a transient backend error (deadlock victim self-heal).
+    /// retries after a transient backend error.
     batch_retry: Counter<u64>,
     /// `uc_timescaledb_query_requests_total` — labelled by `query_kind`.
     query_requests: Counter<u64>,
     /// `uc_timescaledb_tls_handshake_failures_total`.
     tls_handshake_failure: Counter<u64>,
+    /// `uc_timescaledb_retention_sweeps_total` — labelled by `outcome`.
+    retention_sweeps: Counter<u64>,
+    /// `uc_timescaledb_retention_chunks_dropped_total`.
+    retention_chunks_dropped: Counter<u64>,
+    /// `uc_timescaledb_retention_chunks_kept_unresolved_total` — labelled by
+    /// `reason`.
+    retention_chunks_kept_unresolved: Counter<u64>,
+    /// `uc_timescaledb_retention_drop_failures_total`.
+    retention_drop_failures: Counter<u64>,
+    /// `uc_timescaledb_aggregate_path_total` — labelled by `path` and `reason`.
+    aggregate_path: Counter<u64>,
+    /// `uc_timescaledb_rollup_rows_deleted_total`.
+    rollup_rows_deleted: Counter<u64>,
+    /// `uc_timescaledb_feed_cursor_refusals_total`.
+    feed_cursor_refusals: Counter<u64>,
 
     // --- Synchronous gauges (set imperatively) ---
-    /// `uc_timescaledb_usage_type_catalog_size`.
-    usage_type_catalog_size: Gauge<u64>,
-    /// `uc_timescaledb_ready` — plugin-local backend health (0/1).
+    /// `uc_timescaledb_ready` — plugin-local backend health (0/1). Distinct
+    /// from the gear's host-computed structural `uc_plugin_ready` signal
+    /// (gear DESIGN.md §3.11.5): that one is a binding fact the host
+    /// computes, this one is a backend-health fact this plugin computes.
+    /// Driven only by observed connection
+    /// outcomes in [`crate::infra::storage::record_store`]'s `timed_acquire`
+    /// and by this plugin's own startup sequence (`src/gear.rs`) — never by a
+    /// background probe or timer.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-backend-readiness-gauge:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-readiness-gauge-semantics:p2
     ready: Gauge<u64>,
+    /// `uc_timescaledb_chunks` — ledger chunks remaining after the last
+    /// completed retention sweep.
+    chunks: Gauge<u64>,
+    /// `uc_timescaledb_rollup_refresh_age_seconds` — labelled by `policy`.
+    rollup_refresh_age: Gauge<f64>,
+    /// `uc_timescaledb_feed_horizon_lag_seconds` — best-effort; left unset
+    /// (never zeroed) when the plugin role cannot see another session's open
+    /// write transaction.
+    feed_horizon_lag: Gauge<f64>,
+    /// `uc_timescaledb_rollup_refresh_job_failing` — labelled by `policy`.
+    rollup_refresh_job_failing: Gauge<u64>,
+    /// `uc_timescaledb_rollup_refresh_policies` — the number of rollup refresh
+    /// policies the last monitor sample found.
+    rollup_refresh_policies: Gauge<u64>,
 
     // --- Observable gauges (callback-read; handles kept to stay registered) ---
     /// `uc_timescaledb_pool_connections_active`.
     _pool_active: ObservableGauge<u64>,
     /// `uc_timescaledb_pool_connections_idle`.
     _pool_idle: ObservableGauge<u64>,
+}
+
+/// Build the two open-layout duration histograms:
+/// `uc_timescaledb_feed_page_duration_seconds` and
+/// `uc_timescaledb_reconciliation_duration_seconds`. Split out of
+/// [`Metrics::with_meter`] to keep that constructor under
+/// `clippy::too_many_lines` — not a grouping the metric inventory itself gives
+/// any other significance to.
+///
+/// **No `.with_boundaries(...)`, by ruling I3**: the bucket layout for these
+/// two is still open in the design (`docs/DESIGN.md` §4.5, "Open in this
+/// design") and must not be invented here, including by borrowing
+/// [`DURATION_BOUNDARIES_SECS`]. No `.with_unit(...)` either, for the same
+/// reason every instrument in this module skips it (module doc, and §4.3's
+/// own requirement).
+fn build_open_layout_duration_instruments(meter: &Meter) -> (Histogram<f64>, Histogram<f64>) {
+    let feed_page_duration = meter
+        .f64_histogram("uc_timescaledb_feed_page_duration_seconds")
+        .with_description(
+            "Duration of a feed-page read; bucket layout is still open in the design, \
+             section 4.5",
+        )
+        .build();
+    let reconciliation_duration = meter
+        .f64_histogram("uc_timescaledb_reconciliation_duration_seconds")
+        .with_description(
+            "Duration of a reconciliation read; bucket layout is still open in the design, \
+             section 4.5",
+        )
+        .build();
+    (feed_page_duration, reconciliation_duration)
+}
+
+/// Build the three rollup-refresh status gauges:
+/// `uc_timescaledb_rollup_refresh_age_seconds`,
+/// `uc_timescaledb_rollup_refresh_job_failing` and
+/// `uc_timescaledb_rollup_refresh_policies`. Split out of
+/// [`Metrics::with_meter`] to keep that constructor under
+/// `clippy::too_many_lines` — not a grouping the metric inventory itself gives
+/// any other significance to.
+fn build_rollup_refresh_instruments(meter: &Meter) -> (Gauge<f64>, Gauge<u64>, Gauge<u64>) {
+    let rollup_refresh_age = meter
+        .f64_gauge("uc_timescaledb_rollup_refresh_age_seconds")
+        .with_description(
+            "Seconds since each rollup refresh policy last succeeded, by policy; unset \
+             until its first success",
+        )
+        .build();
+    let rollup_refresh_job_failing = meter
+        .u64_gauge("uc_timescaledb_rollup_refresh_job_failing")
+        .with_description("1 when a rollup refresh policy's last run failed, by policy")
+        .build();
+    let rollup_refresh_policies = meter
+        .u64_gauge("uc_timescaledb_rollup_refresh_policies")
+        .with_description("Rollup refresh policies the last monitor sample found; alert below 2")
+        .build();
+    (
+        rollup_refresh_age,
+        rollup_refresh_job_failing,
+        rollup_refresh_policies,
+    )
+}
+
+/// Build the feed's two instruments: `uc_timescaledb_feed_cursor_refusals_total`
+/// and `uc_timescaledb_feed_horizon_lag_seconds`. Split out of
+/// [`Metrics::with_meter`] to keep that constructor under `clippy::too_many_lines`
+/// — not a grouping the metric inventory itself gives any other significance to.
+fn build_feed_instruments(meter: &Meter) -> (Counter<u64>, Gauge<f64>) {
+    let feed_cursor_refusals = meter
+        .u64_counter("uc_timescaledb_feed_cursor_refusals_total")
+        .with_description(
+            "CursorBeyondRetention refusals: a retention mark stood above the presented \
+             position",
+        )
+        .build();
+    let feed_horizon_lag = meter
+        .f64_gauge("uc_timescaledb_feed_horizon_lag_seconds")
+        .with_description(
+            "Best-effort settled-horizon lag in seconds; left unset when the plugin role \
+             cannot see another session's open write transaction",
+        )
+        .build();
+    (feed_cursor_refusals, feed_horizon_lag)
 }
 
 impl Metrics {
@@ -216,11 +399,12 @@ impl Metrics {
     /// The `pool` is cloned into the two observable-gauge callbacks, which read
     /// `pool.size()` / `pool.num_idle()` (synchronous, in-memory) on each
     /// collection cycle — no DB I/O happens in a callback.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-instrument-name-contract:p2
     #[must_use]
     pub fn with_meter(meter: &Meter, pool: PgPool) -> Self {
         let insert_duration = meter
             .f64_histogram("uc_timescaledb_insert_duration_seconds")
-            .with_description("Duration of usage-record inserts, by mode")
+            .with_description("Duration of usage-record inserts")
             .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
         let query_duration = meter
@@ -228,16 +412,13 @@ impl Metrics {
             .with_description("Duration of usage-record queries, by kind")
             .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
-        let deactivate_duration = meter
-            .f64_histogram("uc_timescaledb_deactivate_duration_seconds")
-            .with_description("Duration of the event-deactivation cascade")
-            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
-            .build();
         let pool_acquire_duration = meter
             .f64_histogram("uc_timescaledb_pool_acquire_duration_seconds")
             .with_description("Time spent acquiring a connection from the pool")
             .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
+        let (feed_page_duration, reconciliation_duration) =
+            build_open_layout_duration_instruments(meter);
         let batch_rows = meter
             .f64_histogram("uc_timescaledb_batch_rows")
             .with_description("Row count per batch write")
@@ -256,22 +437,44 @@ impl Metrics {
             .u64_counter("uc_timescaledb_idempotency_conflicts_total")
             .with_description("Canonical-field-mismatch idempotency conflicts")
             .build();
-        let usage_type_referenced = meter
-            .u64_counter("uc_timescaledb_usage_type_referenced_total")
-            .with_description("FK ON DELETE RESTRICT rejections on usage-type delete")
-            .build();
         let migration_failure = meter
             .u64_counter("uc_timescaledb_migration_failures_total")
             .with_description("Schema-migration failures at startup")
             .build();
-        let compensation = meter
-            .u64_counter("uc_timescaledb_compensations_total")
-            .with_description("Inserts carrying a corrects_id (compensating records)")
+        let invalidation = meter
+            .u64_counter("uc_timescaledb_invalidations_total")
+            .with_description("Accepted invalidation entries (append-only withdrawals)")
             .build();
         let dedup_stale = meter
             .u64_counter("uc_timescaledb_dedup_stale_total")
-            .with_description("Dedup hits whose stored record had aged out (retryable)")
+            .with_description(
+                "Dedup hits whose conflicting row could not be read back, whatever \
+                 made it unreadable: a chunk that aged out mid-resolution clears on \
+                 its own on retry; a deployer-set default_transaction_isolation = \
+                 repeatable read also clears per retry but recurs at a rate for as \
+                 long as that setting stands, so a sustained rate here is the cue \
+                 to check it",
+            )
             .build();
+        let stale_acceptance_rejection = meter
+            .u64_counter("uc_timescaledb_stale_acceptance_rejections_total")
+            .with_description(
+                "Entries refused because their accepted_at sat outside \
+                 feed_acceptance_slack_secs of the write statement's own \
+                 statement_timestamp(), in either direction (retryable)",
+            )
+            .build();
+        let dedup_late_convergence = meter
+            .u64_counter("uc_timescaledb_dedup_late_convergence_total")
+            .with_description(
+                "Writes discarded after their dedup identity converged; always 0 under this \
+                 plugin's linearizable dedup level",
+            )
+            .build();
+        // Recorded once at zero so the series is exported: an OpenTelemetry
+        // counter nothing has recorded on is not exported at all, and the
+        // deployment guide names this series (DESIGN §3.10 item 9).
+        dedup_late_convergence.add(0, &[]);
         let batch_retry = meter
             .u64_counter("uc_timescaledb_batch_retries_total")
             .with_description("Bounded create_batch retries after a transient backend error")
@@ -285,14 +488,62 @@ impl Metrics {
             .with_description("TLS handshake failures against the backend DSN")
             .build();
 
-        let usage_type_catalog_size = meter
-            .u64_gauge("uc_timescaledb_usage_type_catalog_size")
-            .with_description("Current usage-type catalog row count")
+        let retention_sweep_duration = meter
+            .f64_histogram("uc_timescaledb_retention_sweep_duration_seconds")
+            .with_description("Duration of one retention sweep, whatever its outcome")
+            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
             .build();
+        let retention_sweeps = meter
+            .u64_counter("uc_timescaledb_retention_sweeps_total")
+            .with_description(
+                "Retention sweeps, by outcome: completed, skipped_locked (another replica \
+                 held the sweep lock) or failed",
+            )
+            .build();
+        let retention_chunks_dropped = meter
+            .u64_counter("uc_timescaledb_retention_chunks_dropped_total")
+            .with_description(
+                "Ledger chunks dropped because every type in them had passed its declared \
+                 retention",
+            )
+            .build();
+        let retention_chunks_kept_unresolved = meter
+            .u64_counter("uc_timescaledb_retention_chunks_kept_unresolved_total")
+            .with_description(
+                "Ledger chunks kept because a type in them had no resolvable retention, by \
+                 reason; counted once per chunk per sweep, so a persistent cause grows by \
+                 the chunk count every sweep",
+            )
+            .build();
+        let retention_drop_failures = meter
+            .u64_counter("uc_timescaledb_retention_drop_failures_total")
+            .with_description("Expired ledger chunks whose drop failed; retried next sweep")
+            .build();
+        let chunks = meter
+            .u64_gauge("uc_timescaledb_chunks")
+            .with_description("Ledger chunks remaining after the last completed retention sweep")
+            .build();
+        let aggregate_path = meter
+            .u64_counter("uc_timescaledb_aggregate_path_total")
+            .with_description(
+                "Aggregate queries by the read that served them: path=rollup (whole hours \
+                 from usage_rollup_1h plus ledger edges) or path=scan, with the reason it fell back",
+            )
+            .build();
+        let rollup_rows_deleted = meter
+            .u64_counter("uc_timescaledb_rollup_rows_deleted_total")
+            .with_description(
+                "Rollup rows deleted with the ledger chunks the retention sweep dropped",
+            )
+            .build();
+        let (feed_cursor_refusals, feed_horizon_lag) = build_feed_instruments(meter);
+
         let ready = meter
             .u64_gauge("uc_timescaledb_ready")
             .with_description("Plugin-local backend readiness (1 = pool + migration ok)")
             .build();
+        let (rollup_refresh_age, rollup_refresh_job_failing, rollup_refresh_policies) =
+            build_rollup_refresh_instruments(meter);
 
         // Each observable gauge owns its own callback closure: 0.31 has no
         // batch-observe API, so the two pool gauges cannot share one callback.
@@ -318,21 +569,35 @@ impl Metrics {
         Self {
             insert_duration,
             query_duration,
-            deactivate_duration,
             pool_acquire_duration,
+            feed_page_duration,
+            reconciliation_duration,
             batch_rows,
+            retention_sweep_duration,
             dedup_absorbed,
             backend_error,
             idempotency_conflict,
-            usage_type_referenced,
             migration_failure,
-            compensation,
+            invalidation,
             dedup_stale,
+            stale_acceptance_rejection,
+            _dedup_late_convergence: dedup_late_convergence,
             batch_retry,
             query_requests,
             tls_handshake_failure,
-            usage_type_catalog_size,
+            retention_sweeps,
+            retention_chunks_dropped,
+            retention_chunks_kept_unresolved,
+            retention_drop_failures,
+            aggregate_path,
+            rollup_rows_deleted,
+            feed_cursor_refusals,
             ready,
+            chunks,
+            rollup_refresh_age,
+            feed_horizon_lag,
+            rollup_refresh_job_failing,
+            rollup_refresh_policies,
             _pool_active: pool_active,
             _pool_idle: pool_idle,
         }
@@ -340,10 +605,14 @@ impl Metrics {
 
     // --- Histogram recording helpers ---
 
-    /// Record an insert duration (seconds) for the given [`InsertMode`].
-    pub fn record_insert(&self, mode: InsertMode, secs: f64) {
-        self.insert_duration
-            .record(secs, &[KeyValue::new(label::MODE, mode.as_label())]);
+    /// Record an insert duration (seconds).
+    ///
+    /// **Unlabelled.** The histogram carried a `mode` label while there were two
+    /// ingest arities to tell apart; the single-row store path is gone, so every
+    /// observation would now be `mode="batch"` and a single-valued label is
+    /// noise rather than a dimension.
+    pub fn record_insert(&self, secs: f64) {
+        self.insert_duration.record(secs, &[]);
     }
 
     /// Record a query duration (seconds) for the given [`QueryKind`].
@@ -352,14 +621,31 @@ impl Metrics {
             .record(secs, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
     }
 
-    /// Record a deactivation-cascade duration (seconds).
-    pub fn record_deactivate(&self, secs: f64) {
-        self.deactivate_duration.record(secs, &[]);
-    }
-
     /// Record a pool-acquire duration (seconds).
     pub fn record_pool_acquire(&self, secs: f64) {
         self.pool_acquire_duration.record(secs, &[]);
+    }
+
+    /// Record a feed-page read duration (seconds). Unlabelled, and with no
+    /// explicit bucket layout (ruling I3; `docs/DESIGN.md` §4.5).
+    ///
+    /// Called via [`OpDurationGuard`] with [`TimedOp::FeedPage`] from
+    /// `PgRecordStore::feed_page` (`src/infra/storage/record_store.rs`), so
+    /// the duration is captured on every return path, including the
+    /// validation and refusal error arms, not just on success.
+    pub fn record_feed_page_duration(&self, secs: f64) {
+        self.feed_page_duration.record(secs, &[]);
+    }
+
+    /// Record a reconciliation read duration (seconds). Unlabelled, and with
+    /// no explicit bucket layout, for the same reason as
+    /// [`Self::record_feed_page_duration`] above.
+    ///
+    /// Called via [`OpDurationGuard`] with [`TimedOp::Reconciliation`] from
+    /// `PgRecordStore::reconciliation`, for the same every-return-path reason
+    /// as [`Self::record_feed_page_duration`].
+    pub fn record_reconciliation_duration(&self, secs: f64) {
+        self.reconciliation_duration.record(secs, &[]);
     }
 
     /// Record the row count `n` of a batch write.
@@ -379,19 +665,44 @@ impl Metrics {
         self.idempotency_conflict.add(1, &[]);
     }
 
-    /// Increment the usage-type-referenced (FK rejection) counter.
-    pub fn inc_usage_type_referenced(&self) {
-        self.usage_type_referenced.add(1, &[]);
+    /// Increment the accepted-invalidation counter (one per admitted entry
+    /// carrying an [`Invalidation`](usage_collector_sdk::Invalidation)).
+    pub fn inc_invalidation(&self) {
+        self.invalidation.add(1, &[]);
     }
 
-    /// Increment the compensation (`corrects_id` insert) counter.
-    pub fn inc_compensation(&self) {
-        self.compensation.add(1, &[]);
-    }
-
-    /// Increment the stale-dedup counter (dedup hit whose record had aged out).
+    /// Increment the stale-dedup counter: one dedup hit whose conflicting row
+    /// could not be read back.
+    ///
+    /// **More than one thing reaches that arm and this counter separates none
+    /// of them.** They are set out on `crate::infra::storage::record_store`'s
+    /// `CONFLICT_UNREADABLE_MESSAGE`, the one place they are listed.
+    ///
+    /// **No label or sibling counter, and that is a decision.** The one cause
+    /// that would want a different operator action — a mis-derived `id`, which
+    /// does not self-heal on a retry — is unreached by every caller in this
+    /// codebase, since each derives `id` through the SDK's own faithful
+    /// derivation, so a label value for it would be a series that can never
+    /// move. The reachable causes are not distinguishable at the write path
+    /// either without new instrumentation.
+    ///
+    /// That is a claim about this codebase's callers, not about every holder of
+    /// `UsageRecord`: the type's fields are public and it is not
+    /// `#[non_exhaustive]`, so a caller reaching this SPI directly is not bound
+    /// by it.
     pub fn inc_dedup_stale(&self) {
         self.dedup_stale.add(1, &[]);
+    }
+
+    /// Increment the stale-acceptance counter: one entry the write statement's
+    /// own admission guard refused, because its `accepted_at` sat outside
+    /// `feed_acceptance_slack_secs` of that statement's `statement_timestamp()`
+    /// (this plugin's DESIGN §3.6). A **different** signal from
+    /// [`Self::inc_dedup_stale`], which counts a conflicting row that could not
+    /// be read back at all; both answer `Transient`, and only this one says the
+    /// entry's acceptance instant is the reason.
+    pub fn inc_stale_acceptance_rejection(&self) {
+        self.stale_acceptance_rejection.add(1, &[]);
     }
 
     /// Increment the `create_batch` bounded-retry counter (one per retry of a
@@ -422,16 +733,214 @@ impl Metrics {
             .add(1, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
     }
 
-    // --- Synchronous gauge setters ---
-
-    /// Set the current usage-type catalog size.
-    pub fn set_catalog_size(&self, n: u64) {
-        self.usage_type_catalog_size.record(n, &[]);
+    /// Record one retention sweep: its duration, and its outcome.
+    pub fn record_retention_sweep(&self, outcome: SweepOutcome, secs: f64) {
+        self.retention_sweep_duration.record(secs, &[]);
+        self.retention_sweeps.add(
+            1,
+            &[KeyValue::new(label::SWEEP_OUTCOME, outcome.as_label())],
+        );
     }
+
+    /// Increment the dropped-chunk counter.
+    pub fn inc_retention_chunk_dropped(&self) {
+        self.retention_chunks_dropped.add(1, &[]);
+    }
+
+    /// Increment the kept-unresolved counter under `reason`.
+    pub fn inc_retention_chunk_kept_unresolved(&self, reason: KeepReason) {
+        self.retention_chunks_kept_unresolved
+            .add(1, &[KeyValue::new(label::KEEP_REASON, reason.as_label())]);
+    }
+
+    /// Increment the failed-drop counter.
+    pub fn inc_retention_drop_failure(&self) {
+        self.retention_drop_failures.add(1, &[]);
+    }
+
+    /// Count one aggregate by the read that served it: `None` for the rollup,
+    /// `Some(reason)` for the scan.
+    pub fn record_aggregate_path(&self, fallback: Option<FallbackReason>) {
+        let (path, reason) = match fallback {
+            None => (label::AGGREGATE_PATH_ROLLUP, label::FALLBACK_REASON_NONE),
+            Some(r) => (label::AGGREGATE_PATH_SCAN, r.as_label()),
+        };
+        self.aggregate_path.add(
+            1,
+            &[
+                KeyValue::new(label::AGGREGATE_PATH, path),
+                KeyValue::new(label::FALLBACK_REASON, reason),
+            ],
+        );
+    }
+
+    /// Add `n` to the deleted-rollup-rows counter.
+    pub fn add_rollup_rows_deleted(&self, n: u64) {
+        self.rollup_rows_deleted.add(n, &[]);
+    }
+
+    /// Count one `CursorBeyondRetention` refusal.
+    ///
+    /// Raised when a retention mark stands above the presented position
+    /// (`docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page`, Retention
+    /// refusal). A sustained rate means consumers are falling behind what the
+    /// deployment retains; a refusal of a consumer that polls at the head is
+    /// the long-transaction shortfall (§3.6, Known shortfall).
+    pub fn inc_feed_cursor_refusal(&self) {
+        self.feed_cursor_refusals.add(1, &[]);
+    }
+
+    // --- Synchronous gauge setters ---
 
     /// Set the plugin-local readiness gauge (1 when `ready`, else 0).
     pub fn set_ready(&self, ready: bool) {
         self.ready.record(u64::from(ready), &[]);
+    }
+
+    /// Set the chunk-count gauge.
+    pub fn set_chunks(&self, n: u64) {
+        self.chunks.record(n, &[]);
+    }
+
+    /// Set one refresh policy's gauges. The age is left unset for a policy
+    /// that has never succeeded.
+    pub fn set_rollup_refresh_status(&self, status: &RefreshJobStatus) {
+        let attrs = [KeyValue::new(
+            label::REFRESH_POLICY,
+            status.policy.as_label(),
+        )];
+        self.rollup_refresh_job_failing
+            .record(u64::from(status.failing), &attrs);
+        if let Some(age) = status.secs_since_success {
+            self.rollup_refresh_age.record(age, &attrs);
+        }
+    }
+
+    /// Set the number of rollup refresh policies the last monitor sample
+    /// found, including zero.
+    pub fn set_rollup_refresh_policies(&self, n: u64) {
+        self.rollup_refresh_policies.record(n, &[]);
+    }
+
+    /// Set the settled-horizon lag, in seconds.
+    ///
+    /// `now()` minus the earliest `xact_start` among backends whose
+    /// `backend_xid` is not null, as visible to the plugin role — the lag
+    /// between acceptance and feed visibility the settled horizon imposes
+    /// (§4.1 item 2). **Left unset rather than zeroed** when the role sees no
+    /// such session: §4.3 makes the gauge best-effort, and a zero would read as
+    /// a healthy instance rather than as an unanswerable question. The 240 s
+    /// figure in §4.1 item 2 is an alert threshold on this series; nothing in
+    /// the plugin compares against it.
+    pub fn set_feed_horizon_lag(&self, seconds: f64) {
+        self.feed_horizon_lag.record(seconds, &[]);
+    }
+
+    /// Every instrument name this inventory declares.
+    ///
+    /// The destructure below has **no `..`**, on purpose — be exact about what
+    /// that buys. It makes adding a field to [`Metrics`] a compile error
+    /// (`E0027`) until the field is accounted for in the destructure; it does
+    /// not force the instrument's name into the `vec!` beside it. What it does
+    /// do is make it impossible to *reach* this function without being shown
+    /// the new field, at the one place whose whole job is to list them — which
+    /// is why `metrics_tests` can assert the exported set **equals** this one
+    /// rather than merely containing some of it. Renaming an instrument in
+    /// [`Self::with_meter`] without renaming it here fails that assertion from
+    /// the other side.
+    ///
+    /// Gated on `any(test, feature = "postgres")` rather than `test` alone, for
+    /// [`crate::infra::storage::migration_probe`]'s reason: the `tests/*.rs`
+    /// integration crates are external to this one, and an inventory they
+    /// cannot reach is one they will hand-copy. `postgres` is a test-only
+    /// feature, so nothing ships with this compiled in.
+    ///
+    /// Also the per-row check for `cpt-cf-uc-plugin-dod-slo-series-backing`:
+    /// every metric name DESIGN.md §4.3's SLO Summary table cites appears here,
+    /// so each service-level indicator resolves to a declared instrument.
+    ///
+    /// **Does not itself earn `algo-instrument-name-assertion` or
+    /// `dod-declared-name-test-binding` a tick.** `metrics_tests.rs`'s own
+    /// in-module tests hand-copy instrument-name literals at their
+    /// `counter_sum` / `histogram_count` / `gauge_last_u64` call sites rather
+    /// than reading them from this function, which those clauses prohibit. The
+    /// clauses' *purpose* ("a rename fails loudly") is met at every one of
+    /// those sites by other means, so this is a gap in the binding mechanism
+    /// rather than a test that silently passes.
+    // @cpt-dod:cpt-cf-uc-plugin-dod-slo-series-backing:p2
+    #[cfg(any(test, feature = "postgres"))]
+    #[must_use]
+    pub fn declared_instrument_names(&self) -> Vec<&'static str> {
+        let Self {
+            insert_duration: _,
+            query_duration: _,
+            pool_acquire_duration: _,
+            feed_page_duration: _,
+            reconciliation_duration: _,
+            batch_rows: _,
+            retention_sweep_duration: _,
+            dedup_absorbed: _,
+            backend_error: _,
+            idempotency_conflict: _,
+            migration_failure: _,
+            invalidation: _,
+            _dedup_late_convergence: _,
+            dedup_stale: _,
+            stale_acceptance_rejection: _,
+            batch_retry: _,
+            query_requests: _,
+            tls_handshake_failure: _,
+            retention_sweeps: _,
+            retention_chunks_dropped: _,
+            retention_chunks_kept_unresolved: _,
+            retention_drop_failures: _,
+            aggregate_path: _,
+            rollup_rows_deleted: _,
+            feed_cursor_refusals: _,
+            ready: _,
+            chunks: _,
+            rollup_refresh_age: _,
+            feed_horizon_lag: _,
+            rollup_refresh_job_failing: _,
+            rollup_refresh_policies: _,
+            _pool_active: _,
+            _pool_idle: _,
+        } = self;
+        vec![
+            "uc_timescaledb_insert_duration_seconds",
+            "uc_timescaledb_query_duration_seconds",
+            "uc_timescaledb_pool_acquire_duration_seconds",
+            "uc_timescaledb_feed_page_duration_seconds",
+            "uc_timescaledb_reconciliation_duration_seconds",
+            "uc_timescaledb_batch_rows",
+            "uc_timescaledb_dedup_absorbed_total",
+            "uc_timescaledb_backend_errors_total",
+            "uc_timescaledb_idempotency_conflicts_total",
+            "uc_timescaledb_migration_failures_total",
+            "uc_timescaledb_invalidations_total",
+            "uc_timescaledb_dedup_late_convergence_total",
+            "uc_timescaledb_dedup_stale_total",
+            "uc_timescaledb_stale_acceptance_rejections_total",
+            "uc_timescaledb_batch_retries_total",
+            "uc_timescaledb_query_requests_total",
+            "uc_timescaledb_tls_handshake_failures_total",
+            "uc_timescaledb_ready",
+            "uc_timescaledb_pool_connections_active",
+            "uc_timescaledb_pool_connections_idle",
+            "uc_timescaledb_retention_sweep_duration_seconds",
+            "uc_timescaledb_retention_sweeps_total",
+            "uc_timescaledb_retention_chunks_dropped_total",
+            "uc_timescaledb_retention_chunks_kept_unresolved_total",
+            "uc_timescaledb_retention_drop_failures_total",
+            "uc_timescaledb_chunks",
+            "uc_timescaledb_aggregate_path_total",
+            "uc_timescaledb_rollup_rows_deleted_total",
+            "uc_timescaledb_rollup_refresh_age_seconds",
+            "uc_timescaledb_rollup_refresh_job_failing",
+            "uc_timescaledb_rollup_refresh_policies",
+            "uc_timescaledb_feed_cursor_refusals_total",
+            "uc_timescaledb_feed_horizon_lag_seconds",
+        ]
     }
 }
 
@@ -440,8 +949,10 @@ impl Metrics {
 pub enum TimedOp {
     /// `uc_timescaledb_query_duration_seconds`, labelled by the [`QueryKind`].
     Query(QueryKind),
-    /// `uc_timescaledb_deactivate_duration_seconds`.
-    Deactivate,
+    /// `uc_timescaledb_feed_page_duration_seconds`, unlabelled.
+    FeedPage,
+    /// `uc_timescaledb_reconciliation_duration_seconds`, unlabelled.
+    Reconciliation,
 }
 
 /// Records an operation-duration histogram on drop, so the duration is captured
@@ -475,7 +986,8 @@ impl Drop for OpDurationGuard {
         let secs = self.start.elapsed().as_secs_f64();
         match self.op {
             TimedOp::Query(kind) => self.metrics.record_query(kind, secs),
-            TimedOp::Deactivate => self.metrics.record_deactivate(secs),
+            TimedOp::FeedPage => self.metrics.record_feed_page_duration(secs),
+            TimedOp::Reconciliation => self.metrics.record_reconciliation_duration(secs),
         }
     }
 }
