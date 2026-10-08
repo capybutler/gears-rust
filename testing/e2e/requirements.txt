@@ -8,6 +8,7 @@ websockets>=14.0  # WebSocket client for OAGW WebSocket proxy E2E tests
 
 
 cryptography>=41.0  # Ed25519 public-key derivation for file-storage lifecycle E2E
+PyYAML>=6.0  # Suite conftests read their own config.yaml (usage-collector); also in testing/requirements.txt
 
 h11>=0.16.0 # not directly required, pinned by Snyk to avoid a vulnerability
 anyio>=4.4.0 # not directly required, pinned by Snyk to avoid a vulnerability

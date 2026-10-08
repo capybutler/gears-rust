@@ -1,81 +1,33 @@
 //! Foundation domain models for the Usage Collector SDK.
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use toolkit_odata_macros::ODataFilterable;
 use uuid::Uuid;
 
-use gts::{GtsId, GtsIdSegment, GtsInstanceId};
+use gts::GtsTypeId;
 
 use crate::error::UsageCollectorError;
+use crate::quantity::UsageQuantity;
 
-// ---------------------------------------------------------------------------
-// Usage-kind discriminator
-// ---------------------------------------------------------------------------
-
-/// Closed classification axis for usage types.
-///
-/// `Counter` and `Gauge` are CF-platform-internal kinds with no vendor
-/// extensibility. Serde `deny_unknown_fields` on [`UsageType`] plus the
-/// closed-enum serde shape rejects any other value at the deserialize
-/// boundary. The allowed aggregation ops per kind are defined by
-/// [`AggregationOp::is_allowed_for`]: `Counter` admits `{Sum, Count}`;
-/// `Gauge` admits `{Min, Max, Avg, Count}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UsageKind {
-    /// Append-only counter semantics. Compensations (negative deltas with
-    /// `corrects_id` set) are accepted.
-    Counter,
-    /// Snapshot-overwrite semantics. Compensations are rejected; the only
-    /// correction for a gauge is deactivation.
-    Gauge,
-}
-
-impl std::str::FromStr for UsageKind {
-    type Err = UsageCollectorError;
-
-    /// Mirrors the serde wire shape — `#[serde(rename_all = "lowercase")]`
-    /// on the enum — without paying the `serde_json::Value` allocation per
-    /// call. Both surfaces are pinned in `models_tests.rs` by
-    /// `usage_kind_serde_round_trips_lowercase` and
-    /// `usage_kind_from_str_accepts_counter_and_gauge`; the two
-    /// assertions catch any future `rename_all` drift between them.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "counter" => Ok(Self::Counter),
-            "gauge" => Ok(Self::Gauge),
-            _ => Err(UsageCollectorError::invalid_usage_kind(s)),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // MetadataKey
-// ---------------------------------------------------------------------------
 
 /// Validating newtype over a metadata key string.
 ///
-/// Every site in the SDK that names a declared metadata key — the keys in
-/// [`UsageType::metadata_fields`], the keys of [`UsageRecord::metadata`],
-/// the key of a [`MetadataFilter`], and the payload of
-/// [`AggregationDimension::Metadata`] — carries this type rather than a bare
-/// `String`, so a malformed key cannot reach any consumer past the SDK
-/// boundary.
+/// Every SDK site naming a declared metadata key carries this type rather
+/// than a bare `String` — the keys of [`UsageRecord::metadata`], a
+/// [`MetadataFilter`]'s key, [`AggregationDimension::Metadata`]'s payload —
+/// so a malformed key cannot reach a consumer past the SDK boundary.
 ///
-/// Validation rules are intentionally minimal: keys are domain-opaque
-/// (operators choose them) so the SDK refuses to encode casing or charset
-/// policy.
-///
-/// Closed-shape membership — every key on a record MUST be in the referenced
-/// usage type's `metadata_fields` — remains a gateway-time check; it cannot
-/// be expressed at the type level without the catalog context, and the
-/// gateway is its single owner.
+/// Validation is deliberately minimal: keys are domain-opaque (operators
+/// choose them), so the SDK encodes no casing or charset policy.
+/// Closed-shape membership against the resolved meter declaration's
+/// `metadata_fields` needs that declaration, so it stays a gateway-time
+/// check the gateway alone owns.
 ///
 /// # Validation
 ///
@@ -93,6 +45,10 @@ impl MetadataKey {
     ///
     /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
     /// empty or contains a NUL byte.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
         if raw.is_empty() {
@@ -157,9 +113,27 @@ impl<'de> Deserialize<'de> for MetadataKey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Attribution composites
-// ---------------------------------------------------------------------------
+
+/// Character cap on each attribution component, from the `ResourceRef` and
+/// `SubjectRef` schemas (`maxLength: 256`) in `docs/usage-collector-v1.yaml`.
+const MAX_ATTRIBUTION_LEN: usize = 256;
+
+/// Refuses an attribution component longer than [`MAX_ATTRIBUTION_LEN`]
+/// characters, naming its dotted path.
+#[allow(
+    clippy::result_large_err,
+    reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+)]
+fn cap_attribution(field: &str, value: &str) -> Result<(), UsageCollectorError> {
+    if value.chars().count() > MAX_ATTRIBUTION_LEN {
+        return Err(UsageCollectorError::attribution_too_long(
+            field,
+            MAX_ATTRIBUTION_LEN,
+        ));
+    }
+    Ok(())
+}
 
 /// Reference to the resource instance to which usage is attributed.
 /// Mandatory on every usage record.
@@ -178,12 +152,16 @@ pub struct ResourceRef {
 
 impl ResourceRef {
     /// Creates a [`ResourceRef`] after validating both components are
-    /// non-empty and contain no NUL bytes.
+    /// non-empty, contain no NUL bytes, and are not longer than 256 characters.
     ///
     /// # Errors
     ///
     /// Returns [`UsageCollectorError::InvalidArgument`] when `resource_id`
-    /// or `resource_type` is empty or contains a NUL byte.
+    /// or `resource_type` is empty, contains a NUL byte, or longer than 256 characters.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(
         resource_id: impl Into<String>,
         resource_type: impl Into<String>,
@@ -199,6 +177,7 @@ impl ResourceRef {
                 "resource_id must not contain NUL bytes",
             ));
         }
+        cap_attribution("resource_ref.resource_id", &resource_id)?;
         let resource_type = resource_type.into();
         if resource_type.is_empty() {
             return Err(UsageCollectorError::invalid_resource_ref(
@@ -210,6 +189,7 @@ impl ResourceRef {
                 "resource_type must not contain NUL bytes",
             ));
         }
+        cap_attribution("resource_ref.resource_type", &resource_type)?;
         Ok(Self {
             resource_id,
             resource_type,
@@ -268,13 +248,17 @@ pub struct SubjectRef {
 impl SubjectRef {
     /// Creates a [`SubjectRef`] after validating `subject_id` is non-empty
     /// and `subject_type`, when supplied, is non-empty; both components are
-    /// also validated to contain no NUL bytes.
+    /// also validated to contain no NUL bytes and are not longer than 256 characters.
     ///
     /// # Errors
     ///
     /// Returns [`UsageCollectorError::InvalidArgument`] when `subject_id`
-    /// is empty, `subject_type` is `Some("")`, or either component contains
-    /// a NUL byte.
+    /// is empty, `subject_type` is `Some("")`, either component contains
+    /// a NUL byte, or longer than 256 characters.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(
         subject_id: impl Into<String>,
         subject_type: Option<impl Into<String>>,
@@ -290,6 +274,7 @@ impl SubjectRef {
                 "subject_id must not contain NUL bytes",
             ));
         }
+        cap_attribution("subject_ref.subject_id", &subject_id)?;
         let subject_type = match subject_type {
             None => None,
             Some(s) => {
@@ -304,6 +289,7 @@ impl SubjectRef {
                         "subject_type must not contain NUL bytes",
                     ));
                 }
+                cap_attribution("subject_ref.subject_type", &s)?;
                 Some(s)
             }
         };
@@ -346,48 +332,72 @@ impl<'de> Deserialize<'de> for SubjectRef {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Idempotency key
-// ---------------------------------------------------------------------------
+
+/// Ceiling on the wire length of an idempotency key, from the
+/// `IdempotencyKey` schema in `docs/usage-collector-v1.yaml`.
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 
 /// Validating newtype over the caller-supplied idempotency key string.
 ///
 /// Every [`UsageRecord::idempotency_key`] carries this type rather than a
-/// bare `String`. The plugin SPI dedups on
-/// `(tenant_id, usage_type_gts_id, idempotency_key)` per `plugin-spi.md`,
-/// and the key is declared mandatory on every record — the newtype
-/// enforces that "mandatory" at the type level so an SDK consumer cannot
-/// build a record with an empty key.
+/// bare `String`: the key is mandatory on every entry, and the newtype
+/// enforces that at the type level. It is a dedup-identity input
+/// ([`crate::id::derive_usage_record_id`]), so a malformed one must not reach
+/// the derivation at all.
+///
+/// **No prefix is reserved** (DESIGN §3.1, `IdempotencyKey`). Both entry
+/// kinds carry a caller-supplied key and an invalidation repeats its
+/// target's, so the whole key space stays the caller's and `entry_type` —
+/// not the key — is what tells the two apart.
 ///
 /// # Validation
 ///
 /// - Non-empty.
-/// - No NUL bytes (Postgres `text` column requirement).
+/// - At most 256 characters (`MAX_IDEMPOTENCY_KEY_LEN`).
+/// - No ASCII control characters, DEL included — the wire contract's
+///   `^[^\x00-\x1F\x7F]+$`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
-    /// Creates an [`IdempotencyKey`] after validating the value is non-empty
-    /// and contains no NUL bytes.
+    /// Creates an [`IdempotencyKey`] after validating it against the wire
+    /// contract's `IdempotencyKey` schema (`minLength: 1`,
+    /// `maxLength: 256`, `pattern: ^[^\x00-\x1F\x7F]+$`).
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when the input
-    /// is empty or contains a NUL byte.
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
+    /// empty, longer than 256 characters, or carries an ASCII control
+    /// character (including DEL).
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
-        if raw.is_empty() {
-            return Err(UsageCollectorError::invalid_idempotency_key(
-                "idempotency_key must not be empty",
-            ));
-        }
-        if raw.contains('\0') {
-            return Err(UsageCollectorError::invalid_idempotency_key(
-                "idempotency_key must not contain NUL bytes",
-            ));
-        }
+        validate_idempotency_key(&raw)?;
         Ok(Self(raw))
+    }
+
+    /// Rebuilds a key read back from storage.
+    ///
+    /// Delegates to [`Self::new`], so the two cannot drift. What the separate
+    /// spelling carries is provenance: it names a rehydration of a persisted
+    /// entry rather than the admission of a submission.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorError::InvalidArgument`] when the stored value is
+    /// empty, longer than 256 characters, or carries an ASCII control
+    /// character.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn from_stored(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
+        Self::new(value)
     }
 
     /// Borrows the underlying string.
@@ -401,6 +411,37 @@ impl IdempotencyKey {
     pub fn into_inner(self) -> String {
         self.0
     }
+}
+
+/// Every check an [`IdempotencyKey`] meets, whichever constructor built it:
+/// non-empty, at most [`MAX_IDEMPOTENCY_KEY_LEN`] characters, and no ASCII
+/// control character (DEL included).
+#[allow(
+    clippy::result_large_err,
+    reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+)]
+fn validate_idempotency_key(raw: &str) -> Result<(), UsageCollectorError> {
+    if raw.is_empty() {
+        return Err(UsageCollectorError::invalid_idempotency_key(
+            "idempotency_key must not be empty",
+        ));
+    }
+    if raw.chars().count() > MAX_IDEMPOTENCY_KEY_LEN {
+        return Err(UsageCollectorError::invalid_idempotency_key(
+            "idempotency_key must be at most 256 characters",
+        ));
+    }
+    // `char::is_ascii_control()` covers U+007F (DEL) alongside U+0000..=U+001F.
+    // Load-bearing, not cosmetic: [`crate::id::derive_usage_record_id`] joins
+    // this value with the other identity inputs under a `0x1F` separator, and
+    // the key is not the final field, so a control character inside it would
+    // inject a separator into the middle of the pre-image.
+    if raw.chars().any(|c| c.is_ascii_control()) {
+        return Err(UsageCollectorError::invalid_idempotency_key(
+            "idempotency_key must not contain ASCII control characters",
+        ));
+    }
+    Ok(())
 }
 
 impl AsRef<str> for IdempotencyKey {
@@ -433,491 +474,1424 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// UsageType identity
-// ---------------------------------------------------------------------------
+// ReasonCode
 
-/// Deployment-unique usage-type human identifier.
+/// Character cap on an invalidation reason code, from the wire contract's
+/// `ReasonCode` schema (`maxLength: 128`).
+const MAX_REASON_CODE_LEN: usize = 128;
+
+/// Validating newtype over the caller-supplied invalidation reason code.
 ///
-/// Validating newtype over [`gts::GtsInstanceId`]: the id MUST derive from
-/// the reserved abstract base [`Self::USAGE_RECORD_BASE`] with at least one
-/// further `~`-separated segment. Counter / gauge classification is carried
-/// separately by [`UsageType::kind`]; the id does not encode kind.
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-type-lifecycle-principle-semantics-enforcement:p2
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct UsageTypeGtsId(GtsInstanceId);
+/// [`Invalidation::reason`] carries this rather than a bare `String` for
+/// the reason [`IdempotencyKey`] does: the wire contract constrains the
+/// value and an unvalidated one would reach a storage plugin.
+///
+/// The vocabulary itself is deliberately open — the gear records the
+/// emitter's stated intent and infers nothing from it, so no closed enum
+/// is declared here or on the wire.
+///
+/// # Validation
+///
+/// - Non-empty.
+/// - At most 128 characters (`MAX_REASON_CODE_LEN`).
+/// - No ASCII control characters, DEL included. Unlike [`IdempotencyKey`]'s,
+///   this is wire hygiene rather than pre-image safety: the code is not an
+///   identity input. The wire contract states no pattern for the code, so
+///   this is the stricter of the two and fails closed.
+///
+/// # Known gap — a whitespace-only code is admitted
+///
+/// The wire contract and DESIGN §3.1 ask only that the code be present, and
+/// [`Self::new`] enforces exactly that, so `" "` is accepted.
+/// `cpt-cf-usage-collector-dod-mandatory-reason-code` and
+/// `cpt-cf-usage-collector-algo-entry-type-discrimination` ask for more — an
+/// absent, empty **or whitespace-only** code must be rejected — and no `trim`
+/// runs here or on either submission path. Both identifiers stay unticked for
+/// that reason; the fix is one `raw.trim().is_empty()` guard beside the
+/// emptiness check, and it changes wire behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ReasonCode(String);
 
-impl UsageTypeGtsId {
-    /// Reserved abstract base type id for usage records.
-    ///
-    /// Every catalog `gts_id` MUST left-prefix-match this value and carry at
-    /// least one further `~`-separated derivation segment. The base itself
-    /// is abstract and rejected as a bare value.
-    pub const USAGE_RECORD_BASE: &'static str = crate::gts::USAGE_RECORD_RESOURCE;
-
-    /// Creates a `UsageTypeGtsId` after validating that the input is a
-    /// well-formed GTS instance id deriving from [`Self::USAGE_RECORD_BASE`].
-    ///
-    /// Validation routes through [`gts::GtsId::try_new`], which enforces the GTS
-    /// per-segment grammar (`vendor.package.namespace.type.v<major>[.<minor>]`),
-    /// the allowed character set, terminator semantics, and the chained-id
-    /// rules. That is the same validator other gears use for catalog-key
-    /// GTS strings, so a
-    /// malformed id surfaces with the canonical GTS error chain instead of a
-    /// raw `strip_prefix` miss.
+impl ReasonCode {
+    /// Creates a [`ReasonCode`] after validating it against the wire
+    /// contract's `ReasonCode` schema (`minLength: 1`, `maxLength: 128`).
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorError::InvalidArgument`] when the input
-    /// is not a syntactically valid GTS id, is a GTS *type* id (trailing
-    /// `~`) rather than an instance id, or does not derive from
-    /// [`Self::USAGE_RECORD_BASE`] (the base must appear as the first
-    /// segment of the parsed chain).
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the input is
+    /// empty, longer than 128 characters, or carries an ASCII control character
+    /// (including DEL).
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
         let raw = value.into();
-        let parsed = GtsId::try_new(&raw).map_err(|e| {
-            UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!("usage type gts_id `{raw}` is not a valid GTS id: {e}"),
-            )
-        })?;
-        if parsed.is_type() {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!(
-                    "usage type gts_id `{raw}` must be a GTS instance id (no trailing `~`), \
-                     not a type id"
-                ),
+        if raw.is_empty() {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must not be empty",
             ));
         }
-        // Parent-chain match at GTS-segment granularity (not byte
-        // granularity). `get_type_id()` returns the prefix up to and
-        // including the last `~`, which for the canonical
-        // `base~concrete` shape is exactly `USAGE_RECORD_BASE`. Any other
-        // base, or a deeper chain whose immediate parent is not the
-        // usage-record base, fails this check — only direct derivation
-        // from the reserved base is admitted into the catalog.
-        if parsed.get_type_id().as_deref() != Some(Self::USAGE_RECORD_BASE) {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!(
-                    "usage type gts_id `{raw}` must derive from the reserved base `{base}`",
-                    base = Self::USAGE_RECORD_BASE,
-                ),
+        if raw.chars().count() > MAX_REASON_CODE_LEN {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must be at most 128 characters",
             ));
         }
-        // The last parsed segment is the derivation tail. The `let Some`
-        // fall-through is structurally unreachable — `get_type_id()`
-        // returning `Some(base)` implies `gts_id_segments.len() >= 2` —
-        // but is kept as a graceful error rather than `expect` to satisfy
-        // the workspace `clippy::expect_used` rule.
-        let Some(segment) = parsed.segments().last().map(GtsIdSegment::raw) else {
-            return Err(UsageCollectorError::invalid_usage_type_gts_id(
-                &raw,
-                &format!("usage type gts_id `{raw}` is missing a derivation segment"),
+        // `char::is_ascii_control()` covers U+007F (DEL) alongside
+        // U+0000..=U+001F.
+        if raw.chars().any(|c| c.is_ascii_control()) {
+            return Err(UsageCollectorError::invalid_reason_code(
+                "reason_code must not contain ASCII control characters",
             ));
-        };
-        Ok(Self(GtsInstanceId::new(Self::USAGE_RECORD_BASE, segment)))
+        }
+        Ok(Self(raw))
     }
 
-    /// Borrows the validated GTS instance id.
+    /// Borrows the underlying string.
     #[must_use]
-    pub fn as_instance_id(&self) -> &GtsInstanceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the newtype and returns the owned string.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for ReasonCode {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-impl AsRef<str> for UsageTypeGtsId {
-    fn as_ref(&self) -> &str {
-        self.0.as_ref()
-    }
-}
-
-impl std::fmt::Display for UsageTypeGtsId {
+impl std::fmt::Display for ReasonCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.as_ref())
+        f.write_str(&self.0)
     }
 }
 
-impl PartialOrd for UsageTypeGtsId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl FromStr for ReasonCode {
+    type Err = UsageCollectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
     }
 }
 
-impl Ord for UsageTypeGtsId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.as_ref().cmp(other.0.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for UsageTypeGtsId {
+impl<'de> Deserialize<'de> for ReasonCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        UsageTypeGtsId::new(raw).map_err(serde::de::Error::custom)
+        ReasonCode::new(raw).map_err(serde::de::Error::custom)
     }
 }
 
-// ---------------------------------------------------------------------------
-// UsageType catalog row
-// ---------------------------------------------------------------------------
+// MeterTypeId
 
-/// Usage-type catalog row exchanged across SDK, plugin SPI, and REST surfaces.
+/// The GTS base type every meter derives from.
 ///
-/// The row carries `gts_id`, the closed `kind: UsageKind` discriminator
-/// (counter vs gauge), and the closed `metadata_fields` list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UsageType {
-    /// Catalog primary key; `usage_records.gts_id` references this value.
-    pub gts_id: UsageTypeGtsId,
-    /// Counter / gauge classification. Serde `deny_unknown_fields` plus the
-    /// closed-enum shape rejects any other value at the deserialize boundary.
-    pub kind: UsageKind,
-    /// Closed set of declared metadata keys. Every key on a record's
-    /// `metadata` map MUST be a member; values are typed as `String`;
-    /// undeclared keys are rejected at the gateway. Each key is a
-    /// validated [`MetadataKey`] (non-empty, no NUL bytes) so malformed
-    /// declarations cannot land here, and the field is deserialized
-    /// through [`deserialize_metadata_fields`] so duplicate keys are
-    /// rejected at the wire boundary instead of silently collapsing.
-    #[serde(deserialize_with = "deserialize_metadata_fields")]
-    pub metadata_fields: BTreeSet<MetadataKey>,
+/// Alias of [`crate::gts::USAGE_RECORD_RESOURCE`] — the same string, not a
+/// new identifier — so a meter-type call site can name the base in
+/// meter-type terms.
+pub const USAGE_RECORD_BASE_TYPE: &str = crate::gts::USAGE_RECORD_RESOURCE;
+
+/// Ceiling on the wire length of a meter type identifier, from
+/// `docs/schemas/usage_record.v1.schema.json`'s `gts_type_id` property.
+const MAX_METER_TYPE_ID_LEN: usize = 512;
+
+/// Reference to the GTS type declaration a ledger entry is metered against.
+///
+/// A meter is a derived **type** of [`USAGE_RECORD_BASE_TYPE`] with exactly
+/// one further segment — not an instance — so this wraps a [`GtsTypeId`].
+/// The declaration it names is owned by `types-registry`; this gear resolves
+/// it and mints none.
+///
+/// The gear infers no metering meaning from the shape of the identifier.
+/// Fold, canonical unit, and metadata surface come from the resolved
+/// declaration alone.
+///
+/// Deliberately implements neither `Ord` nor `PartialOrd`: the wrapped
+/// [`GtsTypeId`] implements neither. A caller that needs this as a
+/// `BTreeMap`/`BTreeSet` key must add manual impls delegating to the string
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct MeterTypeId(GtsTypeId);
+
+impl MeterTypeId {
+    /// Creates a [`MeterTypeId`] after validating it against the base type's
+    /// published pattern
+    /// (`^gts\.cf\.core\.uc\.usage_record\.v1~[^\x00-\x1F\x7F~]+~$`,
+    /// `maxLength: 512`).
+    ///
+    /// Length and control characters are checked before the value is handed
+    /// to [`GtsTypeId::try_new`], so the diagnostic names the real problem
+    /// rather than a generic GTS parse error. The control-character exclusion
+    /// is load-bearing: [`crate::id::derive_usage_record_id`] joins this value
+    /// with the other identity inputs under a `0x1F` separator, so a control
+    /// character inside it would let two distinct identities collapse to one
+    /// pre-image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorError::InvalidArgument`] when the value is
+    /// longer than 512 bytes, carries an ASCII control character (including
+    /// DEL), does not derive from [`USAGE_RECORD_BASE_TYPE`], is not
+    /// `~`-terminated, does not add exactly one further derivation segment
+    /// (empty, or containing an interior `~`) to the base, or — having
+    /// passed all of the above — fails the per-segment GTS grammar enforced
+    /// by the delegated [`GtsTypeId::try_new`] call.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn new(value: impl Into<String>) -> Result<Self, UsageCollectorError> {
+        let raw = value.into();
+
+        if raw.len() > MAX_METER_TYPE_ID_LEN {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must be at most 512 bytes",
+            ));
+        }
+
+        // `char::is_ascii_control()` already covers U+007F (DEL) alongside
+        // U+0000..=U+001F, so no separate DEL check is needed.
+        if raw.chars().any(|c| c.is_ascii_control()) {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must not contain ASCII control characters",
+            ));
+        }
+
+        let Some(suffix) = raw.strip_prefix(USAGE_RECORD_BASE_TYPE) else {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must derive from `gts.cf.core.uc.usage_record.v1~`",
+            ));
+        };
+
+        // Exactly one further segment: non-empty, `~`-terminated, and with
+        // no interior `~` that would make it two.
+        if suffix.is_empty() {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must add exactly one derivation segment to the base type",
+            ));
+        }
+        let Some(segment) = suffix.strip_suffix('~') else {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must end with `~`",
+            ));
+        };
+        if segment.is_empty() || segment.contains('~') {
+            return Err(UsageCollectorError::invalid_meter_type_id(
+                &raw,
+                "must add exactly one derivation segment to the base type",
+            ));
+        }
+
+        let parsed = GtsTypeId::try_new(&raw)
+            .map_err(|e| UsageCollectorError::invalid_meter_type_id(&raw, &e.to_string()))?;
+
+        Ok(Self(parsed))
+    }
+
+    /// Borrows the wire string, terminator included.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    /// Borrows the underlying GTS type identifier.
+    #[must_use]
+    pub fn as_gts(&self) -> &GtsTypeId {
+        &self.0
+    }
 }
 
-/// Deserialize `metadata_fields` through a `Vec<MetadataKey>` so the SDK
-/// boundary rejects duplicate keys instead of silently collapsing them
-/// into the `BTreeSet`. The REST DTO path additionally surfaces the
-/// typed [`UsageCollectorError::InvalidArgument`] via
-/// `metadata_fields_from_wire`; this function provides the same
-/// duplicate-rejection guarantee for any non-REST wire entry point
-/// (config loader, alternate IPC, plugin SPI replay).
-fn deserialize_metadata_fields<'de, D>(d: D) -> Result<BTreeSet<MetadataKey>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Vec::<MetadataKey>::deserialize(d)?;
-    let mut set = BTreeSet::new();
-    for (index, key) in raw.into_iter().enumerate() {
-        if !set.insert(key) {
-            return Err(serde::de::Error::custom(format!(
-                "duplicate metadata field at index {index}"
-            )));
+impl AsRef<str> for MeterTypeId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for MeterTypeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MeterTypeId {
+    type Err = UsageCollectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MeterTypeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        MeterTypeId::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+// Usage-record exchange types
+
+/// Wire name of the covered period's inclusive start bound.
+///
+/// The two bound names are wire vocabulary rather than Rust field names:
+/// they appear in a validation error's `field`, and the read surface
+/// reserves and orders on them. Naming them once keeps a typo at one site
+/// from silently splitting the vocabulary in two.
+pub const WINDOW_START_FIELD: &str = "window_start";
+
+/// Wire name of the covered period's exclusive end bound. See
+/// [`WINDOW_START_FIELD`] for why both are constants.
+pub const WINDOW_END_FIELD: &str = "window_end";
+
+/// Wire name of the record identifier. A constant for the same reason as the
+/// two bound names: the gateway's canonical keyset is `(window_end, id)`,
+/// spelled from [`WINDOW_END_FIELD`] and this, and a keyset half-spelled from
+/// constants and half from literals is where one half gets repointed and the
+/// other does not.
+pub const RECORD_ID_FIELD: &str = "id";
+
+/// The REST path of the dedicated backfill route, named by the live path's
+/// past-tolerance rejection.
+///
+/// A constant because the string appears in that rejection message and in the
+/// route registration, and must stay in step with `usage-collector-v1.yaml`,
+/// which carries the path independently.
+pub const BACKFILL_ROUTE_PATH: &str = "/usage-collector/v1/records/backfill";
+
+/// The closed discriminator between a measurement and a withdrawal.
+///
+/// **Caller-supplied on the ingestion shape, required and with no default**
+/// (DESIGN §3.1, `EntryType`). A stored field of [`CreateUsageRecord`], never
+/// inferred: an invalidation repeats its target's idempotency key, so a
+/// withdrawal stripped of its discriminator is an exact copy of the entry it
+/// means to withdraw and would be absorbed as a retry. This field and
+/// `reason_code` must agree, and both projections refuse a submission where
+/// they do not.
+///
+/// **Derived on the persisted shape.** [`UsageRecord::entry_type`] reads it
+/// off the [`Invalidation`] the entry carries, so an accepted entry has one
+/// place its kind can be read and no marker that can disagree with the
+/// payload it marks (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+///
+/// The kind is never read off the quantity: a zero or negative quantity is an
+/// ordinary measurement, and an invalidation echoes the quantity it withdraws
+/// rather than negating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryType {
+    /// An ordinary measurement: the entry carries no `invalidates`.
+    Record,
+    /// A withdrawal: the entry names the record it invalidates.
+    Invalidation,
+}
+
+impl EntryType {
+    /// Every variant, so a guard over the closed label set cannot fall
+    /// behind the enum. A third entry type would otherwise be admissible
+    /// here and silently absent from the `$filter` literal check that
+    /// consumes [`Self::wire_labels`].
+    pub const ALL: &'static [Self] = &[Self::Record, Self::Invalidation];
+
+    /// The wire spelling, shared by the REST projection and the `$filter`
+    /// surface.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Invalidation => "invalidation",
         }
     }
-    Ok(set)
-}
 
-impl UsageType {
-    /// `true` when this usage type carries counter semantics.
+    /// Every admissible wire label, derived from [`Self::ALL`] via
+    /// [`Self::as_str`] rather than hand-listed a second time. A third
+    /// variant appears here the moment it appears in `ALL`.
     #[must_use]
-    pub fn is_counter(&self) -> bool {
-        matches!(self.kind, UsageKind::Counter)
-    }
-
-    /// `true` when this usage type carries gauge semantics.
-    #[must_use]
-    pub fn is_gauge(&self) -> bool {
-        matches!(self.kind, UsageKind::Gauge)
+    pub fn wire_labels() -> &'static [&'static str] {
+        static LABELS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        LABELS
+            .get_or_init(|| Self::ALL.iter().map(|v| v.as_str()).collect())
+            .as_slice()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Filter surface for `list_usage_types`
-// ---------------------------------------------------------------------------
-//
-// `UsageTypeQuery` declares the filterable-field schema for the OData
-// surface of `list_usage_types`. The struct is never constructed at
-// runtime; it exists solely to feed `#[derive(ODataFilterable)]`, which
-// generates [`UsageTypeQueryFilterField`] and its
-// [`toolkit_odata::filter::FilterField`] impl, mirroring the
-// `UsageRecordQuery` / `UsageRecordQueryFilterField` pattern used by the
-// records surface.
-//
-// `metadata_fields` (a closed set) is intentionally absent — OData has no
-// natural filter shape for `BTreeSet<String>` in this workspace and there
-// is no operator demand for it.
-
-/// Filterable-field schema for `list_usage_types`'s `ODataQuery` argument.
+/// Which ingestion path admitted an entry.
 ///
-/// Never constructed at runtime. The `dead_code` allow is intentional —
-/// the struct is a derive-only artifact (see module comment above for
-/// rationale).
-#[derive(ODataFilterable)]
-#[allow(dead_code)]
-pub struct UsageTypeQuery {
-    /// `usage_type_catalog.gts_id`. Supports `eq`, `ne`, `contains`,
-    /// `startswith`, `endswith`, `in`.
-    #[odata(filter(kind = "String"))]
-    pub gts_id: String,
-    /// `usage_type_catalog.kind` (`"counter"` / `"gauge"`). Plugins
-    /// translate to their storage representation via
-    /// `FieldToColumn::map_value`.
-    #[odata(filter(kind = "String"))]
-    pub kind: String,
-}
-
-pub use UsageTypeQueryFilterField as UsageTypeFilterField;
-
-/// Usage-type filter fields that are sound to use as a keyset-pagination
-/// ordering key. Both `usage_type_catalog` columns on the filter surface
-/// (`gts_id`, the primary key, and `kind`) are `NOT NULL`, so both are
-/// keyset-safe. The catalog list only ever orders by `gts_id`, but this is
-/// the type-surface analogue of [`is_keyset_safe_record_field`] so the
-/// plugin's shared keyset builder can enforce the never-null invariant on
-/// both surfaces. Fail-closed: an unknown field is unsafe.
-#[must_use]
-pub fn is_keyset_safe_type_field(name: &str) -> bool {
-    matches!(name, "gts_id" | "kind")
-}
-
-// ---------------------------------------------------------------------------
-// Usage-record exchange types
-// ---------------------------------------------------------------------------
-
-/// Lifecycle status of a stored [`UsageRecord`]. Defaults to `Active`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+/// **Server-assigned, never caller-supplied.** The Ingestion Gateway stamps
+/// it from the route the entry arrived on
+/// (`cpt-cf-usage-collector-adr-backfill-isolation`), which is why it is
+/// absent from [`CreateUsageRecord`] and refused by that type's
+/// `deny_unknown_fields` wire shadow.
+///
+/// It applies to invalidations exactly as to measurements: the covered-period
+/// bounds belong to the path rather than the entry kind, so a withdrawal of a
+/// period older than the live past tolerance travels the backfill route and
+/// reads `backfill`. The value is what lets a consumer rating the feed treat
+/// imported history as batch catch-up rather than current consumption.
+///
+/// Closed, and deliberately so: it is also a bounded metric label on
+/// `uc_ingestion_records_total` and `uc_ingestion_duration_seconds`
+/// (DESIGN §3.11.5), so an open vocabulary here would be unbounded
+/// cardinality there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum UsageRecordStatus {
-    /// Live, counts toward aggregates, may be referenced by a compensation.
-    #[default]
-    Active,
-    /// Removed from aggregates by an atomic depth-1 cascade; compensations
-    /// referencing this row are rejected per the L1 `corrects_id` rule.
-    Inactive,
+pub enum RecordOrigin {
+    /// Admitted by the live ingestion path — `POST /records` or
+    /// `create_usage_records`.
+    Live,
+    /// Admitted by the dedicated bulk-import route — `POST /records/backfill`
+    /// or `backfill_usage_records`.
+    Backfill,
+}
+
+impl RecordOrigin {
+    /// Every variant, so a guard over the closed label set cannot fall
+    /// behind the enum. See [`EntryType::ALL`].
+    pub const ALL: &'static [Self] = &[Self::Live, Self::Backfill];
+
+    /// The wire spelling, shared by the REST projection, the `$filter`
+    /// surface and the metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Backfill => "backfill",
+        }
+    }
+
+    /// Every admissible wire label, derived from [`Self::ALL`]. See
+    /// [`EntryType::wire_labels`].
+    #[must_use]
+    pub fn wire_labels() -> &'static [&'static str] {
+        static LABELS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        LABELS
+            .get_or_init(|| Self::ALL.iter().map(|v| v.as_str()).collect())
+            .as_slice()
+    }
+}
+
+/// The withdrawal an invalidation entry carries: the entry it retracts and
+/// why.
+///
+/// Grouping the two makes the half-shape unrepresentable. They are
+/// both-or-neither
+/// (`cpt-cf-usage-collector-adr-append-only-invalidation`), so no rule,
+/// check or error for that case exists anywhere.
+///
+/// **The wire shape is two flat sibling properties, not a nested object.**
+/// `usage-collector-v1.yaml` declares `invalidates` and `reason_code` side by
+/// side on `UsageRecord` and `CreateUsageRecordRequest`; the serde shadows in
+/// the wire-codec section split and rejoin the pair so the bytes are
+/// unchanged. A plugin author therefore implements against one grouped field
+/// while reading an OAS that shows two properties.
+///
+/// Fields are public rather than accessor-guarded: unlike [`ResourceRef`] and
+/// [`SubjectRef`] this type has no cross-field invariant to protect — both
+/// components are mandatory by construction and [`ReasonCode`] validates
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Invalidation {
+    /// The accepted entry this one withdraws. Not an input to the derived
+    /// identity; see [`UsageRecord::invalidation`].
+    pub target: Uuid,
+    /// Why the withdrawal was issued. Forbidden on an ordinary record —
+    /// including one whose quantity is negative, which records real
+    /// consumption rather than a correction.
+    pub reason: ReasonCode,
 }
 
 /// Single usage record. The persisted shape is the canonical return value
 /// of every create surface (new insert or silent idempotency replay).
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-usage-record:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-entity-idempotency-key:p1
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// A withdrawal's two halves are one field ([`Invalidation`]), so the pairing
+/// is a property of this type rather than of a validation step. The only
+/// place the pair can arrive apart is a wire body, and the shadow struct that
+/// deserializes one refuses the half-shape there. The wire encoding is
+/// unchanged by the grouping: two flat sibling properties, both omitted on an
+/// ordinary measurement.
+// @cpt-dod:cpt-cf-usage-collector-entity-model:p1
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "UsageRecordWire")]
 pub struct UsageRecord {
-    /// Deterministic gateway-derived record identity: `UUIDv5` of the 4-tuple
-    /// dedup key `(tenant_id, gts_id, idempotency_key, created_at)` (see
-    /// [`crate::derive_usage_record_id`]; ADR-0014). Stamped by
-    /// [`CreateUsageRecord::into_usage_record`] on create and authoritative on
-    /// read / return. The identity cannot be caller-supplied: the create
+    /// Deterministic gateway-derived entry identity — see
+    /// [`crate::derive_usage_record_id`], which is normative for its inputs.
+    /// Stamped by [`CreateUsageRecord::try_into_usage_record`] or
+    /// [`CreateUsageRecord::try_into_invalidation_record`] on create and
+    /// authoritative on read. It cannot be caller-supplied: the create
     /// surface takes the identity-free [`CreateUsageRecord`], not this type.
     pub id: Uuid,
-    /// Usage type this record attaches to.
-    pub gts_id: UsageTypeGtsId,
+    /// Meter this record attaches to — the derived GTS type declaration
+    /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
+    /// `types-registry`, not a plugin-owned catalog row.
+    pub gts_type_id: MeterTypeId,
     /// Owning tenant for this record. Caller-supplied; PDP uses it as the
     /// `OWNER_TENANT_ID` attribute.
     pub tenant_id: Uuid,
     /// Resource attribution composite (mandatory).
     pub resource_ref: ResourceRef,
     /// Optional subject attribution composite.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ref: Option<SubjectRef>,
     /// Caller-supplied metadata. Keys are validated [`MetadataKey`]s and
     /// values are typed as `String` end-to-end; closed-shape membership
     /// against the usage type's `metadata_fields` and the operator-configured
     /// size cap are enforced at the gateway before plugin dispatch. Omitted
     /// from the wire when empty.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<MetadataKey, String>,
-    /// Signed numeric measurement value, carried as a fixed-precision
-    /// [`rust_decimal::Decimal`] on every surface (SDK, REST, plugin SPI)
-    /// and persisted as Postgres `NUMERIC`. The wire encoding is a JSON
-    /// string (`"42.5"`) — never a JSON number — so client/server number
-    /// representations cannot round-trip through float and silently lose
-    /// precision. The permitted sign is jointly governed by the usage
-    /// type's [`UsageKind`] and the presence of `corrects_id` per the
-    /// four-cell value matrix.
-    #[serde(with = "rust_decimal::serde::str")]
-    pub value: Decimal,
-    /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
-    /// The plugin SPI dedups on `(tenant_id, usage_type_gts_id, idempotency_key)`.
+    /// The measured quantity, in the canonical unit of the entry's GTS type.
+    /// Validated against the published range at construction and carried on
+    /// the wire as a JSON string (see [`crate::UsageQuantity`]). The sign is
+    /// never constrained and carries no structural meaning: a negative
+    /// quantity records real consumption, and an invalidation echoes the
+    /// quantity it withdraws rather than negating it
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`).
+    ///
+    /// The wire encoding of this type is declared on its two shadow structs
+    /// in the wire-codec section, because it serializes through them.
+    pub quantity: UsageQuantity,
+    /// Mandatory caller-supplied key for at-least-once-with-dedup semantics,
+    /// on both entry kinds: an invalidation repeats its target's (DESIGN
+    /// §3.1, `IdempotencyKey`), which is how the gateway finds the entry
+    /// being withdrawn. An identity input, so a single stable per-meter key
+    /// covers many periods without collapsing them onto one entry.
     pub idempotency_key: IdempotencyKey,
-    /// When set, marks this row as a counter compensation referencing a
-    /// previously emitted ordinary usage row. The four-cell value matrix
-    /// and the L1 referential rule are enforced at the gateway before
-    /// plugin dispatch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Record lifecycle status.
-    #[serde(default)]
-    pub status: UsageRecordStatus,
-    /// Record creation timestamp (RFC 3339 on the wire). Persisted at
-    /// microsecond precision (matching `timestamptz` storage); see
-    /// [`CreateUsageRecord::into_usage_record`].
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
+    /// Gear-assigned instant of acceptance, stamped once per request by the
+    /// Ingestion Gateway at microsecond precision. Never caller-supplied:
+    /// [`CreateUsageRecord`] has no such field and its wire shadow refuses
+    /// one. An absorbed retry reports the stored entry's instant, which is
+    /// how a caller tells a replay from a first write. No identity input, and
+    /// not compared on a dedup collision.
+    pub accepted_at: time::OffsetDateTime,
+    /// Which path admitted this entry — server-assigned by the Ingestion
+    /// Gateway from the route it arrived on, never caller-supplied. See
+    /// [`RecordOrigin`]. Not an input to [`Self::id`]'s derivation.
+    pub origin: RecordOrigin,
+    /// The withdrawal this entry carries, absent on an ordinary measurement.
+    /// Its presence is what makes this entry an invalidation — hence
+    /// [`Self::entry_type`], which reads it.
+    ///
+    /// [`Invalidation::target`] is no identity input, and server-assigned
+    /// rather than caller-supplied (DESIGN §3.1, Field-ownership): the
+    /// gateway derives it from this entry's own identity inputs with
+    /// `entry_type = record` and stamps it here. Every withdrawal of one
+    /// entry therefore reaches one identity, so a second collides instead of
+    /// producing a second withdrawal.
+    pub invalidation: Option<Invalidation>,
+    /// Inclusive start of the emitter-supplied covered period (RFC 3339 on
+    /// the wire) — the only emitter-supplied time attribution an entry
+    /// carries. Persisted at microsecond precision, UTC-normalized by
+    /// [`CreateUsageRecord::try_into_usage_record`].
+    pub window_start: time::OffsetDateTime,
+    /// Exclusive end of the covered period. At or after
+    /// [`Self::window_start`]; equal bounds mark a point event, not an error.
+    ///
+    /// This is the bound every read path selects on; see
+    /// [`crate::TimeRange::contains_window_end`], which is normative for the
+    /// rule. Every raw-path page order also names it, so the column the range
+    /// selects on is a sort column too — with no caller `$orderby` the
+    /// leading one, letting a single index serve both.
+    pub window_end: time::OffsetDateTime,
+}
+
+impl UsageRecord {
+    /// This entry's kind, derived from the reference it carries.
+    ///
+    /// Not a field: a stored discriminator is a second place the kind can be
+    /// read and the two can disagree
+    /// (`cpt-cf-usage-collector-adr-append-only-invalidation`). Every
+    /// surface that needs the value computes it here.
+    #[must_use]
+    pub const fn entry_type(&self) -> EntryType {
+        if self.invalidation.is_some() {
+            EntryType::Invalidation
+        } else {
+            EntryType::Record
+        }
+    }
+
+    /// Whether `other` carries the same caller-supplied fields as `self`.
+    ///
+    /// This is the dedup comparison (DESIGN §3.1 "Collision resolution"): two
+    /// entries on one dedup identity are one entry when every field the caller
+    /// supplied is equal, and a conflict otherwise. Most server-assigned
+    /// fields are not compared: `id` (derived from the identity
+    /// both sides already share), `accepted_at` (stamped afresh per request)
+    /// and `origin` (the route, which a retry may change).
+    ///
+    /// The exception, an invalidation's [`Invalidation::target`], **is**
+    /// compared, because it travels grouped with the caller's `reason_code`
+    /// in one field. DESIGN says `invalidates` "is derived from the identity
+    /// and is not compared", and that is not a departure from it: two entries
+    /// reaching this comparison share the identity the target is derived
+    /// from, so including it can change no outcome. What the grouped field
+    /// really decides here is `reason_code`.
+    ///
+    /// The one case where it does decide something needs a non-conformant
+    /// plugin to reach: on the batch path the right-hand side can be an
+    /// `existing` row the *plugin* supplied with an `IdempotencyConflict`
+    /// (`domain::service`'s `settle_dispatched` → `resolve_follower`). A row
+    /// equal in every caller-supplied field but carrying a different
+    /// `invalidates` contradicts its own dedup identity, and is reported as a
+    /// conflict rather than absorbed.
+    ///
+    /// Both sides are destructured, so a field added to [`UsageRecord`] fails
+    /// to compile here until it is classified.
+    #[must_use]
+    pub fn caller_supplied_eq(&self, other: &Self) -> bool {
+        let Self {
+            id: _,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            accepted_at: _,
+            origin: _,
+            invalidation,
+            window_start,
+            window_end,
+        } = self;
+        let Self {
+            id: _,
+            gts_type_id: other_gts_type_id,
+            tenant_id: other_tenant_id,
+            resource_ref: other_resource_ref,
+            subject_ref: other_subject_ref,
+            metadata: other_metadata,
+            quantity: other_quantity,
+            idempotency_key: other_idempotency_key,
+            accepted_at: _,
+            origin: _,
+            invalidation: other_invalidation,
+            window_start: other_window_start,
+            window_end: other_window_end,
+        } = other;
+        gts_type_id == other_gts_type_id
+            && tenant_id == other_tenant_id
+            && resource_ref == other_resource_ref
+            && subject_ref == other_subject_ref
+            && metadata == other_metadata
+            && quantity == other_quantity
+            && idempotency_key == other_idempotency_key
+            && invalidation == other_invalidation
+            && window_start == other_window_start
+            && window_end == other_window_end
+    }
 }
 
 /// Identity-free create submission — the input to every create surface
-/// ([`crate::UsageCollectorClientV1::create_usage_record`] /
-/// [`crate::UsageCollectorClientV1::create_usage_records`]).
+/// ([`crate::UsageCollectorClientV1::create_usage_records`]).
 ///
-/// This mirrors [`UsageRecord`] minus the two fields a caller cannot own on
-/// create: `id` (a deterministic projection of the 4-tuple dedup key — see
-/// [`Self::into_usage_record`]) and `status` (always [`UsageRecordStatus::Active`]
-/// on a fresh insert). Encoding "id is derived, not supplied" in the type —
-/// rather than a doc-comment on a full [`UsageRecord`] — is what keeps a
-/// caller from constructing a meaningless identity the gateway would only
-/// discard. The wire REST surface encodes the same shape as
-/// `CreateUsageRecordRequest`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// This mirrors [`UsageRecord`] with [`Self::entry_type`] added — the
+/// persisted shape derives its kind, this one is told it — and minus the
+/// fields the server assigns: `id`, `accepted_at`, `origin`, and, on an
+/// invalidation, the target the gateway resolves. Encoding "id is derived,
+/// not supplied" in the type keeps a caller from constructing a meaningless
+/// identity the gateway would only discard. The wire REST surface encodes the
+/// same shape as `CreateUsageRecordRequest`.
+///
+/// One shape carries both entry kinds and [`Self::entry_type`] alone decides
+/// which (DESIGN §3.1, `CreateUsageRecord`). `reason_code` is the caller's
+/// second statement about that same kind rather than the kind itself:
+/// required on an `invalidation`, forbidden on a `record`, and both
+/// projections refuse a submission whose two statements disagree.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "CreateUsageRecordWire")]
 pub struct CreateUsageRecord {
-    /// Usage type this record attaches to.
-    pub gts_id: UsageTypeGtsId,
+    /// The kind this submission declares — caller-supplied, required, and
+    /// the sixth input to the derived identity.
+    ///
+    /// **Never inferred** (DESIGN §3.1, `EntryType`). It is the one field
+    /// that keeps a withdrawal's identity apart from its target's: the
+    /// faithful copy leaves every other identity input equal to the
+    /// target's, so a submission that omitted this would derive the
+    /// target's own `id` and be absorbed as a retry of it.
+    ///
+    /// It must agree with [`Self::invalidation`], and the projections enforce
+    /// that rather than the type.
+    pub entry_type: EntryType,
+    /// Meter this record attaches to — the derived GTS type declaration
+    /// (`gts.cf.core.uc.usage_record.v1~<segment>~`) resolved through
+    /// `types-registry`, not a plugin-owned catalog row.
+    pub gts_type_id: MeterTypeId,
     /// Owning tenant for this record. Caller-supplied; PDP uses it as the
     /// `OWNER_TENANT_ID` attribute.
     pub tenant_id: Uuid,
     /// Resource attribution composite (mandatory).
     pub resource_ref: ResourceRef,
     /// Optional subject attribution composite.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_ref: Option<SubjectRef>,
     /// Caller-supplied metadata. Same validation and closed-shape rules as
     /// [`UsageRecord::metadata`]. Omitted from the wire when empty.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<MetadataKey, String>,
-    /// Signed numeric measurement value. Same encoding and sign governance as
-    /// [`UsageRecord::value`].
-    #[serde(with = "rust_decimal::serde::str")]
-    pub value: Decimal,
-    /// Mandatory caller-supplied key for at-least-once-with-dedup semantics.
-    pub idempotency_key: IdempotencyKey,
-    /// When set, marks this submission as a counter compensation referencing a
-    /// previously emitted ordinary usage row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub corrects_id: Option<Uuid>,
-    /// Record creation timestamp (RFC 3339 on the wire). Forwarded to the
-    /// persisted record at microsecond precision (canonicalized by
-    /// [`Self::into_usage_record`] to match `timestamptz` storage); it is part
-    /// of the dedup identity, so it also feeds the derived `id`.
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
+    /// The measured quantity. Same encoding and sign rules as [`UsageRecord::quantity`].
+    pub quantity: UsageQuantity,
+    /// The caller's key, required on **both** entry kinds: a withdrawal
+    /// repeats its target's, which is what lets the gateway find the target
+    /// from the submission alone (DESIGN §3.1, Target resolution).
+    ///
+    /// `Option` rather than a bare key because the absence is a caller
+    /// mistake a projection has to report: both projections refuse a
+    /// submission missing one.
+    pub idempotency_key: Option<IdempotencyKey>,
+    /// The withdrawal's stated reason, present exactly when this submission
+    /// is an invalidation.
+    ///
+    /// **No target.** DESIGN §3.1's Field-ownership table makes
+    /// `invalidates` server-assigned: the gateway derives the target's
+    /// identifier from this submission's own identity inputs with
+    /// `entry_type = record`, looks it up converged-only under the PDP scope,
+    /// and stamps the result. A caller-supplied target would let an emitter
+    /// name a record it never measured.
+    pub invalidation: Option<ReasonCode>,
+    /// Inclusive start of the covered period this submission measures (RFC
+    /// 3339 on the wire; the codec requires an offset, so an offset-less
+    /// timestamp never reaches the projection). An identity input, so it
+    /// feeds the derived `id`.
+    pub window_start: time::OffsetDateTime,
+    /// Exclusive end of the covered period. Must be at or after
+    /// [`Self::window_start`]; equal bounds submit a point event. An identity
+    /// input, which is why an emitter that recomputes its bounds on retry
+    /// derives a different identifier, and why deterministic bounds are an
+    /// emitter obligation.
+    pub window_end: time::OffsetDateTime,
 }
 
 impl CreateUsageRecord {
-    /// Project this create submission into the persisted [`UsageRecord`] shape.
+    /// The kind this submission declares — [`Self::entry_type`], read back.
     ///
-    /// This is the single point at which a submission acquires its identity:
-    /// `id` is stamped as the deterministic `UUIDv5` derivation of the 4-tuple
-    /// dedup key `(tenant_id, gts_id, idempotency_key, created_at)` (see
-    /// [`crate::derive_usage_record_id`]; ADR-0014), `created_at` is normalized
-    /// to microsecond precision, and `status` is initialized to
-    /// [`UsageRecordStatus::Active`]. Every other field is forwarded verbatim.
-    /// Because the identity is a pure projection of caller-supplied fields it
-    /// cannot be supplied independently — which is exactly why the create
-    /// surface takes this identity-free type rather than a full
-    /// [`UsageRecord`].
+    /// Unlike [`UsageRecord::entry_type`] this reads a stored field rather
+    /// than projecting one: DESIGN §3.1 requires the discriminator on every
+    /// submission and forbids inferring it, so there is nothing here to
+    /// project it from. An accessor all the same, so asking a submission its
+    /// kind reads the same way as asking an accepted entry.
     #[must_use]
-    pub fn into_usage_record(self) -> UsageRecord {
-        // Canonicalize `created_at` to microsecond precision (what Postgres
-        // `timestamptz` stores) so the persisted timestamp, the 4-tuple dedup
-        // key, and the derived `id` are consistent by construction — independent
-        // of any backend's rounding. This truncation MUST agree with the µs
-        // count [`crate::id::created_at_micros`] projects (the shared primitive
-        // `derive_usage_record_id` below and the plugin's dedup check both use):
-        // it drops exactly the sub-microsecond nanos that projection ignores, so
-        // the id derived here matches one a client reproduces from the same
-        // instant. `replace_nanosecond` cannot fail here (`microsecond() * 1000`
-        // is always a valid nanosecond count); the `unwrap_or` is a lint-safe
-        // no-op fallback.
-        let created_at = self
-            .created_at
-            .replace_nanosecond(self.created_at.microsecond() * 1_000)
-            .unwrap_or(self.created_at);
-        let id = crate::id::derive_usage_record_id(
-            self.tenant_id,
-            &self.gts_id,
-            &self.idempotency_key,
-            created_at,
+    pub const fn entry_type(&self) -> EntryType {
+        self.entry_type
+    }
+
+    /// Refuses a submission whose two statements about its own kind
+    /// disagree.
+    ///
+    /// DESIGN §3.1, "Entry type and reason code": `reason_code` is required
+    /// when `entry_type` is `invalidation` and MUST NOT appear on a `record`.
+    /// Both halves are caller-supplied, so a disagreement is an emitter error
+    /// — [`UsageCollectorError::InvalidArgument`] naming `reason_code`, not
+    /// the [`UsageCollectorError::Internal`] the projections raise when the
+    /// submission is consistent and the *projection* is the wrong one for it.
+    ///
+    /// Both projections run this **before** their own guard, and that
+    /// ordering decides the classification of one disagreement: a submission
+    /// declaring `entry_type: invalidation` with no reason code satisfies
+    /// either projection's guard, so run second it would be reported as a
+    /// host-contract breach against a gateway that chose correctly. The
+    /// mirror case — a `record` stating a reason code — satisfies **neither**
+    /// guard and so reaches this check in either order, but only because
+    /// `try_into_usage_record`'s guard keys on the declared `entry_type`
+    /// rather than on `invalidation.is_some()`; see the comment there.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload"
+    )]
+    fn require_agreeing_kind(&self) -> Result<(), UsageCollectorError> {
+        match (self.entry_type, self.invalidation.is_some()) {
+            (EntryType::Invalidation, false) => {
+                Err(UsageCollectorError::reason_code_required_on_invalidation())
+            }
+            (EntryType::Record, true) => {
+                Err(UsageCollectorError::reason_code_forbidden_on_record())
+            }
+            (EntryType::Record, false) | (EntryType::Invalidation, true) => Ok(()),
+        }
+    }
+
+    /// Projects an ordinary measurement into the persisted [`UsageRecord`]
+    /// shape, validating the submission's own shape first.
+    ///
+    /// This is the single point at which a measurement acquires its identity,
+    /// and the period validation is inseparable from it: both period
+    /// preconditions must be rejected **before** the derivation runs, so the
+    /// projection is fallible rather than the caller's obligation.
+    ///
+    /// In order: `entry_type` and `reason_code` must agree and the declared
+    /// kind must be `record`; both bounds are normalized to UTC; each must
+    /// then carry at most microsecond precision; the period must be ordered
+    /// (`window_start <= window_end`, equal bounds being a point event); a key
+    /// must be present; and only then is `id` derived
+    /// ([`crate::id::derive_usage_record_id`], with `entry_type = record`).
+    /// Every other field is forwarded verbatim; `origin` and `accepted_at`
+    /// are server-assigned and stamped from the arguments.
+    ///
+    /// **A submission is refused rather than reconciled.** Dropping a half
+    /// would turn a withdrawal into an ordinary measurement, colliding with
+    /// the very entry it meant to withdraw.
+    ///
+    /// `origin` arrives as an argument rather than being stamped onto an
+    /// already-constructed record, so one site decides an entry's origin and
+    /// no modified copy sits on the ingestion path. A convention rather than
+    /// a guarantee: [`UsageRecord`]'s fields are public.
+    ///
+    /// Neither period precondition truncates. A truncated bound would be
+    /// persisted under an `id` derived from the truncated value while the
+    /// emitter reproduces the id it submitted.
+    ///
+    /// The rules an invalidation must satisfy against its *target* — that it
+    /// resolves, is itself a record, and is copied faithfully — need a lookup
+    /// and belong to the ingestion gateway. At most one invalidation per
+    /// record needs no rule at all: every withdrawal of one record reaches
+    /// the same identity, so ordinary dedup settles it.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorError::InvalidArgument`] when the submission's
+    /// `entry_type` and `reason_code` disagree, when a bound is finer than
+    /// microsecond precision, when the period is inverted, or when no
+    /// idempotency key is present — all emitter errors.
+    ///
+    /// [`UsageCollectorError::Internal`] when a self-consistent submission
+    /// declares `entry_type: invalidation`: it is well-formed and simply not
+    /// this projection's, needing a target only the gateway can resolve, so
+    /// arriving here means this crate's caller chose wrongly. See
+    /// [`UsageCollectorError::withdrawal_needs_its_target`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn try_into_usage_record(
+        self,
+        origin: RecordOrigin,
+        accepted_at: time::OffsetDateTime,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        self.require_agreeing_kind()?;
+        // Keyed on the declared `entry_type`, not on `invalidation.is_some()`:
+        // keyed on the reason code, a `record` that states one would satisfy
+        // this guard, and whether the emitter got a 400 or the gateway got an
+        // `Internal` would depend on `require_agreeing_kind` running first.
+        if matches!(self.entry_type, EntryType::Invalidation) {
+            return Err(UsageCollectorError::withdrawal_needs_its_target());
+        }
+        self.project(origin, accepted_at, None)
+    }
+
+    /// Projects a withdrawal, stamping the target the gateway resolved.
+    ///
+    /// Separate from [`Self::try_into_usage_record`] because the target is
+    /// server-assigned and only the gateway knows it: a single projection
+    /// would either take a caller-supplied target, which DESIGN forbids, or
+    /// leave the field unset on an entry whose whole purpose is to name it.
+    ///
+    /// `target` is the identifier the gateway resolved for the entry being
+    /// withdrawn — [`crate::derive_usage_record_id`] over this submission's
+    /// own identity inputs with [`EntryType::Record`], looked up
+    /// converged-only under the PDP scope (DESIGN §3.1, Target resolution).
+    /// It is not re-derived here, so an unresolvable target has already been
+    /// refused by the time this is called.
+    ///
+    /// Validation and derivation are otherwise [`Self::try_into_usage_record`]'s,
+    /// except that `id` is derived with `entry_type = invalidation` — the one
+    /// input keeping this entry's identity apart from its target's.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageCollectorError::InvalidArgument`] on the same grounds as
+    /// [`Self::try_into_usage_record`] — including a submission that
+    /// declares `entry_type: invalidation` and states no reason code.
+    ///
+    /// [`UsageCollectorError::Internal`] when a self-consistent submission
+    /// declares `entry_type: record`, which is this projection's mirror of
+    /// the misuse above. See [`UsageCollectorError::missing_reason_code`].
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    pub fn try_into_invalidation_record(
+        mut self,
+        origin: RecordOrigin,
+        accepted_at: time::OffsetDateTime,
+        target: Uuid,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        self.require_agreeing_kind()?;
+        let Some(reason) = self.invalidation.take() else {
+            return Err(UsageCollectorError::missing_reason_code());
+        };
+        self.project(origin, accepted_at, Some(Invalidation { target, reason }))
+    }
+
+    /// The half both projections share: UTC normalization, the two period
+    /// preconditions, the key rule, and the derivation over the identity
+    /// inputs.
+    ///
+    /// The digest's kind input is the caller's own [`Self::entry_type`],
+    /// because DESIGN §3.1 forbids inferring the kind from anything else.
+    /// `invalidation` is the resolved withdrawal the projected entry carries.
+    /// The two cannot disagree: each caller above runs `require_agreeing_kind`
+    /// and then refuses the kind that is not its own, so `invalidation` is
+    /// `Some` exactly when the declared type is [`EntryType::Invalidation`].
+    /// A third projection owes the same two checks before calling this.
+    ///
+    /// `self` is destructured rather than read field by field, so a field
+    /// added to [`CreateUsageRecord`] fails to compile here until it is
+    /// carried onto the projected entry instead of being silently dropped.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
+    fn project(
+        self,
+        origin: RecordOrigin,
+        accepted_at: time::OffsetDateTime,
+        invalidation: Option<Invalidation>,
+    ) -> Result<UsageRecord, UsageCollectorError> {
+        // The pairing both callers are responsible for, made checkable rather
+        // than only stated: a third projection that skipped either check trips
+        // this in debug and test builds instead of minting an identifier under
+        // the wrong type.
+        debug_assert_eq!(
+            matches!(self.entry_type, EntryType::Invalidation),
+            invalidation.is_some(),
+            "project() requires the declared entry_type and the resolved withdrawal to agree; \
+             its caller owes require_agreeing_kind and its own kind guard",
         );
-        UsageRecord {
+
+        let Self {
+            // Already checked by the caller against the reason code, and
+            // re-encoded in the `invalidation` argument — which is why the
+            // kind input below reads this value while the projected entry
+            // carries that one.
+            entry_type,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            // Always `None` by the time this runs: one caller refuses a
+            // submission declaring `entry_type: invalidation`, the other takes
+            // the reason out and hands it back as the `invalidation` argument,
+            // already paired with its resolved target.
+            invalidation: _,
+            window_start: submitted_start,
+            window_end: submitted_end,
+        } = self;
+
+        // Normalization runs before the preconditions. That is safe —
+        // `UtcOffset` holds whole seconds, so the nanosecond component is
+        // invariant under the conversion and the precision check accepts the
+        // same values either way — and it makes both rejections below echo the
+        // bound in one rendering, keeping an offset with non-zero seconds out
+        // of `crate::error`'s RFC 3339 formatter, which cannot render one.
+        let window_start = submitted_start.to_offset(time::UtcOffset::UTC);
+        let window_end = submitted_end.to_offset(time::UtcOffset::UTC);
+
+        require_microsecond_precision(WINDOW_START_FIELD, window_start)?;
+        require_microsecond_precision(WINDOW_END_FIELD, window_end)?;
+
+        if window_end < window_start {
+            return Err(UsageCollectorError::inverted_covered_period(
+                window_start,
+                window_end,
+            ));
+        }
+
+        let Some(idempotency_key) = idempotency_key else {
+            return Err(UsageCollectorError::missing_idempotency_key());
+        };
+
+        let id = crate::id::derive_usage_record_id(
+            tenant_id,
+            &gts_type_id,
+            &idempotency_key,
+            window_start,
+            window_end,
+            entry_type,
+        );
+
+        Ok(UsageRecord {
             id,
-            gts_id: self.gts_id,
-            tenant_id: self.tenant_id,
-            resource_ref: self.resource_ref,
-            subject_ref: self.subject_ref,
-            metadata: self.metadata,
-            value: self.value,
-            idempotency_key: self.idempotency_key,
-            corrects_id: self.corrects_id,
-            status: UsageRecordStatus::Active,
-            created_at,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            // Declaration order, which
+            // `clippy::inconsistent_struct_constructor` requires.
+            accepted_at,
+            origin,
+            invalidation,
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Rejects a covered-period bound carrying finer than microsecond
+/// precision.
+///
+/// The microsecond is the precision ceiling of the identity derivation, whose
+/// canonical bound form is a six-digit fraction, so a finer value has no
+/// representation there. [`crate::canonical_period_bound`] is the other half
+/// of that ceiling — it renders the six digits and truncates rather than
+/// rejects — and no shared constant holds the two together, only this pair of
+/// references. A leap second lands here too, with no branch of its own:
+/// `time`'s RFC 3339 parser renders a `:60` second as `59.999999999`, and
+/// [`time::Time`] cannot represent second 60 at all.
+#[allow(
+    clippy::result_large_err,
+    reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+)]
+fn require_microsecond_precision(
+    field: &'static str,
+    bound: time::OffsetDateTime,
+) -> Result<(), UsageCollectorError> {
+    if bound.nanosecond().is_multiple_of(1_000) {
+        Ok(())
+    } else {
+        Err(UsageCollectorError::sub_microsecond_period_bound(
+            field, bound,
+        ))
+    }
+}
+
+// Wire codecs
+//
+// Every entry shape's serde lives here rather than beside the type, so the two
+// domain shapes stay adjacent instead of being separated by their plumbing.
+// Nothing below is public API: the shadows are private and the two
+// `Serialize` impls are the visible behaviour of the domain types themselves.
+
+/// `skip_serializing_if` predicate for a borrowed metadata map. The attribute
+/// hands the field by reference, so a borrowed field arrives as `&&BTreeMap`
+/// and `BTreeMap::is_empty` does not typecheck against it. The double
+/// reference is the attribute's calling convention — hence the allow.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn metadata_is_empty(metadata: &&BTreeMap<MetadataKey, String>) -> bool {
+    metadata.is_empty()
+}
+
+/// Splits an [`Invalidation`] into the two flat wire properties, or refuses
+/// a half-shape.
+///
+/// The persisted shape's shadow alone. The ingestion shape carries the reason
+/// code without a target — `invalidates` is server-assigned, so its shadow
+/// refuses a submitted one as an unknown field — leaving no half-shape there.
+///
+/// The refusal is a plain message rather than a typed
+/// [`UsageCollectorError`]: it fires inside a `Deserialize`, which erases
+/// everything but the string.
+fn invalidation_from_wire(
+    invalidates: Option<Uuid>,
+    reason_code: Option<ReasonCode>,
+) -> Result<Option<Invalidation>, String> {
+    match (invalidates, reason_code) {
+        (None, None) => Ok(None),
+        (Some(target), Some(reason)) => Ok(Some(Invalidation { target, reason })),
+        (Some(_), None) => Err(
+            "`invalidates` and `reason_code` are both-or-neither on a usage \
+             record; `reason_code` is missing"
+                .to_owned(),
+        ),
+        (None, Some(_)) => Err(
+            "`invalidates` and `reason_code` are both-or-neither on a usage \
+             record; `invalidates` is missing"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Owned deserialization shadow for [`UsageRecord`].
+///
+/// Exists because the pair is flat on the wire and grouped in the type, and
+/// `#[serde(flatten)]` — the obvious way to bridge that — cannot be used
+/// under `#[serde(deny_unknown_fields)]`. The `deny_unknown_fields` lives
+/// here, so a submitted `entry_type` (or any other stray key) is still
+/// refused.
+///
+/// # The four-shadow shape, and the two-shadow alternative
+///
+/// Each entry type has an owned shadow for reading and a borrowing one for
+/// writing — four in all. One owned shadow per type would serve both
+/// directions (`try_from` and `into` coexist), at the cost of cloning the
+/// whole record on every serialization. That saving is unproven and probably
+/// small: neither `Serialize` impl is on an HTTP path this gear serves. The
+/// counterweight is that splitting the directions splits each field's serde
+/// attributes between them, with nothing but `models_tests`' round-trip making
+/// the halves agree. **If a third hand-written codec appears here, revisit
+/// this trade rather than copying it a third time.**
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageRecordWire {
+    id: Uuid,
+    gts_type_id: MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: ResourceRef,
+    #[serde(default)]
+    subject_ref: Option<SubjectRef>,
+    #[serde(default)]
+    metadata: BTreeMap<MetadataKey, String>,
+    quantity: UsageQuantity,
+    idempotency_key: String,
+    #[serde(with = "time::serde::rfc3339")]
+    accepted_at: time::OffsetDateTime,
+    origin: RecordOrigin,
+    #[serde(default)]
+    invalidates: Option<Uuid>,
+    #[serde(default)]
+    reason_code: Option<ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl TryFrom<UsageRecordWire> for UsageRecord {
+    type Error = String;
+
+    fn try_from(wire: UsageRecordWire) -> Result<Self, Self::Error> {
+        let UsageRecordWire {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            accepted_at,
+            origin,
+            invalidates,
+            reason_code,
+            window_start,
+            window_end,
+        } = wire;
+        Ok(Self {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key: IdempotencyKey::from_stored(idempotency_key)
+                .map_err(|e| e.to_string())?,
+            accepted_at,
+            origin,
+            invalidation: invalidation_from_wire(invalidates, reason_code)?,
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Borrowing serialization shadow for [`UsageRecord`].
+///
+/// Borrowed rather than owned so serializing a record costs no clone of its
+/// metadata map and strings — which `#[serde(into = "…")]` would charge on
+/// every call. The [`Serialize`] impl below destructures the record
+/// exhaustively, so a field added to [`UsageRecord`] and not to this shadow
+/// is a compile error rather than a key that silently stops being emitted.
+#[derive(Serialize)]
+struct UsageRecordWireRef<'a> {
+    id: Uuid,
+    gts_type_id: &'a MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: &'a ResourceRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_ref: Option<&'a SubjectRef>,
+    #[serde(skip_serializing_if = "metadata_is_empty")]
+    metadata: &'a BTreeMap<MetadataKey, String>,
+    quantity: UsageQuantity,
+    idempotency_key: &'a IdempotencyKey,
+    #[serde(with = "time::serde::rfc3339")]
+    accepted_at: time::OffsetDateTime,
+    origin: RecordOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidates: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'a ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl Serialize for UsageRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self {
+            id,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            accepted_at,
+            origin,
+            invalidation,
+            window_start,
+            window_end,
+        } = self;
+        UsageRecordWireRef {
+            id: *id,
+            gts_type_id,
+            tenant_id: *tenant_id,
+            resource_ref,
+            subject_ref: subject_ref.as_ref(),
+            metadata,
+            quantity: *quantity,
+            idempotency_key,
+            accepted_at: *accepted_at,
+            origin: *origin,
+            invalidates: invalidation.as_ref().map(|i| i.target),
+            reason_code: invalidation.as_ref().map(|i| &i.reason),
+            window_start: *window_start,
+            window_end: *window_end,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// Owned deserialization shadow for [`CreateUsageRecord`]. See
+/// [`UsageRecordWire`] for why the shadow exists; this is the ingestion
+/// half.
+///
+/// It is **not** on the REST path: a request body deserializes into the host
+/// crate's own `CreateUsageRecordRequest` DTO. This shadow is reached when the
+/// SDK type itself is deserialized. Both paths must agree about the ingestion
+/// key set, and neither can check the other.
+///
+/// It declares no `invalidates` — that field is server-assigned, and
+/// `deny_unknown_fields` above is what rejects a submitted one.
+///
+/// It **does** declare `entry_type`, with no `serde(default)`: the published
+/// schema lists it among the required properties and discriminates its two
+/// `oneOf` branches on it, so a body omitting it is refused as a missing
+/// field rather than read as a `record`. Its agreement with `reason_code` is
+/// checked by the projections, which can raise a typed field violation where
+/// a codec could only raise a plain serde string.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateUsageRecordWire {
+    entry_type: EntryType,
+    gts_type_id: MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: ResourceRef,
+    #[serde(default)]
+    subject_ref: Option<SubjectRef>,
+    #[serde(default)]
+    metadata: BTreeMap<MetadataKey, String>,
+    quantity: UsageQuantity,
+    #[serde(default, deserialize_with = "present_idempotency_key")]
+    idempotency_key: Option<IdempotencyKey>,
+    #[serde(default)]
+    reason_code: Option<ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+/// Decodes a **present** `idempotency_key`. Absence is `serde(default)`'s
+/// `None`; an explicit `null` is refused, because the published schema types
+/// the property `string` and requires it on both `oneOf` branches.
+fn present_idempotency_key<'de, D>(deserializer: D) -> Result<Option<IdempotencyKey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    IdempotencyKey::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<CreateUsageRecordWire> for CreateUsageRecord {
+    type Error = String;
+
+    fn try_from(wire: CreateUsageRecordWire) -> Result<Self, Self::Error> {
+        let CreateUsageRecordWire {
+            entry_type,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            reason_code,
+            window_start,
+            window_end,
+        } = wire;
+        Ok(Self {
+            entry_type,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            invalidation: reason_code,
+            window_start,
+            window_end,
+        })
+    }
+}
+
+/// Borrowing serialization shadow for [`CreateUsageRecord`]. See
+/// [`UsageRecordWireRef`] for why it borrows.
+#[derive(Serialize)]
+struct CreateUsageRecordWireRef<'a> {
+    entry_type: EntryType,
+    gts_type_id: &'a MeterTypeId,
+    tenant_id: Uuid,
+    resource_ref: &'a ResourceRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_ref: Option<&'a SubjectRef>,
+    #[serde(skip_serializing_if = "metadata_is_empty")]
+    metadata: &'a BTreeMap<MetadataKey, String>,
+    quantity: UsageQuantity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<&'a IdempotencyKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'a ReasonCode>,
+    #[serde(with = "time::serde::rfc3339")]
+    window_start: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_end: time::OffsetDateTime,
+}
+
+impl Serialize for CreateUsageRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self {
+            entry_type,
+            gts_type_id,
+            tenant_id,
+            resource_ref,
+            subject_ref,
+            metadata,
+            quantity,
+            idempotency_key,
+            invalidation,
+            window_start,
+            window_end,
+        } = self;
+        CreateUsageRecordWireRef {
+            entry_type: *entry_type,
+            gts_type_id,
+            tenant_id: *tenant_id,
+            resource_ref,
+            subject_ref: subject_ref.as_ref(),
+            metadata,
+            quantity: *quantity,
+            idempotency_key: idempotency_key.as_ref(),
+            reason_code: invalidation.as_ref(),
+            window_start: *window_start,
+            window_end: *window_end,
+        }
+        .serialize(serializer)
+    }
+}
+
+// Declared aggregation fold
+
+/// The single aggregation a meter declares, read from its GTS type
+/// declaration's `x-gts-traits.aggregation_fold`.
+///
+/// Never a request parameter: the aggregate path serves the declared fold and
+/// no other, so no class of request is well-formed and semantically wrong. The
+/// set is closed — adding a fold is additive, removing one is breaking.
+///
+/// `SUM` is the only fold yielding a chargeable period quantity. A meter whose
+/// consumption is naturally a level is pre-integrated at the emitter into an
+/// accrued quantity and declared `SUM`; this gear integrates on no path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AggregationFold {
+    /// Total of the selected quantities.
+    Sum,
+    /// Count of selected entries. Under this fold a quantity means nothing:
+    /// one record is one event.
+    Count,
+    /// Greatest selected quantity.
+    Max,
+    /// Least selected quantity.
+    Min,
+    /// The quantity of the entry with the greatest `window_end`, ties broken
+    /// by the greatest `accepted_at`, then by the greatest `id` in byte
+    /// order (DESIGN §3.1, which is normative for this and is where to
+    /// verify it). `id` is unique, so the order is total, and every one of
+    /// those keys compares across tenants and types, so it holds for a group
+    /// spanning them. A plugin owes this exact order; a backend-local sequence
+    /// or insertion order is not it.
+    Latest,
+}
+
+impl AggregationFold {
+    /// The wire spelling, identical to the trait-schema enum member.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "SUM",
+            Self::Count => "COUNT",
+            Self::Max => "MAX",
+            Self::Min => "MIN",
+            Self::Latest => "LATEST",
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Aggregated-query surface
-// ---------------------------------------------------------------------------
-
-/// Aggregation function applied to the filtered `UsageRecord.value` stream.
-///
-/// # Op-per-kind matrix
-///
-/// Each op is valid only for the usage [`UsageKind`] for which it is
-/// semantically meaningful. The gateway enforces this with a typed `400`
-/// (`UsageCollectorError::aggregation_op_not_allowed_for_kind`) before
-/// plugin dispatch — see [`AggregationOp::is_allowed_for`].
-///
-/// | Op                | Counter | Gauge |
-/// |-------------------|:-------:|:-----:|
-/// | `Sum`             |   ✅    |  ❌   |
-/// | `Min`/`Max`/`Avg` |   ❌    |  ✅   |
-/// | `Count`           |   ✅    |  ✅   |
-///
-/// Counter allows `{Sum, Count}`; gauge allows `{Min, Max, Avg, Count}`.
-///
-/// # Compensation handling
-///
-/// `SUM` nets across all active rows regardless of `corrects_id` (counter
-/// compensations reduce the total). Every other op operates over
-/// `corrects_id IS NULL` rows only. Under the matrix that partition is
-/// load-bearing only for `Count`-on-counter; `Min`/`Max`/`Avg` are gauge-only
-/// and gauges never carry compensations, so the filter is a structural no-op
-/// for them.
-///
-/// `Count` counts matched rows and is well-defined for any value shape. The
-/// other variants require a numeric `value`; non-numeric values surface as a
-/// validation error from the plugin at execution time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AggregationOp {
-    /// Sum of matched values. Compensation rows contribute their signed value.
-    Sum,
-    /// Count of matched rows.
-    Count,
-    /// Minimum matched value.
-    Min,
-    /// Maximum matched value.
-    Max,
-    /// Mean of matched values.
-    Avg,
+impl std::fmt::Display for AggregationFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
-impl AggregationOp {
-    /// Returns `true` when this op is semantically valid for `kind`.
-    ///
-    /// Counter allows `{Sum, Count}`; gauge allows `{Min, Max, Avg, Count}`
-    /// (see the type-level matrix). This is the single source of truth the
-    /// gateway consults before dispatch.
-    #[must_use]
-    pub fn is_allowed_for(self, kind: UsageKind) -> bool {
-        matches!(
-            (self, kind),
-            (Self::Count, _)
-                | (Self::Sum, UsageKind::Counter)
-                | (Self::Min | Self::Max | Self::Avg, UsageKind::Gauge)
-        )
+impl FromStr for AggregationFold {
+    type Err = UsageCollectorError;
+
+    /// Mirrors the serde wire shape without paying a `serde_json::Value`
+    /// allocation per call. Case-sensitive: the trait schema's enum is upper
+    /// case, so accepting another casing would admit a declaration
+    /// `types-registry` rejects.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SUM" => Ok(Self::Sum),
+            "COUNT" => Ok(Self::Count),
+            "MAX" => Ok(Self::Max),
+            "MIN" => Ok(Self::Min),
+            "LATEST" => Ok(Self::Latest),
+            other => Err(UsageCollectorError::invalid_aggregation_fold(other)),
+        }
     }
 }
 
 /// Dimension to group an aggregation by.
 ///
 /// Each variant is a column or JSON-key facet of the underlying record
-/// stream. `Metadata(String)` carries a single declared metadata key
+/// stream. `Metadata(MetadataKey)` carries a single declared metadata key
 /// (validated against the queried usage type's `metadata_fields`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -938,25 +1912,13 @@ pub enum AggregationDimension {
     Metadata(MetadataKey),
 }
 
-/// Aggregation specification: what to compute and how to slice it.
-///
-/// `op` is the aggregation function; `group_by` is the ordered list of
-/// dimensions. An empty `group_by` yields a single result bucket with an
-/// empty key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregationSpec {
-    pub op: AggregationOp,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub group_by: Vec<AggregationDimension>,
-}
-
-/// Single aggregated bucket. One entry per element in
-/// [`AggregationSpec::group_by`], in the same order; empty when `group_by`
-/// was empty.
+/// Single aggregated bucket. One entry per element in the query's
+/// `group_by` dimensions, in the same order; empty when `group_by` was
+/// empty.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregationBucket {
-    /// Dimension key values in [`AggregationSpec::group_by`] order. Each
-    /// entry is the string form of the corresponding [`AggregationDimension`]:
+    /// Dimension key values in `group_by` order. Each entry is the string
+    /// form of the corresponding [`AggregationDimension`]:
     ///
     /// - [`AggregationDimension::TenantId`] — `Uuid::to_string()`, the
     ///   canonical lowercase hyphenated form
@@ -968,7 +1930,7 @@ pub struct AggregationBucket {
     ///   identifier or type string verbatim.
     /// - [`AggregationDimension::Metadata`] — the metadata value at the
     ///   declared key, which is already a `String` (or string-coercible)
-    ///   per the [`UsageType::metadata_fields`] closed-shape rule.
+    ///   per the resolved meter declaration's closed-shape metadata rule.
     ///
     /// Plugins own this string-form contract at bucket-construction time;
     /// the SDK does not transform values at the boundary. Empty when
@@ -976,16 +1938,17 @@ pub struct AggregationBucket {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key: Vec<String>,
     /// Aggregation result for the bucket, carried as an arbitrary-precision
-    /// [`bigdecimal::BigDecimal`] so `SUM`, `MIN`, `MAX`, and `COUNT` are exact
-    /// at any magnitude and compensation rows net to zero. Postgres `NUMERIC`
-    /// is unbounded, and a wide `SUM` (or large-magnitude `AVG`) can exceed
-    /// [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling — which previously
-    /// surfaced as an `Internal` (HTTP 500) on decode. `AVG` is now exact in
-    /// magnitude but may still carry a backend/plugin-chosen rounding scale on
-    /// non-terminating quotients (arbitrary precision is still finite). `None`
-    /// when no rows matched the bucket (e.g. `MIN` over an empty set).
+    /// [`bigdecimal::BigDecimal`] so every fold is exact at any magnitude:
+    /// Postgres `NUMERIC` is unbounded, and a wide `SUM` can exceed
+    /// [`rust_decimal::Decimal`]'s ~7.9×10²⁸ ceiling.
+    ///
+    /// `None` when no rows matched the bucket, except under `SUM` and
+    /// `COUNT`, which answer `Some(0)`. DESIGN §3.3's plugin obligations are
+    /// normative: *"`SUM` and `COUNT` are defined over an empty selection and
+    /// report `0`; `MAX`, `MIN` and `LATEST` are not and report absent"*.
+    ///
     /// Wire-encoded as a JSON string (never a float) for the same round-trip
-    /// reason as [`UsageRecord::value`], via
+    /// reason as [`UsageRecord::quantity`], via
     /// [`crate::serde_helpers::bigdecimal_str_option`].
     #[serde(default, with = "crate::serde_helpers::bigdecimal_str_option")]
     pub value: Option<BigDecimal>,
@@ -1002,57 +1965,59 @@ pub struct AggregationResult {
 
 /// Maximum number of buckets a single [`AggregationResult`] may carry.
 ///
-/// The gateway-enforced bounded `created_at` window caps the rows an aggregate
-/// *scans*; this caps the distinct *groups* it produces. A high-cardinality
-/// [`AggregationDimension::Metadata`] key (e.g. a per-record id) could otherwise
-/// materialize an unbounded bucket set into memory, unlike the page-size-clamped
-/// list path. The storage plugin MUST bound its own result (e.g. append
-/// `LIMIT MAX_AGGREGATION_BUCKETS + 1`) so an over-cap query cannot blow up
-/// plugin memory; the gateway rejects a result exceeding this cap with a `400`
-/// ([`crate::reason::AGGREGATION_RESULT_TOO_LARGE`]). Declared on the wire as the
-/// `AggregatedQueryResult.buckets` `maxItems` in `usage-collector-v1.yaml`.
+/// The mandatory read-path [`crate::TimeRange`] caps the rows an aggregate
+/// *scans*; this caps the distinct *groups* it produces, which a
+/// high-cardinality [`AggregationDimension::Metadata`] key could otherwise
+/// leave unbounded. The storage plugin MUST bound its own result (e.g. append
+/// `LIMIT MAX_AGGREGATION_BUCKETS + 1`); the gateway rejects a result
+/// exceeding this cap with a `400`
+/// ([`crate::reason::AGGREGATION_RESULT_TOO_LARGE`]). Declared on the wire as
+/// `AggregatedQueryResult.buckets`' `maxItems`.
 pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 
-// ---------------------------------------------------------------------------
 // Filter surface for `list_usage_records`
-// ---------------------------------------------------------------------------
 //
 // `UsageRecordQuery` declares the filterable-field schema for the OData
 // surface of `list_usage_records`. The struct is never constructed at
 // runtime; it exists solely to feed `#[derive(ODataFilterable)]`, which
-// generates [`UsageRecordQueryFilterField`] and its
-// [`toolkit_odata::filter::FilterField`] impl. Plugin implementations supply
+// generates `UsageRecordQueryFilterField` and its
+// `toolkit_odata::filter::FilterField` impl. Plugin implementations supply
 // a `FieldToColumn<UsageRecordFilterField>` mapper next to their entity
 // definition; the SDK does not encode storage-layer column mapping.
 //
-// `gts_id` is intentionally absent from this schema. It is carried as a
-// typed parameter on `list_usage_records` /
-// `query_aggregated_usage_records`; omitting it here means
-// `parse_odata_filter::<UsageRecordFilterField>` rejects any
-// `gts_id`-touching predicate at parse time as
-// `FilterError::UnknownField`, so neither plugins nor the gateway need a
-// runtime reject path.
+// `gts_type_id` is intentionally absent from this schema. It travels as a
+// typed parameter on both read surfaces, and omitting it here makes
+// `parse_odata_filter::<UsageRecordFilterField>` reject any
+// `gts_type_id`-touching predicate as `FilterError::UnknownField`. That
+// covers the wire path only: an in-process caller builds an `ast::Expr` by
+// hand, so the host crate's runtime `reject_unpublished_filter_fields` guard
+// reserves `gts_type_id` too, and needs to.
 //
-// `created_at` and `id` ARE on the schema: the gateway treats the
-// `[from, to)` time window as an ordinary `created_at ge … and
-// created_at lt …` predicate inside `$filter` (no separate `TimeWindow`
-// typed parameter), and `id` is the canonical cursor tiebreaker the
-// gateway substitutes into `$orderby` when the caller omits one.
+// The covered-period bounds and `id` ARE on the schema, and none of them is
+// `$filter`-reachable. This schema is two vocabularies at once — the
+// plugin's field-to-column mapping and the `$orderby` surface — and is a
+// superset of `$filter`'s admissible surface rather than a definition of it;
+// `PUBLISHED_FILTER_FIELDS` is what defines that, and
+// `reject_unpublished_filter_fields` is what enforces it.
 //
 // Nested attribution composites (`resource_ref`, `subject_ref`) are
 // flattened to their leaf identifiers (`resource_id`, `resource_type`,
 // `subject_id`, `subject_type`) so filtering goes through the macro-derived
 // path rather than a hand-rolled slash-path `FilterField` impl.
 //
-// `status` is declared `String` on the filter wire (`"active"` /
-// `"inactive"`); plugins translate to their storage representation via
-// `FieldToColumn::map_value`.
+// `entry_type` is declared `String` on the filter wire (`"record"` /
+// `"invalidation"`). The SDK stores no such attribute, so a plugin wanting the
+// field filterable holds a column of its own — written or derived, its choice
+// — and returns it from `FieldToColumn::map_field`. `map_value` cannot carry
+// it: that hook rewrites a value and can change neither column nor operator,
+// and `toolkit-db`'s `sea_orm_filter` converts the mapped value before its
+// `IS NULL` / `IS NOT NULL` branch, so an `ODataValue::Null` from the hook is
+// refused rather than lowered, for `in` as well as `eq`.
 //
-// `metadata` filtering does not flow through OData — see
-// [`MetadataFilter`] below, supplied as a separate parameter on
-// `list_usage_records`. Postgres has no general `serde_json::Value` filter
-// surface in `toolkit-odata`, and there is no precedent for one in the
-// workspace.
+// `metadata` filtering does not flow through OData — see `MetadataFilter`
+// below, supplied as a separate parameter on `list_usage_records`.
+// `toolkit-odata` has no general `serde_json::Value` filter surface and
+// there is no precedent for one in the workspace.
 
 /// Filterable-field schema for `list_usage_records`'s `ODataQuery` argument.
 ///
@@ -1062,19 +2027,26 @@ pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 #[derive(ODataFilterable)]
 #[allow(dead_code)]
 pub struct UsageRecordQuery {
-    /// `usage_records.id` (record primary key). Carried on the filter
-    /// surface so the gateway can use it as the canonical cursor
-    /// tiebreaker (`(created_at, id)`) and so callers can pin a
-    /// specific record via `$filter`.
+    /// `usage_records.id` (record primary key). On the filter surface so the
+    /// gateway can use it as the canonical cursor tiebreaker
+    /// (`(window_end, id)`) and a plugin has a column mapping for it;
+    /// **not** filterable — it is off [`PUBLISHED_FILTER_FIELDS`], so
+    /// `reject_unpublished_filter_fields` rejects any predicate naming it.
     #[odata(filter(kind = "Uuid"))]
     pub id: Uuid,
-    /// `usage_records.created_at` (record creation timestamp). The
-    /// `[from, to)` time-window is expressed as
-    /// `created_at ge X and created_at lt Y` inside `$filter`; the
-    /// plugin SPI receives that AST and is responsible for honouring
-    /// it (server-side time-bounded read).
+    /// `usage_records.window_start` — the inclusive start of the covered
+    /// period. Here so a plugin has a column mapping for it and a caller can
+    /// order by it; **not** filterable, because the read range travels as a
+    /// typed parameter.
     #[odata(filter(kind = "DateTimeUtc"))]
-    pub created_at: time::OffsetDateTime,
+    pub window_start: time::OffsetDateTime,
+    /// `usage_records.window_end` — the exclusive end of the covered period,
+    /// and the column every read path selects on (see
+    /// [`crate::TimeRange::contains_window_end`]). Every raw-path page order
+    /// names it, so selection and sorting share a column. Reserved on the
+    /// `$filter` surface for the same reason as [`Self::window_start`].
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub window_end: time::OffsetDateTime,
     /// `usage_records.tenant_id` (owning tenant). Supports `eq` and `in`.
     #[odata(filter(kind = "Uuid"))]
     pub tenant_id: Uuid,
@@ -1094,60 +2066,153 @@ pub struct UsageRecordQuery {
     /// surface.
     #[odata(filter(kind = "String"))]
     pub subject_type: String,
-    /// `usage_records.corrects_id` (compensation target). Supports `eq`
-    /// and `in`.
+    /// The entry an invalidation withdraws, or absent on an ordinary
+    /// record. Filterable (`eq` / `in`) so a consumer folding entries
+    /// itself can find a withdrawn pair; **not** an order key, because it
+    /// is domain-optional — see [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "Uuid"))]
-    pub corrects_id: Uuid,
-    /// `usage_records.status` lifecycle (`"active"` / `"inactive"`). Plugins
-    /// translate to the storage representation via
-    /// `FieldToColumn::map_value`.
+    pub invalidates: Uuid,
+    /// The derived `record` / `invalidation` discriminator. On the filter
+    /// surface because the wire contract lists it there; a plugin backs it
+    /// with a column of its own and returns that from
+    /// `FieldToColumn::map_field` (see the file-level comment above).
+    /// **Not** an order key — see [`is_keyset_safe_record_field`].
     #[odata(filter(kind = "String"))]
-    pub status: String,
+    pub entry_type: String,
+    /// `usage_records.origin` — which ingestion path admitted the entry
+    /// (`live` / `backfill`). On the filter surface because DESIGN §3.1 lists
+    /// it among the fixed `$filter` and `group_by` fields: a consumer that has
+    /// already raised a charge for a period needs to separate imported history
+    /// from current consumption.
+    ///
+    /// Declared `String` on the filter wire like [`Self::entry_type`], but
+    /// unlike it a stored attribute rather than a function of an optional one,
+    /// so it **is** a sound order key. See [`is_keyset_safe_record_field`].
+    #[odata(filter(kind = "String"))]
+    pub origin: String,
 }
 
 pub use UsageRecordQueryFilterField as UsageRecordFilterField;
 
-/// Record filter fields backed by a **mandatory (never-null)** attribute, and
-/// therefore sound to use as a keyset-pagination ordering key.
+/// The `$filter` field set the public contract publishes, and the whole of
+/// it — the closed set the gear's `reject_unpublished_filter_fields` guard
+/// admits.
+///
+/// `DESIGN.md`'s `UsageRecordFilterField` row and `usage-collector-v1.yaml`'s
+/// `$filter` parameter each enumerate exactly this set, and DESIGN adds
+/// "Fixed, not resolved per request". A strict subset of
+/// [`UsageRecordFilterField`]'s variants, which are wider: membership
+/// in that schema says nothing about `$filter` admissibility (see the
+/// file-level comment above `UsageRecordQuery`), and this constant is what
+/// says it.
+///
+/// Exported so
+/// [`unpublished_filter_field`](crate::UsageCollectorError::unpublished_filter_field)
+/// can render the whole set into its `detail` *from here*, leaving no refused
+/// caller to guess and no prose to drift from the guard. Matching against it
+/// is case-insensitive, not exact: see the gear's `is_published_filter_field`,
+/// which has to agree with `toolkit_odata::FilterField::from_name`, the
+/// resolver `$filter` identifiers actually go through.
+pub const PUBLISHED_FILTER_FIELDS: &[&str] = &[
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "subject_id",
+    "subject_type",
+    "entry_type",
+    "origin",
+    "invalidates",
+];
+
+/// The record attributes every entry carries in its own right, and
+/// therefore sound as keyset-pagination ordering keys — the closed set
+/// [`is_keyset_safe_record_field`] tests against.
+///
+/// Exported because it is the admissible `$orderby` vocabulary, so a `400`
+/// refusing a caller's order can name the whole closed set.
+///
+/// Matching is **exact**, unlike [`PUBLISHED_FILTER_FIELDS`] just above, under
+/// the same rule: each side matches the way its own downstream resolver
+/// matches. An `$orderby` key never passes through
+/// `toolkit_odata::filter::FilterField::from_name` — the plugin hands the
+/// caller's string straight to its field-to-column map, an exact `match` — so
+/// folding case here would admit a key the storage layer then fails to
+/// resolve.
+pub const KEYSET_SAFE_RECORD_FIELDS: &[&str] = &[
+    RECORD_ID_FIELD,
+    WINDOW_START_FIELD,
+    WINDOW_END_FIELD,
+    "tenant_id",
+    "resource_id",
+    "resource_type",
+    "origin",
+    "accepted_at",
+];
+
+/// Record filter fields sound to use as a keyset-pagination ordering key.
 ///
 /// The storage plugin's keyset continuation is a row-value tuple comparison
 /// (`(c1, c2, …) > ($…)`). In SQL three-valued logic a tuple whose leading
 /// column is NULL compares as NULL, so every NULL-keyed row is silently
 /// dropped from the paged result — and a page ending on such a row cannot
-/// encode a `next_cursor` at all (a 500). A field is keyset-safe **iff** its
-/// backing [`UsageRecord`] attribute is never absent:
+/// encode a `next_cursor` at all (a 500). A keyset key therefore has to be an
+/// attribute this SDK guarantees present on every entry. Two kinds of field
+/// are not, and both are on the filterable schema:
 ///
-/// - `subject_id` / `subject_type` come from `subject_ref: Option<SubjectRef>`
-///   and `corrects_id` is `Option<Uuid>` — all three are domain-optional, so
-///   they are **not** keyset-safe.
-/// - `id`, `created_at`, `tenant_id`, `resource_id`, `resource_type`, `status`
-///   are mandatory on every record, so they are keyset-safe.
+/// - **Domain-optional attributes.** `subject_id` / `subject_type` come from
+///   `subject_ref: Option<SubjectRef>`, and the `invalidates` filter field
+///   reads the target inside [`UsageRecord::invalidation`], absent on every
+///   ordinary measurement.
+/// - **Attributes derived from an optional one.** `entry_type` has a value on
+///   every entry and is still not keyset-safe: it is
+///   [`UsageRecord::entry_type`], a function of `invalidates` that partitions
+///   entries on that field's *absence*. The SDK carries no such attribute of
+///   its own and obliges no plugin to materialize one, so it will not promise
+///   a keyset key over it — whatever column a plugin chooses to build.
 ///
-/// This is a domain-optionality fact (an SDK concern), not a storage-column
-/// fact — the gateway rejects a caller `$orderby` on a non-keyset-safe field
-/// with `400`, and the plugin enforces the same invariant fail-closed. The
-/// allowlist is deliberately fail-closed: an unknown or newly added field is
-/// unsafe until it is classified here.
+/// Derivation, not presence, is what separates the second bullet from the
+/// safe fields: [`UsageRecord::origin`] and [`UsageRecord::accepted_at`] also
+/// have a value on every entry, but each is a *field* of the record, so the
+/// SDK's shape obliges every plugin persisting a [`UsageRecord`] to store it
+/// non-null. This is a claim about the shape this SDK guarantees, not about
+/// any storage schema.
+///
+/// Enforcement is the **gateway's alone**: it refuses a caller `$orderby` on a
+/// non-keyset-safe field with a `400` and guarantees the order slot the Plugin
+/// SPI documents on every surface, so a plugin needs no fallback keyset and an
+/// unusable order is a gateway breach rather than a case to paper over — see
+/// [`crate::UsageCollectorPluginV1::list_usage_records`], normative for the
+/// plugin side. The allowlist is fail-closed: a newly added field is unsafe
+/// until it is classified there.
+///
+/// Being on this list is necessary but not sufficient — an order key also has
+/// to resolve to a column. For every key but `accepted_at` that vocabulary is
+/// [`UsageRecordFilterField`]'s, and `models_tests` checks the two against
+/// each other in both directions. `accepted_at` has no
+/// `UsageRecordFilterField` variant, so its column resolution is a
+/// plugin-level fact; the `TimescaleDB` plugin's `record_column` /
+/// `record_row_key` and this crate's reference backend resolve it, each with
+/// its own test iterating this constant.
 #[must_use]
 pub fn is_keyset_safe_record_field(name: &str) -> bool {
-    matches!(
-        name,
-        "id" | "created_at" | "tenant_id" | "resource_id" | "resource_type" | "status"
-    )
+    KEYSET_SAFE_RECORD_FIELDS.contains(&name)
 }
 
 /// Equality-set filter applied to a single [`UsageRecord::metadata`] key.
 ///
-/// `metadata` is a `BTreeMap<MetadataKey, String>` whose keys are not part
-/// of any static schema; the `OData` filter surface in `toolkit-odata`
-/// cannot express filtering on dynamic map keys. `MetadataFilter` is the
-/// typed side-channel used by
-/// [`crate::UsageCollectorClientV1::list_usage_records`] and the plugin
-/// SPI to filter on those keys.
+/// `metadata` keys are not part of any static schema, and `toolkit-odata`'s
+/// filter surface cannot express filtering on dynamic map keys. This is the
+/// typed side-channel [`crate::UsageCollectorClientV1::list_usage_records`]
+/// and the plugin SPI use instead.
 ///
 /// Semantics across a `&[MetadataFilter]`:
 ///
-/// - AND across distinct filters (different keys).
+/// - AND across **every** filter in the slice, including two that name the
+///   same key: a storage plugin emits one AND-ed clause per entry, so
+///   `[k in {a}, k in {b}]` selects rows whose `k` is both — generally
+///   nothing — and is **not** equivalent to the single filter
+///   `k in {a, b}`. A consumer that merged same-key entries would widen
+///   the result set.
 /// - OR within a single filter's `values()`.
 /// - An empty slice imposes no metadata filter.
 ///
@@ -1171,6 +2236,10 @@ impl MetadataFilter {
     /// failing `MetadataKey::new` is rewrapped as
     /// `InvalidMetadataFilter` so callers see one variant for the whole
     /// `MetadataFilter::new` boundary.
+    #[allow(
+        clippy::result_large_err,
+        reason = "UsageCollectorError is large because Conflict carries reason-specific payload; callers returning Result<_, UsageCollectorError> outside this crate hit the same lint"
+    )]
     pub fn new(
         key: impl Into<String>,
         values: impl IntoIterator<Item = impl Into<String>>,

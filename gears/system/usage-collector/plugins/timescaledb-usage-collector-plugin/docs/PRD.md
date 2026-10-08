@@ -58,7 +58,7 @@ This PRD specifies **only plugin-specific requirements** for the TimescaleDB bac
 
 The core owns authentication, PDP authorization, attribution and shape validation, idempotency-key presence and usage-type resolution; the plugin is pure persistence and query and receives only already-authorized, structurally-validated calls.
 
-This PRD is **normative for the gear's target seven-method Plugin SPI**; the shipped crate predates it (DESIGN §4.5).
+This PRD is **normative for the gear's Plugin SPI**; DESIGN §4.5 says where to read what the crate still trails it in.
 
 ### 1.2 Background / Problem Statement
 
@@ -83,7 +83,7 @@ The parent gear glossary is the primary source of truth. The terms below are plu
 | Entry               | The ledger unit — an ordinary measurement or a withdrawal. "Usage record" in this document means any entry, withdrawals included, so the raw-list and retention obligations cover withdrawals too. |
 | Hypertable          | A TimescaleDB time-partitioned table; usage records are stored in a hypertable partitioned on event time.                                                                                        |
 | Retention policy    | A GTS type's declared retention policy, read from the registry, that governs how long the plugin keeps the entries it covers.                                                                    |
-| Dedup key           | The tenant, GTS type, idempotency key, covered-period (`window_start`, `window_end`) and entry-type 6-tuple on which usage-record uniqueness is enforced; a record and its invalidation share the first five and differ in entry type. |
+| Dedup key           | The tenant, GTS type, idempotency key, covered-period (`window_start`, `window_end`) and entry type on which usage-record uniqueness is enforced; a record and its invalidation share the non-kind components and differ in entry type. |
 | Silent absorb       | An idempotent-retry outcome: a same-dedup-key submission whose canonical fields match the stored record returns the stored record instead of creating a duplicate.                               |
 | Keyset pagination   | Seek-based pagination that walks records in a stable order by a cursor rather than by numeric offset.                                                                                            |
 | Consistency profile | The read-visibility ceiling a backend deployment advertises above the gear's eventual-consistency floor (per `cpt-cf-usage-collector-nfr-query-freshness`).                                      |
@@ -93,7 +93,7 @@ The parent gear glossary is the primary source of truth. The terms below are plu
 | Feed position       | The opaque point in feed order a feed cursor carries, issued and interpreted by the plugin alone. Its age is the acceptance instant of the oldest entry of a subscribed GTS type after it, whatever the reader's scope, and a position with no such entry after it is current (DESIGN §3.1, §3.6). |
 | Settled horizon     | The oldest transaction holding an id in the PostgreSQL instance; every entry written by an older transaction is final, so the feed serves only entries below it.                                                      |
 | Retention floor     | The gear's minimum retention: its backfill window plus its operational replay horizon (`cpt-cf-usage-collector-fr-billing-retention-floor`). The plugin is not configured with it and never refuses a position on age — it refuses on a retention mark (`cpt-cf-uc-plugin-fr-usage-feed`). This plugin requires more retention than the floor (`cpt-cf-uc-plugin-fr-per-type-retention`).                                                               |
-| Replay horizon      | H, the deployment's operational replay horizon (`feed_replay_horizon_secs`): the age within which the feed serves every position (`cpt-cf-uc-plugin-fr-usage-feed`). |
+| Replay horizon      | H, the deployment's operational replay horizon: the age within which the feed serves every position (`cpt-cf-uc-plugin-fr-usage-feed`). |
 | Acceptance-order slack | 2 × `feed_acceptance_slack_secs` + `statement_timeout_secs`: how much earlier than an entry already delivered an entry later in feed order can have been accepted. `feed_acceptance_slack_secs` is the per-entry acceptance tolerance the write path enforces (`cpt-cf-uc-plugin-fr-record-persistence`); the derivation is DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`. |
 | Dedup level         | The concurrent-submission guarantee a plugin declares: `linearizable` (convergence bound zero) or `eventual` (`cpt-cf-usage-collector-fr-idempotency`). This plugin is `linearizable`.                    |
 
@@ -127,7 +127,7 @@ This plugin operates within the standard Gears ToolKit lifecycle: it provisions 
 
 ### 4.1 In Scope
 
-- Full implementation of the Usage Collector storage SPI (`cpt-cf-usage-collector-interface-plugin`) — all seven methods of the gear DESIGN's `UsageCollectorPluginV1` — covering single and batch persistence, converged-only point read, pushed-down aggregation, keyset-paginated raw list, feed pages, and reconciliation metadata.
+- Full implementation of the Usage Collector storage SPI (`cpt-cf-usage-collector-interface-plugin`) — all methods of the gear DESIGN's `UsageCollectorPluginV1` — covering batch persistence, converged-only point read, pushed-down aggregation, keyset-paginated raw list, feed pages, and reconciliation metadata.
 - Durable system-of-record storage for usage records, persisted in time order.
 - In-backend deduplication on the tenant, GTS type, idempotency key, covered-period and entry-type identity.
 - Append-only invalidation: a withdrawal is persisted as an ordinary appended entry that names the entry it withdraws, without rewriting the withdrawn entry.
@@ -170,7 +170,7 @@ The plugin **MUST** persist usage records supplied by the host, both singly and 
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-fr-idempotent-dedup`
 
-The plugin **MUST** deduplicate records in the backend on the identity of tenant, GTS type, idempotency key, covered period and entry type. Every constraint, conflict target, conflict read-back and in-batch comparison keyed on identity **MUST** include the entry type or key on the entry id, which covers all six inputs: a record and its invalidation carry the same idempotency key and covered period, and deduplicating on the first five alone would treat every invalidation as a collision with its target. On a duplicate identity whose caller-supplied canonical fields are identical, the plugin **MUST** return the stored record (silent absorb); on a duplicate identity whose canonical fields differ, the plugin **MUST** return an idempotency-conflict error. Concurrent same-identity submissions **MUST** resolve at the declared dedup level (`cpt-cf-uc-plugin-fr-dedup-level`), so exactly one entry is ever visible per identity. Idempotency-key presence is enforced upstream by the gear core and **MUST NOT** be re-validated here.
+The plugin **MUST** deduplicate records in the backend on the identity of tenant, GTS type, idempotency key, covered period and entry type. Every constraint, conflict target, conflict read-back and in-batch comparison keyed on identity **MUST** include the entry type or key on the entry id, which covers the full identity: a record and its invalidation carry the same idempotency key and covered period, and deduplicating without the entry type would treat every invalidation as a collision with its target. On a duplicate identity whose caller-supplied canonical fields are identical, the plugin **MUST** return the stored record (silent absorb); on a duplicate identity whose canonical fields differ, the plugin **MUST** return an idempotency-conflict error. Concurrent same-identity submissions **MUST** resolve at the declared dedup level (`cpt-cf-uc-plugin-fr-dedup-level`), so exactly one entry is ever visible per identity. Idempotency-key presence is enforced upstream by the gear core and **MUST NOT** be re-validated here.
 
 - **Rationale**: At-least-once emission from callers requires the storage boundary to be the exactly-once authority. One stable per-meter idempotency key therefore covers many covered periods: a replay of that key over a different covered period is a distinct entry by design, consistent with the parent contract. For the same reason a record and its invalidation, which share key and covered period, are two distinct entries.
 - **Actors**: `cpt-cf-uc-plugin-actor-plugin-host`
@@ -201,7 +201,7 @@ The plugin **MUST** declare the dedup level `linearizable` and meet it: its conv
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-fr-durable-ack`
 
-The plugin **MUST** return from a persist call only after every entry it reports accepted is durable in the store, **MUST NOT** buffer acknowledged entries in memory, **MUST** refuse to start under a store durability setting that could lose a committed write, and **MUST** force synchronous commit on its own write transactions.
+The plugin **MUST** return from a persist call only after every entry it reports accepted is durable in the store, **MUST NOT** buffer acknowledged entries in memory, **MUST** refuse to start under a store durability setting that could lose a committed write, and **MUST** force synchronous commit on every write transaction whose commit it acknowledges to a caller.
 
 - **Rationale**: An acknowledgement is the only surface the gear's consistency floor binds for write-derived state; losing an acknowledged entry breaks both the idempotency contract and every charge derived from it.
 - **Actors**: `cpt-cf-uc-plugin-actor-plugin-host`
@@ -368,9 +368,9 @@ The plugin **MUST** sustain the parent gear's ingestion envelope — sustained a
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-plugin-nfr-spi-stability`
 
-The plugin **MUST** implement the storage SPI exactly as declared by the gear, with changes additive-only within a major version, and **MUST** pass the gear's full SPI contract suite. Conformance **MUST** be verifiable before release: compile-time conformance to the trait and a green run of every contract check, none blocked.
+The plugin **MUST** implement the storage SPI exactly as declared by the gear, with changes additive-only within a major version, and **MUST** pass its own behavioural integration-test suite covering every SPI obligation. Conformance **MUST** be verifiable before release: compile-time conformance to the trait and a green run of that suite, none of its obligations unverified.
 
-- **Threshold**: Build-time conformance to the SPI; every contract check implemented and passing; no breaking change within a major SPI version.
+- **Threshold**: Build-time conformance to the SPI; every SPI obligation covered by a passing integration test; no breaking change within a major SPI version.
 - **Rationale**: Allocation target for `cpt-cf-usage-collector-nfr-plugin-contract-stability`; the host binds the backend by contract, so the contract must not silently drift.
 - **Architecture Allocation**: See DESIGN.md §2.1 (Design Principles — SPI Conformance).
 
@@ -454,7 +454,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 - **Type**: In-process async Rust trait implementation of the storage SPI (`UsageCollectorPluginV1`).
 - **Stability**: pre-1.0 (`V1`), as the gear labels this same surface (`cpt-cf-usage-collector-interface-plugin`).
-- **Description**: The plugin's sole public surface — the seven Plugin SPI methods ([§4.1](#41-in-scope)). Registered as a scoped client under a GTS instance identifier and consumed in-process by the Usage Collector core; there is no REST or network-exposed surface. Realizes the gear's Plugin SPI (`cpt-cf-usage-collector-interface-plugin` and its `cpt-cf-usage-collector-contract-storage-plugin`); the technical realization is defined in DESIGN.md (`cpt-cf-uc-plugin-interface-spi`).
+- **Description**: The plugin's sole public surface — the Plugin SPI methods ([§4.1](#41-in-scope)). Registered as a scoped client under a GTS instance identifier and consumed in-process by the Usage Collector core; there is no REST or network-exposed surface. Realizes the gear's Plugin SPI (`cpt-cf-usage-collector-interface-plugin` and its `cpt-cf-usage-collector-contract-storage-plugin`); the technical realization is defined in DESIGN.md (`cpt-cf-uc-plugin-interface-spi`).
 - **Breaking Change Policy**: Follows the SPI's versioning (`cpt-cf-usage-collector-nfr-plugin-contract-stability`) — additive within a major version from that surface's 1.0 release onward, and until then a breaking change ships in place; breaking changes are coordinated through the SDK crate.
 
 ### 7.2 External Integration Contracts
@@ -583,7 +583,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 ## 9. Acceptance Criteria
 
-- [ ] The plugin implements all seven methods of the gear's Plugin SPI and conforms to the SDK SPI at build time, and does not depend on the host gear crate.
+- [ ] The plugin implements all methods of the gear's Plugin SPI and conforms to the SDK SPI at build time, and does not depend on the host gear crate.
 - [ ] A usage record is persisted and retrievable; a second submission with the same dedup identity and identical canonical fields yields a single stored record (silent absorb).
 - [ ] A submission with the same dedup identity but differing canonical fields is rejected with an idempotency-conflict error.
 - [ ] A submission with the same idempotency key but a different covered period is stored as a distinct record.
@@ -592,7 +592,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 - [ ] A withdrawal is persisted as an ordinary appended entry naming the entry it withdraws and carrying a reason code, without rewriting the withdrawn entry; a second withdrawal of the same target is either absorbed or conflicts, never admitted as a second withdrawal.
 - [ ] Aggregation (SUM/COUNT/MIN/MAX/LATEST) with grouping is computed in the backend, excludes a withdrawn entry and the invalidation that withdrew it from every fold, and honors the host filter and scope.
 - [ ] An eligible aggregation query is answered from the materialised aggregate and every other query is answered exactly from the stored entries; which path served a query is exposed.
-- [ ] Raw list seeks from the host-decoded keyset, returns rows with the last row's keyset, and never encodes or decodes a wire cursor — the target contract, and not verifiable yet: the SPI returns `toolkit_odata::Page`, whose `PageInfo` carries opaque cursor strings and no structured keyset, so the boundary remains the open question DESIGN §2.2 records.
+- [x] Raw list seeks from the host-decoded keyset, returns rows with the last row's keyset, and never encodes or decodes a wire cursor — ~~the target contract, and not verifiable yet: the SPI returns `toolkit_odata::Page`, whose `PageInfo` carries opaque cursor strings and no structured keyset, so the boundary remains the open question DESIGN §2.2 records~~. **Verified:** `UsageCollectorPluginV1::list_usage_records` (`usage-collector-sdk/src/plugin_api.rs`) now takes `keyset: Option<&Keyset>` and returns `Result<RecordPage, _>` — a structured keyset in and out, never `toolkit_odata::Page`. The struck text above points at DESIGN §2.2 for an open question; §2.2 *Gateway-Owned Cursors*, DECOMPOSITION entry 2.5 and `raw-query-converged-lookup.md` §1.2 all now record this closure instead, so the pointer resolves to the closure rather than to a stale statement. `build_list_sql`/`build_list_page` (`record_store.rs`) are the plugin's own seek and keyset-mint; `keyset.rs::decode_cursor` survives as disclosed dead code — **not** as an SPI-boundary obligation, since the SPI's own doc makes decoding a wire cursor "the gateway's alone" and the gateway strips `query.cursor` before every dispatch. Its only caller in this crate is a test; it is a deletion candidate.
 - [ ] An entry is retained until its type's current declared retention policy elapses, measured from the end of its covered period; an entry whose retention cannot be resolved is retained, not deleted, and the plugin signals that it did so.
 - [ ] Database connections default to TLS — an unspecified `sslmode`, `prefer`, or `allow` is raised to `require`, `verify-ca` / `verify-full` are preserved, and an explicit `sslmode=disable` is honoured only with a warning; the connection string and credentials never appear in logs, errors, or debug output; no caller-supplied string reaches query text as a literal or identifier.
 - [ ] Aggregation queries meet p95 ≤ 500ms over a ≥ 30-minute steady-state window, and the batch write path sustains ≥ 10,000 records/sec sustained sample-mean over the same window, both within the parent throughput-profile envelope — unverified in this repository, since no load test exists here.
@@ -601,13 +601,13 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 - [ ] The plugin emits the enumerated OpenTelemetry metrics under its `uc_timescaledb_*` sub-namespace, including a backend-readiness signal.
 - [ ] The plugin registers under a GTS instance identifier with its configured vendor and priority and does not self-select as the active backend.
 - [ ] The plugin declares the `linearizable` dedup level with a zero convergence bound; racing same-identity submissions yield one entry, a divergent later one an idempotency conflict.
-- [ ] A persist call returns only after its accepted entries are durable; the plugin refuses to start under a durability setting that can lose a committed write and forces synchronous commit on its own write transactions.
+- [ ] A persist call returns only after its accepted entries are durable; the plugin refuses to start under a durability setting that can lose a committed write and forces synchronous commit on every write transaction whose commit it acknowledges to a caller.
 - [ ] Every quantity in the published range and precision, negative half included, reads back digit for digit.
 - [ ] `LATEST` breaks ties by covered-period end, then acceptance instant, then entry identifier in byte order, across tenants.
 - [ ] A converged-only lookup returns the entry or not-found immediately and never reports an acknowledged, retained entry absent.
 - [ ] Feed pages omit every entry outside the host-supplied scope, are complete behind every returned position under concurrent writers, snapshot-consistent, place an invalidation after its target, return a head position on a quiet subscription, replay identically when bounded, begin a first read at the oldest entry the subscription retains, serve a position whose continuation is intact whatever its age, and refuse a position after which retention has removed an entry of a subscribed type.
 - [ ] Reconciliation reports, for one `(tenant, GTS type)` scope, a count including invalidations, a fold-appropriate summary excluding withdrawn pairs, and both watermarks — absent when the scope holds no entries, and likewise for a tenant outside the host-supplied scope.
-- [ ] The full SPI contract suite passes with no blocked check.
+- [ ] The plugin's own SPI-level integration-test suite passes, covering every SPI obligation with none skipped.
 - [ ] Acceptance → feed visibility p95 ≤ 5 minutes and the replay recovery objective are met — unverified in this repository, since no load test exists here.
 
 ## 10. Dependencies
@@ -624,7 +624,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 - The Usage Collector core performs all authentication, PDP authorization, attribution and shape validation, and semantics decisions before every SPI call; the plugin trusts each call as authorized and structurally valid.
 - The gateway derives each entry's id, and on an invalidation the `invalidates` reference, from the entry's own fields; the plugin stores them and the caller-supplied idempotency key verbatim and does not mint identity.
 - The operator provisions a PostgreSQL database with the TimescaleDB extension and a TLS-capable endpoint, sized for the deployment's throughput and retention.
-- The deployment supplies its replay horizon (`feed_replay_horizon_secs`) to the plugin as configuration, because the SPI does not carry it. The retention rule of `cpt-cf-uc-plugin-fr-per-type-retention` adds the acceptance-order slack on top of the gear's retention floor, so the deployment holds more history than the floor and a first read, which begins at the oldest entry the subscription retains, replays all of it.
+- The deployment supplies its replay horizon through its retention declarations and readiness review; the plugin does not read it. The retention rule of `cpt-cf-uc-plugin-fr-per-type-retention` adds the acceptance-order slack on top of the gear's retention floor, so the deployment holds more history than the floor and a first read, which begins at the oldest entry the subscription retains, replays all of it.
 - The PostgreSQL instance hosts no long-running write transactions outside the plugin's own, since feed freshness is bounded by the oldest running write transaction instance-wide (DESIGN §4.1 item 2). Such a transaction, held open long enough, also causes the polled-cursor shortfall in [§13](#13-open-questions).
 
 ## 12. Risks
@@ -641,8 +641,8 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 Open questions for the gateway:
 
-1. Whether the replay horizon should reach the plugin through the SPI rather than configuration ([§11](#11-assumptions)).
-2. The raw-list SPI return type: the gear's trait returns an `ODataPage` while its raw-query sequence returns a keyset (`cpt-cf-uc-plugin-fr-raw-query`).
+1. ~~Whether the replay horizon should reach the plugin through the SPI rather than configuration ([§11](#11-assumptions)).~~ **Closed**: the plugin does not read the replay horizon. It remains a deployment retention obligation.
+2. ~~The raw-list SPI return type: the gear's trait returns an `ODataPage` while its raw-query sequence returns a keyset (`cpt-cf-uc-plugin-fr-raw-query`).~~ **Closed:** the raw-path cursor reshape is the gear's to own. The SPI returns the page's rows together with a structured `Keyset`; the gateway, not the plugin, mints, encodes and decodes the wire `CursorV1`. This was a real open question when written — kept rather than deleted so the record of how it closed is on the page.
 
 One known shortfall stands against the gateway's cursor zones (`cpt-cf-usage-collector-fr-billing-retention-floor`), argued in DESIGN §3.6 Retention refusal. A transaction that holds an id open for a long time keeps every later entry unsettled, and the mark check reads settled entries only. A cursor polled at the head can therefore be refused by a retention mark while such a transaction has been open for at least the replay horizon, less the time between the consumer's pages. Nothing is silently truncated, because a retention mark still refuses the cursor after any deletion. The horizon-lag gauge surfaces such a transaction (DESIGN §3.6 Retention refusal, §4.3, `cpt-cf-uc-plugin-fr-usage-feed`).
 

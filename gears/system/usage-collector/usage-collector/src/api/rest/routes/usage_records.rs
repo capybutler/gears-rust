@@ -1,5 +1,6 @@
 //! `OperationBuilder` route registration for the foundation
-//! `/usage-collector/v1/records` create + deactivation surface.
+//! `/usage-collector/v1/records` create + read surface, and for the
+//! `/records/backfill` bulk-import route registered alongside it.
 //! Every route is registered with `.no_license_required()` — the
 //! foundation create surface is platform-internal substrate.
 
@@ -13,18 +14,72 @@ use super::{dto, handlers};
 
 const USAGE_RECORDS_TAG: &str = "Usage Records";
 
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-fr-ingestion:p1
-// @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-component-ingestion-gateway:p1
+/// The bulk-import route carries its own tag rather than sitting under
+/// [`USAGE_RECORDS_TAG`]: it is a separate operator-facing surface with
+/// its own authorization story, and the published contract groups it that
+/// way.
+const BACKFILL_TAG: &str = "Backfill";
+
+/// `DESIGN.md` §3.10's consistency floor, worded identically across every
+/// read surface's `.description()` here, in `usage_feed.rs` and
+/// `reconciliation.rs` (via `pub(super)`, one shared constant rather than
+/// independent copies), and quoted verbatim by `UsageCollectorPluginV1`'s
+/// trait doc in `usage-collector-sdk`. Pulled into a constant because
+/// inlining it pushed [`register_usage_record_routes`] over
+/// `clippy::too_many_lines`.
+// @cpt-dod:cpt-cf-usage-collector-dod-consistency-floor-published:p1
+// @cpt-dod:cpt-cf-usage-collector-dod-staleness-coupling-recorded:p1
+pub(super) const CONSISTENCY_FLOOR_STATEMENT: &str = "Consistency floor (DESIGN.md Section \
+    3.10): after an ingestion call returns the persisted entry, that entry is durable. Under \
+    eventual dedup level, an acknowledged entry can still lose a race before convergence \
+    (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no \
+    upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the \
+    floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. \
+    A consumer depending on a tighter bound than this floor must record that dependency in \
+    its own design document, naming the plugin, the dimension, and the value; weakening a \
+    published bound is a breaking change for every coupled consumer, and the Plugin SPI \
+    publishes no runtime method for discovering a plugin's ceiling in v1.";
+
+/// `DESIGN.md` §3.10's read-after-write rule, published on the ingestion
+/// endpoint and all three query endpoints.
+// @cpt-dod:cpt-cf-usage-collector-dod-consistency-read-after-write-rule:p1
+const READ_AFTER_WRITE_NOTE: &str = "Read-after-write flows (admission control, post-emit \
+    summary, immediate-readback dashboards) must consume the ingestion acknowledgement, \
+    never a query surface.";
+
+/// `DESIGN.md` Section 3.10's raw-tailing caveat: published only on the raw
+/// path (`list_usage_records`), the one surface it describes.
+const RAW_TAILING_NOTE: &str = "Raw tailing is best-effort, not a change feed; a consumer \
+    that must not miss entries reads GET /usage-collector/v1/feed instead.";
+
+/// `DESIGN.md` Section 3.10's dedup-identity-visibility horizon: published
+/// only on the ingestion surface, where
+/// `cpt-cf-usage-collector-dod-dedup-visibility-consistency-horizon`'s own
+/// Assertion looks for it.
+const DEDUP_HORIZON_NOTE: &str = "An accepted entry's dedup identity stays visible to \
+    subsequent ingestion attempts for as long as the referenced type's retention policy \
+    keeps it (a per-meter floor, not a gear-wide window); a retry arriving after the entry \
+    has aged out of retention draws no guaranteed outcome.";
+
+/// Realizes `dod-pair-remains-readable` by an absence: no route in this
+/// file, `usage_feed.rs` or `reconciliation.rs` registers a mutating verb
+/// (`grep -rn 'OperationBuilder::\(put\|patch\|delete\)' usage-collector/src/`
+/// returns nothing), and `UsageCollectorPluginV1` only creates or reads —
+/// so no surface exists that could rewrite a withdrawn entry.
+// @cpt-dod:cpt-cf-usage-collector-fr-ingestion:p1
+// @cpt-dod:cpt-cf-usage-collector-component-ingestion-gateway:p1
+// @cpt-dod:cpt-cf-usage-collector-dod-pair-remains-readable:p1
 pub(super) fn register_usage_record_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
 ) -> Router {
-    // @cpt-begin:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1:inst-register-route-create-records
     router = OperationBuilder::post("/usage-collector/v1/records")
         .operation_id("usage_collector.create_usage_records")
         .summary("Create usage records")
-        .description("Submit a batch of usage records for persistence.")
+        .description(format!(
+            "Submit a batch of usage records for persistence. {READ_AFTER_WRITE_NOTE} \
+             {DEDUP_HORIZON_NOTE}"
+        ))
         .tag(USAGE_RECORDS_TAG)
         .authenticated()
         .no_license_required()
@@ -43,34 +98,88 @@ pub(super) fn register_usage_record_routes(
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
-    // @cpt-end:cpt-cf-usage-collector-dod-usage-emission-api-post-records:p1:inst-register-route-create-records
 
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-raw:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-raw:p1
+    // The path comes from `usage_collector_sdk::BACKFILL_ROUTE_PATH`, not a
+    // literal, so the SDK's past-tolerance rejection message (which points
+    // here) can't drift from the route. The summary omits
+    // `usage-collector-v1.yaml`'s "isolated from live ingestion" claim:
+    // workload isolation isn't implemented yet (see the TODO on
+    // `Service::backfill_usage_records`), and publishing it would put a
+    // guarantee on the wire the code doesn't keep.
+    // @cpt-dod:cpt-cf-usage-collector-dod-backfill-route:p2
+    router = OperationBuilder::post(usage_collector_sdk::BACKFILL_ROUTE_PATH)
+        .operation_id("usage_collector.backfill_usage_records")
+        .summary("Bulk historical import of periods the live path rejects")
+        .description(
+            "Identical validation and request shape to POST /records, differing as \
+             follows: every accepted entry is stamped `origin: backfill`, the \
+             live path's past bound on the covered period does not apply because this \
+             route exists for exactly the periods that bound rejects, and submissions \
+             whose covered period ends further back than the configured backfill \
+             window require elevated authorization. The route takes measurements and \
+             invalidation entries alike, mixed in one batch.",
+        )
+        .tag(BACKFILL_TAG)
+        .authenticated()
+        .no_license_required()
+        .json_request::<dto::CreateUsageRecordsRequest>(openapi, "Usage-record import payload")
+        .handler(handlers::handle_backfill_usage_records)
+        .json_response_with_schema::<dto::CreateUsageRecordsResponse>(
+            openapi,
+            StatusCode::OK,
+            "Every entry accepted or deduplicated",
+        )
+        .json_response_with_schema::<dto::CreateUsageRecordsResponse>(
+            openapi,
+            StatusCode::MULTI_STATUS,
+            "At least one entry rejected; inspect each per-entry outcome",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    // @cpt-flow:cpt-cf-usage-collector-flow-query-raw-ledger-page:p1
+    // @cpt-dod:cpt-cf-usage-collector-fr-query-raw:p1
     //
-    // DE0802 requires every `$`-prefixed `OData` parameter to be declared
-    // through `OperationBuilderODataExt`, so that the description and the
-    // schema come from one place and gears cannot drift apart on them.
-    // The trait offers `with_odata_filter`, `with_odata_orderby`, and
-    // `with_odata_select` — there is no `$top` method. #4422 bound `$top`
-    // on the wire (`ODataParams.limit` gained `#[serde(alias = "$top")]`)
-    // without adding one, so the rule has nothing to satisfy it with here.
-    //
-    // The choice is therefore between declaring `$top` by hand and leaving
-    // an accepted parameter out of the published document. Declaring it
-    // wins: an endpoint that honours a page-size spelling and does not
-    // document it is the drift `openapi_contract_tests` exists to stop.
-    // The `let` binding exists only to carry the attribute: attributes on
-    // expressions are unstable, and putting this on the function would
-    // exempt the other four routes registered here too. Drop both once
-    // the toolkit grows `with_odata_top()`.
+    // DE0802 requires every `$`-prefixed `OData` parameter to go through
+    // `OperationBuilderODataExt`, which has no `$top` method (`$top` binds
+    // on the wire via `ODataParams.limit`'s `#[serde(alias = "$top")]`
+    // instead). Declared by hand so `openapi_contract_tests` doesn't see an
+    // accepted parameter missing from the document. The `let` only scopes
+    // the `#[allow]` (unstable on expressions; on the function it would
+    // exempt the other routes registered here too). Drop both once the
+    // toolkit grows `with_odata_top()`.
     #[allow(unknown_lints, de0802_use_odata_ext)]
     let list_records_route = OperationBuilder::get("/usage-collector/v1/records")
         .operation_id("usage_collector.list_usage_records")
         .summary("List usage records")
-        .description("Keyset-paginated raw read over the persisted usage records.")
+        .description(format!(
+            "Keyset-paginated raw read over the persisted usage records. \
+             {CONSISTENCY_FLOOR_STATEMENT} {READ_AFTER_WRITE_NOTE} {RAW_TAILING_NOTE}"
+        ))
         .tag(USAGE_RECORDS_TAG)
-        .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
+        .query_param(
+            "gts_type_id",
+            true,
+            "Usage-type GTS instance id (mandatory)",
+        )
+        // The covered-period range is a first-class parameter on this path,
+        // never a `$filter` conjunct: an entry is selected when its period
+        // end falls in `[from, to)`. A `GET` has no body, so the raw path
+        // carries the range in the query string while the aggregate path
+        // carries it in its declared request body.
+        .query_param(
+            "from",
+            true,
+            "Inclusive lower bound of the covered-period range (mandatory; RFC 3339 \
+             with an offset, normalized to UTC)",
+        )
+        .query_param(
+            "to",
+            true,
+            "Exclusive upper bound of the covered-period range (mandatory; RFC 3339 \
+             with an offset, normalized to UTC)",
+        )
         .query_param(
             "metadata.<key>",
             false,
@@ -94,9 +203,9 @@ pub(super) fn register_usage_record_routes(
             "integer",
         )
         .query_param("cursor", false, "Opaque CursorV1 continuation token")
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
+        // @cpt-begin:cpt-cf-usage-collector-flow-query-raw-ledger-page:p1:inst-raw-request-received
         .authenticated()
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-raw:p1:inst-raw-request-received
+        // @cpt-end:cpt-cf-usage-collector-flow-query-raw-ledger-page:p1:inst-raw-request-received
         .no_license_required()
         .handler(handlers::handle_list_usage_records)
         .json_response_with_schema::<toolkit_odata::Page<dto::UsageRecordDto>>(
@@ -115,27 +224,37 @@ pub(super) fn register_usage_record_routes(
         .register(router, openapi);
     router = list_records_route;
 
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-fr-query-aggregation:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-query-api-post-records-aggregate:p1
+    // @cpt-flow:cpt-cf-usage-collector-flow-query-aggregated-usage:p1
+    // @cpt-dod:cpt-cf-usage-collector-fr-query-aggregation:p1
     router = OperationBuilder::post("/usage-collector/v1/records/aggregate")
         .operation_id("usage_collector.query_aggregated_usage_records")
         .summary("Query server-side aggregated usage")
-        .description("Server-side aggregation (`SUM` / `COUNT` / `MIN` / `MAX` / `AVG`) over the persisted usage records.")
+        .description(format!(
+            "Server-side aggregation over the persisted usage records. Carries no \
+             aggregation parameter: the fold (`SUM` / `COUNT` / `MAX` / `MIN` / \
+             `LATEST`) is resolved from the queried type's declaration. \
+             {CONSISTENCY_FLOOR_STATEMENT} {READ_AFTER_WRITE_NOTE}"
+        ))
         .tag(USAGE_RECORDS_TAG)
-        .query_param("gts_id", true, "Usage-type GTS instance id (mandatory)")
+        .query_param(
+            "gts_type_id",
+            true,
+            "Usage-type GTS instance id (mandatory)",
+        )
         .query_param(
             "metadata.<key>",
             false,
             "Repeated metadata-filter entries; OR within a key, AND across keys",
         )
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
+        // @cpt-begin:cpt-cf-usage-collector-flow-query-aggregated-usage:p1:inst-aggregated-request-received
         .authenticated()
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-query-query-aggregated:p1:inst-aggregated-request-received
+        // @cpt-end:cpt-cf-usage-collector-flow-query-aggregated-usage:p1:inst-aggregated-request-received
         .no_license_required()
-        .json_request::<dto::QueryAggregatedUsageRecordsRequest>(
+        // The range is in the body on this path (`AggregationRequest.time_range`),
+        // so no `from` / `to` query parameter is declared or accepted here.
+        .json_request::<dto::AggregationRequest>(
             openapi,
-            "Aggregation operator + optional group-by dimensions",
+            "Mandatory time range plus optional group-by dimensions",
         )
         .handler(handlers::handle_query_aggregated_usage_records)
         .json_response_with_schema::<dto::AggregationResultDto>(
@@ -148,18 +267,19 @@ pub(super) fn register_usage_record_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    // @cpt-flow:cpt-cf-usage-collector-flow-usage-emission-get-record:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-usage-emission-api-get-records-id:p1
-    // @cpt-begin:cpt-cf-usage-collector-dod-usage-emission-api-get-records-id:p1:inst-register-route-get-record
+    // @cpt-flow:cpt-cf-usage-collector-flow-lookup-entry-by-identifier:p1
     router = OperationBuilder::get("/usage-collector/v1/records/{id}")
         .operation_id("usage_collector.get_usage_record")
         .summary("Get a usage record")
-        .description("Read a single usage record by `id`.")
+        .description(format!(
+            "Read a single usage record by `id`. {CONSISTENCY_FLOOR_STATEMENT} \
+             {READ_AFTER_WRITE_NOTE}"
+        ))
         .tag(USAGE_RECORDS_TAG)
         .path_param("id", "Usage-record UUID")
-        // @cpt-begin:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-submit
+        // @cpt-begin:cpt-cf-usage-collector-flow-lookup-entry-by-identifier:p1:inst-get-record-submit
         .authenticated()
-        // @cpt-end:cpt-cf-usage-collector-flow-usage-emission-get-record:p1:inst-get-record-submit
+        // @cpt-end:cpt-cf-usage-collector-flow-lookup-entry-by-identifier:p1:inst-get-record-submit
         .no_license_required()
         .handler(handlers::handle_get_usage_record)
         .json_response_with_schema::<dto::UsageRecordDto>(
@@ -167,28 +287,6 @@ pub(super) fn register_usage_record_routes(
             StatusCode::OK,
             "The persisted usage record",
         )
-        .standard_errors(openapi)
-        .error_503(openapi)
-        .register(router, openapi);
-    // @cpt-end:cpt-cf-usage-collector-dod-usage-emission-api-get-records-id:p1:inst-register-route-get-record
-
-    // @cpt-flow:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-api-post-records-id-deactivate:p1
-    // @cpt-dod:cpt-cf-usage-collector-dod-event-deactivation-component-deactivation-handler:p1
-    router = OperationBuilder::post("/usage-collector/v1/records/{id}/deactivate")
-        .operation_id("usage_collector.deactivate_usage_record")
-        .summary("Deactivate a usage record")
-        .description("Deactivate a usage record by `id`.")
-        .tag(USAGE_RECORDS_TAG)
-        .path_param("id", "Usage-record UUID")
-        // @cpt-begin:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-no-ctx
-        // @cpt-begin:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-submit
-        .authenticated()
-        // @cpt-end:cpt-cf-usage-collector-flow-event-deactivation-deactivate-record:p1:inst-deactivate-record-submit
-        // @cpt-end:cpt-cf-usage-collector-algo-event-deactivation-operator-pdp-authorization:p1:inst-algo-pdp-no-ctx
-        .no_license_required()
-        .handler(handlers::handle_deactivate_usage_record)
-        .no_content_response(StatusCode::NO_CONTENT, "Deactivation succeeded")
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);

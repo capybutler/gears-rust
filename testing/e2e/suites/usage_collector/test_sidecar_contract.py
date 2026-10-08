@@ -6,9 +6,11 @@ through a failed server boot is far slower than failing here.
 
 It lives in this package rather than next to lib/sidecars.py so that it
 inherits this package's conftest skip gate (Task 4's `_require_dedicated_binary`
-autouse fixture): the shared `make e2e-local` run DOES collect this file (it's
-part of `testpaths = .`), but every test in it is skipped unless `E2E_BINARY`
-is set, same as the rest of this package.
+autouse fixture): run it any way that reaches it and it is skipped unless
+`E2E_BINARY` is set, same as the rest of this package. The shared
+`make e2e-local` run does not reach it at all — `run_e2e.py` passes pytest the
+paths of `launcher: e2e-launcher` suites only, so `testpaths = .` in
+pytest.ini never governs that run.
 
 Isolation note: `reap_orphans()` matches on Docker label alone, via
 `docker ps -aq`, which includes RUNNING containers — not just dead ones. If

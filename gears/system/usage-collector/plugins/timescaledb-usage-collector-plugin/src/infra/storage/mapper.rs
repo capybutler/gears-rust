@@ -4,89 +4,113 @@
 //! [`UsageCollectorPluginError::Internal`] — a row already in the database that
 //! cannot be reconstituted is a plugin invariant break, not a caller error.
 //!
-//! `UsageTypeGtsId` is the SDK newtype over `gts::GtsInstanceId`; it is built
-//! from a stored `&str` via [`gts_id_from_str`] (validating `UsageTypeGtsId::new`)
-//! and read back via [`gts_id_str`] (`AsRef<str>`). The constructor is fallible,
-//! so [`gts_id_from_str`] returns a `Result` (deviation from the infallible
-//! signature in the task skeleton — `UsageTypeGtsId::new` validates against the
-//! reserved GTS base).
+//! Of the columns the model carries, `id`, `tenant_id` and the two period
+//! bounds move across unchanged. The rest are validated on the way in:
+//! `resource_id` and `resource_type` through [`ResourceRef::new`], `subject_id`
+//! and `subject_type` through [`SubjectRef::new`], `idempotency_key` through
+//! [`IdempotencyKey::from_stored`] — which applies exactly the checks
+//! [`IdempotencyKey::new`] applies and differs from it only in naming the
+//! rehydration of a persisted entry rather than the admission of a submission
+//! — `metadata` through [`metadata_jsonb_to_map`],
+//! `quantity` through [`UsageQuantity::try_from`], and these through the
+//! helpers below, which take more explaining:
+//!
+//! - `gts_type_uuid` moves across unchanged, and is the only meter identity a
+//!   row carries at all. The SPI's record shape names its meter by reference,
+//!   and so does the ledger.
+//! - `origin` becomes a [`RecordOrigin`]. There is deliberately no
+//!   `origin_to_sql` counterpart to [`parse_origin`]: [`RecordOrigin::as_str`]
+//!   already is the SQL form, and [`parse_origin`] compares against that same
+//!   accessor rather than against its own literals, so the two directions
+//!   cannot drift apart.
+//! - `invalidates` and `reason_code` are two nullable columns standing for one
+//!   `Option<Invalidation>` field; [`invalidation_from_row`] rejoins them and
+//!   [`invalidation_to_row`] splits them again. This is the one pair with a
+//!   helper in both directions, because it is the one pair whose halves the
+//!   insert could otherwise bind independently.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
+use uuid::Uuid;
 
 use usage_collector_sdk::{
-    IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageCollectorPluginError, UsageKind,
-    UsageRecord, UsageRecordStatus, UsageType, UsageTypeGtsId,
+    IdempotencyKey, Invalidation, MetadataKey, ReasonCode, RecordOrigin, ResourceRef,
+    StoredUsageRecord, SubjectRef, UsageCollectorPluginError, UsageQuantity,
 };
 
-use super::entity::{UsageRecordRow, UsageTypeRow};
+use super::entity::UsageRecordRow;
 
-/// Borrow the raw GTS instance id string out of a [`UsageTypeGtsId`] (for
-/// binding).
-#[must_use]
-pub fn gts_id_str(gts_id: &UsageTypeGtsId) -> &str {
-    gts_id.as_ref()
-}
-
-/// Reconstruct a validated [`UsageTypeGtsId`] from a stored string.
+/// Parse a stored `origin` string into [`RecordOrigin`].
 ///
-/// # Errors
-///
-/// Returns [`UsageCollectorPluginError::Internal`] when the stored value is not
-/// a valid usage-type GTS id (a stored-data invariant break).
-pub fn gts_id_from_str(raw: &str) -> Result<UsageTypeGtsId, UsageCollectorPluginError> {
-    UsageTypeGtsId::new(raw).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored gts_id `{raw}` invalid: {e}"))
-    })
-}
-
-/// Parse a stored `status` string into [`UsageRecordStatus`].
-///
-/// Mirrors the SDK serde wire shape (`#[serde(rename_all = "lowercase")]`),
-/// matching the DDL `CHECK (status IN ('active', 'inactive'))`.
+/// The accepted vocabulary is taken from [`RecordOrigin::as_str`] rather than
+/// restated here, so this reader and the writer that binds the column cannot
+/// disagree. The DDL `CHECK (origin IN ('live', 'backfill'))` pins the same
+/// two values on the storage side.
 ///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] for any other value.
-pub fn parse_status(raw: &str) -> Result<UsageRecordStatus, UsageCollectorPluginError> {
-    match raw {
-        "active" => Ok(UsageRecordStatus::Active),
-        "inactive" => Ok(UsageRecordStatus::Inactive),
-        other => Err(UsageCollectorPluginError::internal(format!(
-            "stored status `{other}` is not 'active'/'inactive'"
+pub fn parse_origin(raw: &str) -> Result<RecordOrigin, UsageCollectorPluginError> {
+    if raw == RecordOrigin::Live.as_str() {
+        Ok(RecordOrigin::Live)
+    } else if raw == RecordOrigin::Backfill.as_str() {
+        Ok(RecordOrigin::Backfill)
+    } else {
+        Err(UsageCollectorPluginError::internal(format!(
+            "stored origin `{raw}` is not `{}`/`{}`",
+            RecordOrigin::Live.as_str(),
+            RecordOrigin::Backfill.as_str()
+        )))
+    }
+}
+
+/// Reassemble the stored invalidation pair into an [`Invalidation`].
+///
+/// The `usage_records_invalidation_pairing` constraint holds the two columns
+/// both-present or both-absent, so a half-populated row is a stored-invariant
+/// break rather than a shape the model can carry: [`Invalidation`] groups the
+/// target and the reason precisely so that half is unrepresentable.
+///
+/// # Errors
+///
+/// Returns [`UsageCollectorPluginError::Internal`] when exactly one of the two
+/// is present, or when the stored reason fails [`ReasonCode`] validation.
+pub fn invalidation_from_row(
+    invalidates: Option<Uuid>,
+    reason_code: Option<String>,
+) -> Result<Option<Invalidation>, UsageCollectorPluginError> {
+    match (invalidates, reason_code) {
+        (None, None) => Ok(None),
+        (Some(target), Some(raw)) => {
+            let reason = ReasonCode::new(raw).map_err(|e| {
+                UsageCollectorPluginError::internal(format!("stored reason_code invalid: {e}"))
+            })?;
+            Ok(Some(Invalidation { target, reason }))
+        }
+        (Some(target), None) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry `{target}` names an invalidation target with no reason_code"
+        ))),
+        (None, Some(raw)) => Err(UsageCollectorPluginError::internal(format!(
+            "stored entry carries reason_code `{raw}` with no invalidation target"
         ))),
     }
 }
 
-/// SQL string form of a [`UsageRecordStatus`] (inverse of [`parse_status`]).
-#[must_use]
-pub fn status_to_sql(status: UsageRecordStatus) -> &'static str {
-    match status {
-        UsageRecordStatus::Active => "active",
-        UsageRecordStatus::Inactive => "inactive",
-    }
-}
-
-/// Parse a stored `kind` string into [`UsageKind`] via the SDK `FromStr`
-/// (`counter` / `gauge`).
+/// Split an [`Invalidation`] back into the two columns that store it.
 ///
-/// # Errors
-///
-/// Returns [`UsageCollectorPluginError::Internal`] for any other value.
-pub fn parse_kind(raw: &str) -> Result<UsageKind, UsageCollectorPluginError> {
-    raw.parse::<UsageKind>().map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored kind `{raw}` invalid: {e}"))
-    })
-}
-
-/// SQL string form of a [`UsageKind`] (inverse of [`parse_kind`]), matching the
-/// DDL `CHECK (kind IN ('counter', 'gauge'))`.
+/// The inverse of [`invalidation_from_row`], and the reason the insert cannot
+/// bind `invalidates` and `reason_code` separately: going through one function
+/// makes the half-populated pair unrepresentable on the way out, the same way
+/// [`Invalidation`] makes it unrepresentable on the way in. Without it the
+/// write direction would reintroduce exactly the split shape the read
+/// direction exists to refuse, with nothing catching it until Postgres rejects
+/// the row on `usage_records_invalidation_pairing` at runtime.
 #[must_use]
-pub fn kind_to_sql(kind: UsageKind) -> &'static str {
-    match kind {
-        UsageKind::Counter => "counter",
-        UsageKind::Gauge => "gauge",
+pub fn invalidation_to_row(invalidation: Option<&Invalidation>) -> (Option<Uuid>, Option<&str>) {
+    match invalidation {
+        None => (None, None),
+        Some(Invalidation { target, reason }) => (Some(*target), Some(reason.as_str())),
     }
 }
 
@@ -122,7 +146,11 @@ pub fn metadata_jsonb_to_map(
             }
         };
         // `key` is already owned (the loop consumes `obj` by value), so move it
-        // into the validation; the error `e` carries the offending key.
+        // into the validation. The message below cannot name the key and does
+        // not try: `MetadataKey::new` passes a fixed reason to
+        // `invalid_metadata_key`, which drops it into `newtype_validation`
+        // with `resource_name: None`, so the rejected value reaches no field
+        // of the error — and `key` has been moved by the time `e` exists.
         let metadata_key = MetadataKey::new(key).map_err(|e| {
             UsageCollectorPluginError::internal(format!("stored metadata key invalid: {e}"))
         })?;
@@ -141,75 +169,111 @@ pub fn metadata_map_to_jsonb(map: &BTreeMap<MetadataKey, String>) -> JsonValue {
     JsonValue::Object(obj)
 }
 
-/// Map a [`UsageRecordRow`] into a validated [`UsageRecord`].
+/// Map a [`UsageRecordRow`] into a validated [`StoredUsageRecord`].
+///
+/// **No meter identifier is read, because none is stored.** The SPI's record
+/// shape names its meter by the registry reference alone, and so does the
+/// ledger: this reads [`UsageRecordRow::gts_type_uuid`] and there is no text
+/// column to parse. A `uuid` column cannot be malformed-but-present the way a
+/// `text` one could, so this function has one fewer way to fail than it did.
+///
+/// The row's `type_key` and `entry_type` are read and deliberately dropped,
+/// because the model has no field for either. `type_key` is assigned where
+/// the entry is stored and is this plugin's own: it is the ledger's second
+/// partition dimension, a function of the `gts_type_uuid` the meter the SPI
+/// call carried already names, so there is nothing in it a caller could not
+/// already read.
+/// `entry_type` is dropped for the opposite reason: the model already answers
+/// what it holds, projecting an entry's kind from the `Invalidation` it
+/// carries, and `cpt-cf-usage-collector-adr-append-only-invalidation` is
+/// explicit that no discriminator may sit beside that projection. Neither is
+/// an oversight; see [`UsageRecordRow`]'s own doc for why `entry_type` is
+/// decoded at all despite it.
+///
+/// **`xact_id` never reaches this function.** It is assigned where the entry
+/// is stored — by the database, from the inserting transaction — and does
+/// not travel back out through the SPI as a record field; it reaches a
+/// caller only inside a `FeedPosition`. `UsageRecordRow` carries no such
+/// field at all, so there is nothing here to drop: only a feed page read
+/// decodes it, off `super::entity::FeedRecordRow`, and only
+/// `feed_page_in_transaction` reads it, off the raw row rather than through
+/// this function.
+///
+/// The two stored pairs are treated asymmetrically, deliberately. A
+/// half-populated invalidation pair is *refused*, because [`Invalidation`] has
+/// a shape to reconstruct into and half of it is not that shape. A
+/// `subject_type` with no `subject_id` is *dropped* — the `match` on
+/// `row.subject_id` never looks at the type — because [`SubjectRef`] requires
+/// an id and makes only the type optional, so there is no half-built subject
+/// to refuse on behalf of. Both shapes are already refused at the table by
+/// `usage_records_invalidation_pairing` and `usage_records_subject_pairing`;
+/// the difference here is only in what a mapper can say about them.
 ///
 /// # Errors
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when any stored component
-/// fails its SDK newtype validation (`gts_id`, `resource_ref`, `subject_ref`,
-/// `idempotency_key`, `status`, `metadata`).
-pub fn record_row_to_model(row: UsageRecordRow) -> Result<UsageRecord, UsageCollectorPluginError> {
-    let gts_id = gts_id_from_str(&row.gts_id)?;
+/// fails its SDK newtype validation (`resource_ref`,
+/// `subject_ref`, `idempotency_key`, `metadata`, `origin`, `quantity`), or
+/// when the stored invalidation pair is half-populated or carries a
+/// `reason_code` that fails [`ReasonCode`] validation (both via
+/// [`invalidation_from_row`]).
+pub fn record_row_to_model(
+    row: UsageRecordRow,
+) -> Result<StoredUsageRecord, UsageCollectorPluginError> {
+    // The composite primary key, captured before the row is picked apart.
+    // `ResourceRef::new`, `SubjectRef::new` and `IdempotencyKey::from_stored`
+    // all report a fixed reason and never echo the value they rejected, so without
+    // this an operator is told a stored row is malformed and not which one.
+    //
+    // The binding is required rather than tidy: reading `row.id` inside the
+    // `map_err` closure would borrow `row` in the same expression that moves
+    // `row.resource_id` and `row.resource_type` into `ResourceRef::new`.
+    let (id, window_end) = (row.id, row.window_end);
 
     let resource_ref = ResourceRef::new(row.resource_id, row.resource_type).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored resource_ref invalid: {e}"))
+        UsageCollectorPluginError::internal(format!(
+            "stored row `{id}` (window_end {window_end}): resource_ref invalid: {e}"
+        ))
     })?;
 
     let subject_ref = match row.subject_id {
         Some(subject_id) => Some(SubjectRef::new(subject_id, row.subject_type).map_err(|e| {
-            UsageCollectorPluginError::internal(format!("stored subject_ref invalid: {e}"))
+            UsageCollectorPluginError::internal(format!(
+                "stored row `{id}` (window_end {window_end}): subject_ref invalid: {e}"
+            ))
         })?),
         None => None,
     };
 
-    let idempotency_key = IdempotencyKey::new(row.idempotency_key).map_err(|e| {
-        UsageCollectorPluginError::internal(format!("stored idempotency_key invalid: {e}"))
+    let idempotency_key = IdempotencyKey::from_stored(row.idempotency_key).map_err(|e| {
+        UsageCollectorPluginError::internal(format!(
+            "stored row `{id}` (window_end {window_end}): idempotency_key invalid: {e}"
+        ))
     })?;
 
     let metadata = metadata_jsonb_to_map(row.metadata)?;
-    let status = parse_status(&row.status)?;
+    let origin = parse_origin(&row.origin)?;
+    let invalidation = invalidation_from_row(row.invalidates, row.reason_code)?;
+    let quantity = UsageQuantity::try_from(row.quantity).map_err(|e| {
+        UsageCollectorPluginError::internal(format!(
+            "stored row `{id}` (window_end {window_end}): quantity invalid: {e}"
+        ))
+    })?;
 
-    Ok(UsageRecord {
+    Ok(StoredUsageRecord {
         id: row.id,
-        gts_id,
+        gts_type_uuid: row.gts_type_uuid,
         tenant_id: row.tenant_id,
         resource_ref,
         subject_ref,
         metadata,
-        value: row.value,
+        quantity,
         idempotency_key,
-        corrects_id: row.corrects_id,
-        status,
-        created_at: row.created_at,
-    })
-}
-
-/// Map a [`UsageTypeRow`] into a validated [`UsageType`].
-///
-/// # Errors
-///
-/// Returns [`UsageCollectorPluginError::Internal`] when the stored `gts_id`,
-/// `kind`, or any `metadata_fields` entry fails its SDK newtype validation.
-pub fn type_row_to_model(row: UsageTypeRow) -> Result<UsageType, UsageCollectorPluginError> {
-    let gts_id = gts_id_from_str(&row.gts_id)?;
-    let kind = parse_kind(&row.kind)?;
-
-    let mut metadata_fields = std::collections::BTreeSet::new();
-    for field in row.metadata_fields {
-        // `field` is already owned (the loop consumes `metadata_fields` by
-        // value), so move it into the validation; `e` carries the reason.
-        let key = MetadataKey::new(field).map_err(|e| {
-            UsageCollectorPluginError::internal(format!(
-                "stored metadata_fields entry invalid: {e}"
-            ))
-        })?;
-        metadata_fields.insert(key);
-    }
-
-    Ok(UsageType {
-        gts_id,
-        kind,
-        metadata_fields,
+        accepted_at: row.accepted_at,
+        origin,
+        invalidation,
+        window_start: row.window_start,
+        window_end: row.window_end,
     })
 }
 

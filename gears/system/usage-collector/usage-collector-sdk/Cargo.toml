@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["constructorfabric", "cf-gears"]
 categories = ["api-bindings"]
-metadata.docs.rs.all-features = true
 
 [lib]
 name = "usage_collector_sdk"
@@ -37,3 +36,6 @@ toolkit = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-odata = { workspace = true }
 toolkit-odata-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

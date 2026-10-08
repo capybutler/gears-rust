@@ -81,7 +81,19 @@ def require_docker() -> None:
 
 
 def skip_without_docker() -> None:
-    """pytest.skip (module-level) unless Docker is usable."""
+    """pytest.skip (module-level) unless Docker is usable.
+
+    No caller today. The usage-collector suite was the last one and moved to
+    `require_docker` directly, because it needs to FAIL rather than skip when
+    its CI step says the suite must run (`UC_E2E_REQUIRE_DOCKER`), and this
+    helper only skips. Kept because skipping is still the right default for a
+    suite with no such demand, and because the alternative is every such suite
+    re-writing the same try/except around `require_docker`.
+
+    If you are adding a Docker-dependent suite: use this when a developer
+    without Docker should get a skip and CI has no separate guarantee to
+    protect, and `require_docker` when it does.
+    """
     try:
         require_docker()
     except DockerUnavailable as exc:

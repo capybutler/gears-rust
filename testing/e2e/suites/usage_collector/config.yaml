@@ -6,26 +6,28 @@
 # `make e2e-local` run. Colocated with the suite (its conftest loads it) rather
 # than living under config/.
 #
-# The two authz surfaces reach the PDP differently. usage-collector's
-# `usage_type` resource is platform-global per ADR-0012 and so declares no
-# supported properties (`ResourceType::from_static(.., &[])`), which means
-# `static-authz-plugin` emits no `owner_tenant_id` clamp for the CATALOG routes
-# (create/get/list/delete) — a constraint naming an undeclared property is an
-# `AllConstraintsFailed` deny in the PEP compiler. Those routes run under
-# `require_constraints(false)`, so the empty set compiles to `allow_all` and the
-# catalog is tenant-agnostic. The usage-RECORD routes declare
-# `owner_tenant_id` and run under `require_constraints(true)`, so they carry the
-# usual row clamp and the tenant-scoping tests below have something to assert
-# against.
+# There is one authz surface left. `usage_type` was a second `ResourceType`
+# with no supported properties, running under `require_constraints(false)`; the
+# types-registry redesign deleted the catalog routes it guarded and the gear now
+# declares only `usage_record` (`domain/authz.rs`, `RESOURCE`). That one lists
+# `owner_tenant_id` among its supported properties and every record route runs
+# under `require_constraints(true)`, so `static-authz-plugin` emits the row
+# clamp the tenant-scoping tests assert against.
 #
 # `__E2E_TS_PORT__` is substituted with the container's mapped host port by
 # testing/e2e/suites/usage_collector/conftest.py before the server starts.
 #
-# usage-collector itself declares no `db` capability (all durable usage rows
-# live in the bound storage plugin's own TimescaleDB, via `database_url`
-# below) and types-registry is in-memory. BUT a top-level `database:` section
-# IS required regardless: `credstore`, `resource-group`, `simple-user-settings`,
-# and `file-parser` are gears compiled unconditionally into
+# usage-collector itself now declares the `db` capability, for the DESIGN
+# §3.7 declaration mirror (cpt-cf-usage-collector-adr-declaration-rehydration)
+# — one small, temporary table the gear uses to restore a lost GTS type
+# declaration; see its `database:` block below, on the same `sqlite_uc_e2e`
+# server as credstore/resource-group/simple-user-settings. Every durable
+# usage row still lives wholly in the bound storage plugin's own TimescaleDB,
+# via `database_url` below — the mirror never holds a usage record, only a
+# cached type declaration — and types-registry is in-memory. A top-level
+# `database:` section was already required regardless of this gear's own
+# binding: `credstore`, `resource-group`, `simple-user-settings`, and
+# `file-parser` are gears compiled unconditionally into
 # cf-gears-example-server (not gated by any cargo feature — see
 # apps/cf-gears-example-server/Cargo.toml) and the first three call
 # `ctx.db_required()` at init. Verified by hand: booting this binary with NO
@@ -174,8 +176,34 @@ gears:
   # gear with no storage plugin bound — a failure that would otherwise surface
   # only on the first dispatch, not at startup.
   usage-collector:
+    database:
+      server: "sqlite_uc_e2e"
+      file: "usage_collector_declaration_mirror.db"
     config:
       vendor: "constructorfabric"
+      # Deliberately tiny, and the only reason the declaration mirror's
+      # `ON CONFLICT DO UPDATE` branch is reachable from this suite at all.
+      # That branch needs ONE meter resolved TWICE with a cache miss in
+      # between, and the resolver has exactly two ways to miss on a key it
+      # already holds: the TTL expiring (`type_cache_ttl_secs`, default 300s
+      # — unwaitable under pytest.ini's 10s per-test budget) and the
+      # least-recently-resolved eviction in `TypeResolver::store` (default
+      # ceiling 10000 — unfillable in a test). Lowering the ceiling makes the
+      # SECOND one drivable: `test_declaration_mirror.py` resolves this many
+      # other meters and its own is gone. The branch is then exercised by the
+      # gear's real eviction path, not by a test hook.
+      #
+      # It costs this suite nothing it was covering. Every test here declares
+      # exactly one meter and never revisits another test's, so a two-entry
+      # cache still serves every within-test repeat from cache and no test
+      # re-resolves a meter it did not mean to. What is NOT covered here, and
+      # was not before either, is a large cache's steady state — the
+      # resolver's own unit tests (`domain/type_resolver/resolver_tests.rs`)
+      # own capacity and eviction behaviour.
+      #
+      # Read back by conftest.py as TYPE_CACHE_CAPACITY; the test derives its
+      # filler count from it rather than restating the number.
+      type_cache_capacity: 2
 
   timescaledb-usage-collector-plugin:
     config:
@@ -189,6 +217,3 @@ gears:
       pool_size_max: 16
       connection_timeout_secs: 10
       statement_timeout_secs: 30
-      # ~100 years. Long enough that no retention job can drop test rows
-      # mid-run.
-      retention_period_secs: 3153600000
