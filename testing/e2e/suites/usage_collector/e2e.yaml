@@ -1,7 +1,17 @@
+# Generation 1's suite, and it is ClickHouse-only: conftest.py defaults
+# `UC_E2E_BACKEND` to `clickhouse` and `make e2e-usage-collector-clickhouse`
+# builds the server with `clickhouse-usage-collector`. The feature list below
+# is what `run_e2e.py` feeds to `cargo build --features` for
+# `make e2e-local SUITE=usage-collector`, so it must name the same plugin:
+# with `timescaledb-usage-collector` here that documented entry point built a
+# server carrying the V2-only TimescaleDB plugin — which fails init without a
+# live Postgres of its own — and not the plugin this suite's config and
+# sidecar require. Generation 2's suite keeps `timescaledb-usage-collector`,
+# correctly; see `suites/usage_collector_v2/e2e.yaml`.
 suite: usage-collector
 features:
   - usage-collector
-  - timescaledb-usage-collector
+  - clickhouse-usage-collector
   - static-tenants
   - static-authn
   - static-authz

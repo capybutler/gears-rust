@@ -726,7 +726,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-oagw-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-ledger-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-mirror-pg test-usage-collector-ch test-types-registry-db test-oagw-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-ledger-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -822,6 +822,37 @@ test-users-info-pg: install-tools
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	$(call nextest_run,usage-collector-pg,-p cf-gears-timescaledb-usage-collector-plugin --features postgres)
+
+## Run the usage-collector GEAR's declaration-mirror Postgres tier (Docker
+## required; the suite spins up its own postgres container via testcontainers).
+##
+## Separate from `test-usage-collector-pg` above, which names only the
+## *TimescaleDB plugin* package. `tests/postgres_declaration_mirror.rs` lives in
+## `cf-gears-usage-collector` itself and no target or CI step ever named that
+## package with `--run-ignored`, so from the day it was written the file
+## compiled on every run and executed on none — the third instance of this exact
+## failure recorded in this Makefile, after `test-pricing-pg` (2026-08-11) and
+## `test-products-pg` (2026-08-30). Same `--run-ignored ignored-only` shape as
+## those two, and the same reason: the gate is `#[ignore = "requires Docker
+## (testcontainers)"]` rather than a feature, so `--features` cannot reach it.
+##
+## What lives here and nowhere else: the declaration mirror's DDL and its one
+## `ON CONFLICT DO UPDATE` on the engine a production deployment actually binds.
+## The adapter's in-crate tests run `sqlite::memory:` and the e2e suite binds
+## `engine: "sqlite"`, so without this tier a Postgres deployment is the first
+## execution of that migration and that upsert anywhere — and the `ON CONFLICT`
+## branch itself is unreachable on a fresh in-memory database used once per
+## test. The suite also reads `first_seen_at` / `last_seen_at` by raw SQL,
+## because `DeclarationMirror::read` returns the document alone and cannot
+## reach the set-once/move-on-write contract that is the table's whole design
+## claim.
+##
+## `--no-fail-fast` for the donors' reason: a tier whose purpose is to be the
+## one place a Postgres-only defect surfaces must report every failure it
+## found, not the first.
+test-usage-collector-mirror-pg: install-tools
+	$(call print_target_banner)
+	$(call nextest_run,usage-collector-mirror-pg,-p cf-gears-usage-collector --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast)
 
 ## Run ClickHouse usage-collector plugin integration tests (Docker required;
 ## every test gets its own database on one shared, named clickhouse container,
@@ -1233,15 +1264,16 @@ e2e-mini-chat:
 
 UC_E2E_FEATURES = usage-collector,static-tenants,static-authn,static-authz
 
-## Run usage-collector E2E tests against TimescaleDB (dedicated binary; Docker required)
+## Run usage-collector E2E tests against TimescaleDB (dedicated binary; Docker
+## required). This is the GENERATION 2 suite: the TimescaleDB plugin is V2-only.
 ## Shared UC_E2E_FEATURES plus this backend's storage plugin. The two plugins
 ## cannot share a binary: every linked gear is initialized, and both fail init
 ## without their own live database. Hence two builds, two runs.
 e2e-usage-collector-timescaledb: py-env
 	$(call print_target_banner)
 	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),timescaledb-usage-collector
-	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=timescaledb \
-		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)
+	E2E_BINARY=target/debug/cf-gears-example-server \
+		$(PYTHON) -m pytest testing/e2e/suites/usage_collector_v2/ -vv $(E2E_TARGET)
 
 ## Run usage-collector E2E tests against ClickHouse
 ## (dedicated binary + ClickHouse container; Docker required)
@@ -1557,7 +1589,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-oagw-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-mirror-pg test-usage-collector-ch test-types-registry-db test-oagw-db lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set

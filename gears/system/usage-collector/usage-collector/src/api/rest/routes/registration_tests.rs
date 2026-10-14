@@ -1,9 +1,7 @@
 //! Wiring test for [`super::register_routes`].
 //!
-//! [`super::register_api_routes`] is pinned by
-//! [`super::openapi_contract_tests`], which deliberately supplies no
-//! `Service`. What `register_routes` adds on top is the single
-//! `Extension<Arc<Service>>` layer every handler extracts — and no
+//! What `register_routes` adds over [`super::register_api_routes`] is the
+//! single `Extension<Arc<Service>>` layer every handler extracts — and no
 //! registry-shaped assertion can observe it, because the layer changes
 //! nothing about the registered `OperationSpec`s.
 //!

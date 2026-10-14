@@ -32,6 +32,10 @@ toolkit-odata = { workspace = true }
 tokio-util = { workspace = true }
 
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
+
+# ISO 8601 duration parsing for the declared `retention` trait.
+toolkit-utils = { workspace = true }
 
 sqlx = { workspace = true, features = [
   "postgres",
@@ -70,10 +74,19 @@ anyhow = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` for `#[tokio::test(start_paused = true)]` / `tokio::time::advance`,
+# used by the retention-source timeout test to simulate a hung registry call
+# without a real delay.
+tokio = { workspace = true, features = ["test-util"] }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="postgres")]-gated.
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 # In-memory metric reader for the metrics-recording unit tests; the `testing`
 # feature gates `InMemoryMetricExporter`.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `MockTypesRegistryClient` for the retention-source unit tests.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# `CanonicalError`, named by the `TypesRegistryClient` trait's own method
+# signatures, which the retention-source timeout test's `SlowRegistry` fake
+# must implement in full.
+toolkit-canonical-errors = { workspace = true }

@@ -1009,8 +1009,7 @@ pub struct AggregationResult {
 /// list path. The storage plugin MUST bound its own result (e.g. append
 /// `LIMIT MAX_AGGREGATION_BUCKETS + 1`) so an over-cap query cannot blow up
 /// plugin memory; the gateway rejects a result exceeding this cap with a `400`
-/// ([`crate::reason::AGGREGATION_RESULT_TOO_LARGE`]). Declared on the wire as the
-/// `AggregatedQueryResult.buckets` `maxItems` in `usage-collector-v1.yaml`.
+/// ([`crate::reason::AGGREGATION_RESULT_TOO_LARGE`]).
 pub const MAX_AGGREGATION_BUCKETS: usize = 100_000;
 
 // ---------------------------------------------------------------------------

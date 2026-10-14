@@ -37,6 +37,12 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# `ReconciliationMetadata.quantity_summary` is a `BigDecimal`, and the
+# reconciliation answer under a fold over an empty selection is a defined
+# zero rather than an absent value. The SDK now re-exports the type as
+# `usage_collector_sdk::bigdecimal`; reach it there and drop this dependency.
+bigdecimal = { workspace = true }
+
 # Identifiers
 uuid = { workspace = true }
 

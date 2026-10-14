@@ -558,6 +558,15 @@ gears:
       # dev only
       finalize_internal_secret: "dev-file-storage-internal-secret"
 
+  usage-collector:
+    # The declaration mirror's table. SQLite for E2E, like the other gears;
+    # the migration uses sea-query's Table::create() and runs on either
+    # backend. Generation 2 calls db_required(), so this block is mandatory
+    # wherever the gear is compiled in.
+    database:
+      server: "sqlite_users"
+      file: "usage_collector.db"
+
   oagw:
     config:
       proxy_timeout_secs: 2

@@ -424,6 +424,31 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-usage-collector-ch
 
+      # The usage-collector gear's generation-2 surface is behind a `v2` cargo
+      # feature, and `GEAR_FEATURES` appeared nowhere in this directory: both
+      # `make test-no-macros` and the coverage job's first pass are `--workspace`
+      # at default features, while `make clippy`/`make check` pass
+      # `--all-features` and so compile and lint the gated code without
+      # executing any of it. Unrun as a result: all of `src/v2/module_tests.rs`
+      # (attached by `#[path]` from the gated `crate::v2::module`, hence gated as
+      # a unit) — every coexistence test, including the one that found the
+      # OpenAPI component-name collision that panics the gear at boot — plus
+      # `src/v2/gts/permissions_tests.rs` and `src/v2/gts/usage_record_tests.rs`.
+      - name: Test usage-collector gear with the v2 surface
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test GEAR=usage-collector GEAR_FEATURES=v2
+
+      # The usage-collector gear's own declaration-mirror Postgres tier. The
+      # `test-usage-collector-pg` step above names only the TimescaleDB *plugin*
+      # package, so until this step existed `tests/postgres_declaration_mirror.rs`
+      # — the only execution anywhere of the mirror's DDL and its one
+      # `ON CONFLICT DO UPDATE` on Postgres, the engine production binds —
+      # compiled on every run and ran in no job, the same state the pricing and
+      # products comments below record.
+      - name: Test usage-collector declaration mirror with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-usage-collector-mirror-pg
+
       - name: Test postgres-cluster-plugin (pg integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-cluster-pg

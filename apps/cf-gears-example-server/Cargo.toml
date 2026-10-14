@@ -51,7 +51,7 @@ bss-rate-provider = [
     "dep:bss_rate_provider_http_json_plugin",
 ]
 bss-ledger = ["dep:bss_ledger"]
-usage-collector = ["dep:usage_collector"]
+usage-collector = ["dep:usage_collector", "usage_collector/v2"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
 clickhouse-usage-collector = ["dep:clickhouse_usage_collector_plugin"]
 # Quota Enforcement gear, its storage plugin, and the platform cluster gear it
