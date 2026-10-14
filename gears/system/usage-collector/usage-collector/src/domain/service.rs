@@ -55,8 +55,7 @@ use super::error::DomainError;
 /// invocation, enforced at the SDK-facing service entry per
 /// `cpt-cf-usage-collector-dod-usage-emission-nfr-batch-and-report-timing`.
 /// The REST handler is a thin wrapper over this entry, so the cap is the
-/// same on both surfaces; `usage-collector-v1.yaml` documents it as
-/// `CreateUsageRecordsRequest.records.maxItems` on the wire.
+/// same on both surfaces.
 pub const MAX_BATCH_RECORDS: usize = 100;
 
 /// Concurrency cap for the per-distinct-attribution-tuple PDP fan-out in

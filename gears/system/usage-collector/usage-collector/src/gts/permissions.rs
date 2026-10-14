@@ -136,6 +136,9 @@ mod tests {
                         seg.vendor() == UC_VENDOR
                             && seg.package() == UC_PACKAGE
                             && seg.namespace() == UC_NAMESPACE
+                            // Generation 2 registers `cf.core.uc.usage_record_*.v2` into the same
+                            // inventory; this catalog is generation 1's, so select only `.v1`.
+                            && seg.ver_major_opt() == Some(1)
                     })
             })
             .collect()

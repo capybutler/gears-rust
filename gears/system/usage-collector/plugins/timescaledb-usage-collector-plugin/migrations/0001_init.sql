@@ -1,48 +1,259 @@
 -- TimescaleDB Usage Collector storage backend — base schema.
+--
+-- One ledger table plus the small keyed tables it needs: per-type partitioning
+-- keys and per-type feed retention marks.
+-- There is no usage-type catalog: declarations live in types-registry and the
+-- storage SPI never sees one (the gear's DESIGN §3.7).
+--
+-- This plugin's own DESIGN §3.7 states the target schema, and the ledger's
+-- columns, its indexes and the set of tables here are now that schema rather
+-- than trailing it. `migration_probe` parses this file so the crate's column
+-- constants are checked against it, and `schema_integration_pg` reads the live
+-- table and every index back; neither compares this file to §3.7, so that
+-- sentence is a statement about the last schema pass and not a tested invariant.
+--
+-- This file replaces the schema that preceded it and that schema's rename
+-- migration outright rather than migrating from them. Neither survives in this
+-- directory, and neither does the additive `gts_type_uuid` migration that
+-- briefly sat beside this one: the column it added is declared here instead.
+-- The gear is unreleased, so no deployment holds rows worth a migration path.
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
-CREATE TABLE IF NOT EXISTS usage_type_catalog (
-    gts_id          text PRIMARY KEY,
-    kind            text NOT NULL CHECK (kind IN ('counter', 'gauge')),
-    metadata_fields text[] NOT NULL DEFAULT '{}'
-);
+-- The entry kind, as a 4-byte enum rather than a variable-length string (this
+-- plugin's DESIGN §3.7). `CREATE TYPE` has no `IF NOT EXISTS`, and every
+-- statement in this file must be re-runnable, so the duplicate is swallowed.
+DO $$
+BEGIN
+    CREATE TYPE usage_entry_type AS ENUM ('record', 'invalidation');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS usage_records (
-    uuid            uuid        NOT NULL,
-    tenant_id       uuid        NOT NULL,
-    gts_id          text        NOT NULL,
-    value           numeric     NOT NULL,
-    created_at      timestamptz NOT NULL,
-    resource_id     text        NOT NULL,
-    resource_type   text        NOT NULL,
-    subject_id      text,
-    subject_type    text,
-    idempotency_key text        NOT NULL,
-    corrects_id     uuid,
-    status          text        NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
-    metadata        jsonb       NOT NULL DEFAULT '{}'::jsonb,
-    ingested_at     timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (uuid, created_at),
-    -- Dedup authority: `INSERT … ON CONFLICT (tenant_id, gts_id, idempotency_key,
-    -- created_at) DO NOTHING` serializes concurrent same-key ingest and decides
-    -- insert-vs-absorb-vs-conflict (record_store.rs). A hypertable UNIQUE must
-    -- include the partition column (`created_at`), so the dedup identity is the
-    -- 4-tuple `(tenant_id, gts_id, idempotency_key, created_at)` — the canonical
-    -- dedup key per ADR-0014, not a divergence from the SPI. The plugin's
-    -- remaining divergence is retention-bounded key preservation (the key
-    -- becomes reusable once its chunk is dropped, vs. the SPI's permanent
-    -- preservation); see DESIGN.md §2.2.
+    -- Deterministic gateway-derived entry identity: UUIDv5 over the 6-tuple
+    -- dedup identity (cpt-cf-usage-collector-adr-record-identity-derivation).
+    -- `entry_type` is its sixth input, and the only one a withdrawal does not
+    -- share with the entry it withdraws.
+    id                  uuid        NOT NULL,
+    tenant_id           uuid        NOT NULL,
+    -- The meter's `types-registry` Registry Reference, and the only meter
+    -- identity this ledger stores (`cpt-cf-types-registry-adr-storage-identity-query-model`).
+    -- The GTS identifier is diagnostic on `MeterRef` and is deliberately not
+    -- persisted: the Plugin SPI carries the reference in both directions, and
+    -- a stored identifier would be a second spelling of one fact that nothing
+    -- keeps in step with the registry.
+    gts_type_uuid       uuid        NOT NULL,
+    -- The plugin-internal integer key of `gts_type_uuid`, assigned once per
+    -- type from `usage_type_key` below. It is the hypertable's second
+    -- partitioning dimension, so a chunk holds a slice of types and the
+    -- retention sweep can drop it by the retention of the types in it. It is
+    -- not a declared attribute (cpt-cf-usage-collector-adr-declaration-rehydration
+    -- statement 6): it names the type, and a type's key never changes.
+    type_key            int         NOT NULL,
+    -- `numeric` with no precision or scale modifier, so the submitted digits and
+    -- scale survive the store unchanged and nothing rounds, scales or truncates
+    -- a stored quantity.
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-quantity-round-trip:p1
+    quantity            numeric     NOT NULL,
+    -- The covered period [window_start, window_end). The only emitter-supplied
+    -- time attribution. The time-range predicate reads the end alone
+    -- (cpt-cf-usage-collector-adr-window-end-selection), which is why the end
+    -- is the hypertable partition column.
+    window_start        timestamptz NOT NULL,
+    window_end          timestamptz NOT NULL,
+    resource_id         text        NOT NULL,
+    resource_type       text        NOT NULL,
+    subject_id          text,
+    subject_type        text,
+    idempotency_key     text        NOT NULL,
+    -- The append-only invalidation pair. An invalidation entry names the entry
+    -- it withdraws and carries a reason; an ordinary measurement carries
+    -- neither (cpt-cf-usage-collector-adr-append-only-invalidation).
+    invalidates         uuid,
+    reason_code         text,
+    origin              text        NOT NULL
+        CONSTRAINT usage_records_origin_valid
+        CHECK (origin IN ('live', 'backfill')),
+    -- The entry's declared kind, written from the dispatched entry and never
+    -- derived from another column (this plugin's DESIGN §3.7). It is the sixth
+    -- input to the derived identity and a column of the dedup UNIQUE below: a
+    -- withdrawal repeats its target's tenant, type, idempotency key and covered
+    -- period, so a constraint over the first five alone would make every
+    -- invalidation a collision with the entry it withdraws.
+    --
+    -- `$filter=entry_type eq 'invalidation'` compares against it directly, the
+    -- literal casting to the enum.
+    entry_type          usage_entry_type NOT NULL,
+    -- Gear-assigned acceptance instant, stamped by the Ingestion Gateway and
+    -- written as given. An absorbed retry returns this stored value. It is also
+    -- the `LATEST` fold's second key (the gear's DESIGN §3.1), which is why
+    -- `usage_records_watermark_idx` below is not the only read that reaches it.
+    --
+    -- `xact_id` below is declared between this column and `metadata`, and it is
+    -- the one column in neither `INSERT_COLUMNS` (`record_store.rs`) nor the
+    -- binds: that constant is this declaration order with `xact_id` dropped out
+    -- of it — which still leaves `metadata` last, where the batch insert needs
+    -- it (see the constant's doc).
+    accepted_at         timestamptz NOT NULL,
+    -- The inserting transaction's id, and the feed order's first key
+    -- (this plugin's DESIGN §3.6 `cpt-cf-uc-plugin-seq-feed-page`). Stamped by
+    -- this default and never bound by the Record Store, which is what makes
+    -- every entry of one batch share one value and what lets a page read a
+    -- settled horizon off `pg_snapshot_xmin` rather than off anything the
+    -- plugin computes.
+    --
+    -- `xid8` rather than `xid`: `xid8` is 64-bit and totally ordered, where
+    -- `xid` wraps around and compares only modulo 2^32.
+    xact_id             xid8        NOT NULL DEFAULT pg_current_xact_id(),
+    metadata            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+
+    -- A hypertable's PRIMARY KEY and every UNIQUE must contain every partition
+    -- column, so both carry `window_end` and `type_key`. `type_key` is a
+    -- function of `gts_type_uuid`, so adding it separates no two rows either
+    -- key would otherwise join.
+    --
+    -- This carries the same identity class as the dedup UNIQUE below: `id` is
+    -- a UUIDv5 over the identifier-keyed 6-tuple and that constraint carries
+    -- the reference instead, so the two now meet through the
+    -- identifier-to-reference bridge rather than through the derivation. How
+    -- far that bridge carries is the paragraph below. It is kept as defense in
+    -- depth: while the derivation is correct the two are redundant, and a
+    -- defect in it cannot then produce two rows for one identity.
+    PRIMARY KEY (id, window_end, type_key),
+
+    -- The gear's DESIGN §3.7 dedup obligation, over the §3.1 6-tuple with the
+    -- type component expressed as its registry reference, plus the partition
+    -- key the hypertable requires (see the PRIMARY KEY above).
+    --
+    -- The gateway derives each entry `id` as a UUIDv5 over the 6-tuple naming
+    -- the *identifier*, and keeps doing so. The two partition rows into the
+    -- same identity classes wherever an identifier and its registry reference
+    -- are one-to-one, which types-registry ADR-0001 guarantees for the managed
+    -- identifier profile and not beyond it: a managed identifier may not carry
+    -- an explicit UUID tail and managed storage rejects a colliding derivation
+    -- at admission, but an external registry source may serve two identifiers
+    -- embedding one tail, and ADR-0001 accepts that residual because nothing
+    -- detects it centrally. Where that map is many-to-one the classes here are
+    -- unions of the identifier-keyed ones -- a coarser partition, and so a
+    -- strictly stronger constraint, because it can only refuse more. This one
+    -- is therefore at least as strong as the identifier-keyed constraint it
+    -- replaces, and exactly as strong under the managed profile. It is no
+    -- longer the same columns, which is why this no longer says "verbatim".
+    --
+    -- `entry_type` has to be in it. A withdrawal repeats its target's tenant,
+    -- type, idempotency key and covered period, so a constraint over the first
+    -- five alone would make every invalidation a collision with the very entry
+    -- it withdraws.
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-dedup-identity-enforcement:p1
+    -- @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-identity-derivation:p1
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-at-most-one-withdrawal:p1
     CONSTRAINT usage_records_dedup_uniq
-        UNIQUE (tenant_id, gts_id, idempotency_key, created_at),
-    CONSTRAINT usage_records_gts_id_fk
-        FOREIGN KEY (gts_id) REFERENCES usage_type_catalog (gts_id) ON DELETE RESTRICT
+        UNIQUE (tenant_id, gts_type_uuid, idempotency_key, window_start, window_end, entry_type, type_key),
+
+    -- A point event is window_start == window_end; a period is strictly
+    -- ordered. Nothing admits window_end < window_start.
+    CONSTRAINT usage_records_window_ordered
+        CHECK (window_start <= window_end),
+
+    -- The declared kind and the withdrawal pair must agree. An invalidation
+    -- names a target and carries a reason; an ordinary measurement carries
+    -- neither. Under the retired generated column this held by construction,
+    -- because the kind *was* a function of `invalidates`. Written, the two can
+    -- disagree, and this is what refuses it.
+    -- @cpt-algo:cpt-cf-uc-plugin-algo-withdrawal-pairing-enforcement:p1
+    -- @cpt-dod:cpt-cf-uc-plugin-dod-withdrawal-pairing-rule:p1
+    CONSTRAINT usage_records_invalidation_pairing
+        CHECK (
+            (entry_type = 'record'
+                AND invalidates IS NULL AND reason_code IS NULL)
+            OR (entry_type = 'invalidation'
+                AND invalidates IS NOT NULL AND reason_code IS NOT NULL)
+        ),
+
+    -- `SubjectRef` makes `subject_id` required and `subject_type` optional
+    -- (models.rs), so a type without an id is unrepresentable upstream. Pinned
+    -- here for the same reason as the invalidation pair above: the ledger
+    -- should not accept a shape the model cannot describe.
+    CONSTRAINT usage_records_subject_pairing
+        CHECK (subject_type IS NULL OR subject_id IS NOT NULL)
 );
 
-SELECT create_hypertable('usage_records', 'created_at', if_not_exists => TRUE);
+-- Partitioned on the covered-period end, then on the per-type key. The key's
+-- slice width and the time interval are configuration, applied at startup to
+-- chunks created afterwards (`pool::apply_post_migration_setup`).
+SELECT create_hypertable('usage_records', by_range('window_end'), if_not_exists => TRUE);
+SELECT add_dimension('usage_records', by_range('type_key', 1), if_not_exists => TRUE);
 
-CREATE INDEX IF NOT EXISTS usage_records_tenant_gts_time_idx
-    ON usage_records (tenant_id, gts_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS usage_records_tenant_time_idx
-    ON usage_records (tenant_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS usage_records_corrects_id_idx
-    ON usage_records (corrects_id) WHERE corrects_id IS NOT NULL;
+-- Lookup index for the fold's second withdrawal-exclusion obligation: "is this
+-- entry named by an accepted invalidation?" `invalidates` leads it under
+-- exactly that partial predicate. It is not a rule. At most one invalidation
+-- per entry follows from the shared identity: every withdrawal of one entry
+-- repeats that entry's five shared components and carries
+-- `entry_type = invalidation`, so all of them land on one identity and a
+-- second withdrawal is an ordinary collision on `usage_records_dedup_uniq`
+-- (the gear's DESIGN §3.1 "At most one invalidation").
+-- `window_end` and `type_key` are carried because an invalidation copies both
+-- from its target, so a lookup by target can prune chunks on them.
+CREATE INDEX IF NOT EXISTS usage_records_invalidates_idx
+    ON usage_records (invalidates, window_end, type_key)
+    WHERE invalidates IS NOT NULL;
+
+-- Feed order, per this plugin's DESIGN §3.7. The subscription selects on
+-- `gts_type_uuid`, the order is `(xact_id, id)` beneath it, and the compiled
+-- scope is applied as a filter on the index-ordered merge rather than as a
+-- leading key (§4.1 item 7). The retention sweep reads each type's highest
+-- position in a chunk off this same index.
+CREATE INDEX IF NOT EXISTS usage_records_feed_idx
+    ON usage_records (gts_type_uuid, xact_id, id);
+
+-- The reconciliation acceptance watermark, `MAX(accepted_at)` per
+-- (gts_type_uuid, tenant_id) and unbounded by any range, per this plugin's
+-- DESIGN §3.6 `cpt-cf-uc-plugin-seq-reconciliation`. No other index in these
+-- migrations reaches `accepted_at`, which is stamped upstream by the Ingestion
+-- Gateway rather than assigned here.
+CREATE INDEX IF NOT EXISTS usage_records_watermark_idx
+    ON usage_records (gts_type_uuid, tenant_id, accepted_at DESC);
+
+-- Per-GTS-type-reference feed retention marks.
+--
+-- One row per GTS type that has lost an entry to retention, holding the highest
+-- feed position among the entries of that type retention has deleted. A feed
+-- page refuses a position a mark stands above (this plugin's DESIGN §3.6,
+-- Retention refusal).
+--
+-- Created empty in slice 2. The retention sweep raises a mark into it in the
+-- transaction that drops a chunk (`retention_sweep::drop_chunk_and_rollup_rows`),
+-- and `read_feed_page` refuses a position a mark stands above.
+CREATE TABLE IF NOT EXISTS usage_feed_retention_marks (
+    gts_type_uuid uuid NOT NULL PRIMARY KEY,
+    xact_id       xid8 NOT NULL,
+    id            uuid NOT NULL
+);
+
+-- Per-GTS-type-reference partitioning keys.
+--
+-- One row per GTS type this plugin has written, mapping the type's registry
+-- reference to a small integer the hypertable can partition on (`by_range`
+-- refuses a non-integer column). It stores no declared attribute and nothing
+-- references it; it is not a type catalog. A key is assigned by the first write
+-- of its type and never changes, which is what lets it sit inside the ledger's
+-- unique constraints.
+CREATE TABLE IF NOT EXISTS usage_type_key (
+    gts_type_uuid uuid NOT NULL PRIMARY KEY,
+    type_key      int  GENERATED ALWAYS AS IDENTITY UNIQUE
+);
+
+-- Time-windowed reads, per this plugin's DESIGN §3.7, which declares both of
+-- these over exactly these columns. Read paths select on the period end, within
+-- a (tenant, meter) scope or across one tenant's meters.
+--
+-- No tie-break column trails either of them: the `LATEST` fold breaks a
+-- `window_end` tie on `accepted_at` and then on `id` (the gear's DESIGN §3.1),
+-- and neither is a leading key here. The fold is an ordered pick over the rows
+-- a scope-and-range predicate already selected, so the tie-break keys are read
+-- off those rows rather than sought through an index.
+CREATE INDEX IF NOT EXISTS usage_records_tenant_type_window_idx
+    ON usage_records (tenant_id, gts_type_uuid, window_end DESC);
+CREATE INDEX IF NOT EXISTS usage_records_tenant_window_idx
+    ON usage_records (tenant_id, window_end DESC);

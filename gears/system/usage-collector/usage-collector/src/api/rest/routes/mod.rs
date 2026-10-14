@@ -17,14 +17,11 @@ mod usage_types;
 /// Compose every per-resource registrar onto `router`.
 ///
 /// Split out of [`register_routes`] because it is the whole REST surface
-/// minus the one thing a contract check cannot supply — the
+/// minus the one thing a test cannot supply — the
 /// `Extension<Arc<Service>>` layer the handlers need at request time.
-/// `openapi_contract_tests` builds its registry through this function, so
-/// a registrar reaches production and the conformance check together and
-/// a registrar wired into only one of them cannot exist. Duplicating the
-/// composition in the test would leave that hole open: a third registrar
-/// added here and missing from the document would compare two incomplete
-/// views and stay green.
+/// `registration_tests` composes through this function, so a registrar
+/// reaches production and the test together and a registrar wired into
+/// only one of them cannot exist.
 fn register_api_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = usage_types::register_usage_type_routes(router, openapi);
     router = usage_records::register_usage_record_routes(router, openapi);
@@ -44,10 +41,6 @@ pub fn register_routes(
 ) -> Router {
     register_api_routes(router, openapi).layer(axum::Extension(service))
 }
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod openapi_contract_tests;
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

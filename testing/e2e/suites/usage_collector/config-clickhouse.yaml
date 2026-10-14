@@ -172,6 +172,14 @@ gears:
   # leave the gear with no storage plugin bound — a failure that would
   # otherwise surface only on the first dispatch, not at startup.
   usage-collector:
+    # The declaration mirror's table. SQLite for E2E, like the other gears;
+    # the migration uses sea-query's Table::create() and runs on either
+    # backend. Generation 2 calls db_required(), so this block is mandatory
+    # wherever the gear is compiled in — including this suite's binary, which
+    # carries generation 2 even though it exercises generation 1.
+    database:
+      server: "sqlite_uc_e2e"
+      file: "usage_collector.db"
     config:
       vendor: "constructorfabric"
 

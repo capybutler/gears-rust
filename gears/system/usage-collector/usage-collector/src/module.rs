@@ -6,8 +6,10 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
+use toolkit::contracts::DatabaseCapability;
 use toolkit::{Gear, GearCtx, RestApiCapability};
 use tracing::info;
 use usage_collector_sdk::UsageCollectorClientV1;
@@ -35,8 +37,11 @@ use crate::domain::{Service, UsageCollectorLocalClient};
 ///    consumers.
 ///
 /// Per ADR-0012 the durable `usage_type_catalog` and `usage_records` rows
-/// both live in the bound storage plugin's backend, so the gateway hosts no
-/// database of its own and declares no `db` capability.
+/// both live in the bound storage plugin's backend, so generation 1 hosts no
+/// database of its own. The `db` capability declared below is generation 2's:
+/// its one migration is the declaration mirror
+/// ([`crate::v2::infra::storage::declaration_mirror`]), and without the `v2`
+/// feature [`DatabaseCapability::migrations`] returns an empty set.
 ///
 /// The `UsageCollectorPluginSpecV1` schema itself reaches `types-registry`
 /// automatically via the `toolkit-gts` link-time inventory — no per-init
@@ -44,12 +49,16 @@ use crate::domain::{Service, UsageCollectorLocalClient};
 #[toolkit::gear(
     name = "usage-collector",
     deps = [types_registry, authz_resolver],
-    capabilities = [rest, stateful],
+    capabilities = [rest, db, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s")
 )]
 #[derive(Default)]
 pub struct UsageCollectorModule {
     service: OnceLock<Arc<Service>>,
+    /// Generation 2's wiring, when the `v2` feature is on. See
+    /// [`crate::v2::module::init_v2`].
+    #[cfg(feature = "v2")]
+    v2: OnceLock<crate::v2::module::V2Wiring>,
 }
 
 #[async_trait]
@@ -112,6 +121,15 @@ impl Gear for UsageCollectorModule {
         // 4. Register local client in ClientHub for in-process consumers.
         let api: Arc<dyn UsageCollectorClientV1> = Arc::new(UsageCollectorLocalClient::new(svc));
         ctx.client_hub().register::<dyn UsageCollectorClientV1>(api);
+
+        // 5. Generation 2's bootstrap, when compiled in. It reads the same
+        //    `[usage-collector]` section itself (see
+        //    `crate::v2::module::init_v2`), so nothing above needs to survive
+        //    this call — `cfg.vendor` has already moved into `Service::new`.
+        #[cfg(feature = "v2")]
+        self.v2.set(crate::v2::module::init_v2(ctx)?).map_err(|_| {
+            anyhow::anyhow!("{} generation 2 already initialized", Self::MODULE_NAME)
+        })?;
 
         Ok(())
     }
@@ -182,6 +200,22 @@ impl UsageCollectorModule {
     // @cpt-end:cpt-cf-usage-collector-flow-foundation-plugin-host-binding:p1:inst-serve-usage-types-gauge-refresh
 }
 
+impl DatabaseCapability for UsageCollectorModule {
+    /// The declaration mirror of the reworked design — one table, owned by
+    /// generation 2. Generation 1 contributes no migration, so a build without
+    /// the `v2` feature returns an empty set and the runtime skips the gear.
+    fn migrations(&self) -> Vec<Box<dyn MigrationTrait>> {
+        #[cfg(feature = "v2")]
+        {
+            crate::v2::infra::storage::declaration_mirror::migrations()
+        }
+        #[cfg(not(feature = "v2"))]
+        {
+            Vec::new()
+        }
+    }
+}
+
 impl RestApiCapability for UsageCollectorModule {
     /// Mount the FOUNDATION REST surface onto the runtime router.
     ///
@@ -221,6 +255,18 @@ impl RestApiCapability for UsageCollectorModule {
         })?;
 
         let router = rest_routes::register_routes(router, openapi, service);
+
+        // Generation 2's surface mounts onto the same router. `Router::route`
+        // panics on a duplicate path+method, so a generation-2 route left at
+        // `/usage-collector/v1/` would fail here at boot — pinned by
+        // `crate::v2::module::module_tests`.
+        #[cfg(feature = "v2")]
+        let router = {
+            let v2 = self.v2.get().ok_or_else(|| {
+                anyhow::anyhow!("{} generation 2 Service not initialized", Self::MODULE_NAME)
+            })?;
+            crate::v2::api::rest::routes::register_routes(router, openapi, Arc::clone(&v2.service))
+        };
 
         info!(module = Self::MODULE_NAME, "REST surface registered");
         Ok(router)

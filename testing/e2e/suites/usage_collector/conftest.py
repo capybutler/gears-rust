@@ -28,7 +28,7 @@ import httpx
 import pytest
 
 from lib.orchestrator import GearTestEnv
-from lib.sidecars import ClickHouseSidecar, TimescaleDbSidecar, skip_without_docker
+from lib.sidecars import ClickHouseSidecar, skip_without_docker
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -37,13 +37,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 # Per-backend wiring: config file, sidecar class, the DSN port placeholder that
 # config carries, and the plugin crate to raise to debug logging.
+#
+# ClickHouse only. The TimescaleDB plugin moved to the V2 Plugin SPI and no
+# longer implements V1, so it cannot serve this (generation-1) suite; the
+# generation-2 suite at ../usage_collector_v2/ exercises it instead.
 BACKENDS = {
-    "timescaledb": {
-        "config": "config.yaml",
-        "sidecar": TimescaleDbSidecar,
-        "placeholder": "__E2E_TS_PORT__",
-        "log_crate": "cf_gears_timescaledb_usage_collector_plugin",
-    },
     "clickhouse": {
         "config": "config-clickhouse.yaml",
         "sidecar": ClickHouseSidecar,
@@ -52,9 +50,7 @@ BACKENDS = {
     },
 }
 
-# Defaults to timescaledb so a bare `pytest testing/e2e/suites/usage_collector/`
-# behaves as it always has; the Makefile sets this explicitly for each run.
-BACKEND = os.environ.get("UC_E2E_BACKEND", "timescaledb")
+BACKEND = os.environ.get("UC_E2E_BACKEND", "clickhouse")
 if BACKEND not in BACKENDS:
     raise RuntimeError(
         f"UC_E2E_BACKEND={BACKEND!r} is not one of {sorted(BACKENDS)}"

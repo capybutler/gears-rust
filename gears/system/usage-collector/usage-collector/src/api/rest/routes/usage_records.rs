@@ -58,8 +58,9 @@ pub(super) fn register_usage_record_routes(
     //
     // The choice is therefore between declaring `$top` by hand and leaving
     // an accepted parameter out of the published document. Declaring it
-    // wins: an endpoint that honours a page-size spelling and does not
-    // document it is the drift `openapi_contract_tests` exists to stop.
+    // wins: an endpoint that honours a page-size spelling and leaves it
+    // out of the registry is drift between what callers may send and what
+    // the emitted document declares.
     // The `let` binding exists only to carry the attribute: attributes on
     // expressions are unstable, and putting this on the function would
     // exempt the other four routes registered here too. Drop both once

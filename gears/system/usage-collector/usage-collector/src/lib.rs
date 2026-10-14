@@ -23,3 +23,7 @@ pub mod domain;
 pub(crate) mod gts;
 pub mod infra;
 pub mod module;
+
+/// Generation 2 of the gateway — the reworked metering surface. See [`v2`]'s
+/// own module documentation.
+pub mod v2;

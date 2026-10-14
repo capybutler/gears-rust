@@ -457,7 +457,7 @@ test-eb-kafka: install-tools
 # The tables use `=` so a `$$` in a filter reaches the shell as `$`.
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
-INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
+INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-mirror-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
 
@@ -482,6 +482,35 @@ lane_args_users-info-pg = -p users-info --features integration
 ## TimescaleDB usage-collector plugin integration tests (Docker required;
 ## the suite spins up its own timescale/timescaledb container via testcontainers)
 lane_args_usage-collector-pg = -p cf-gears-timescaledb-usage-collector-plugin --features postgres
+
+## The usage-collector GEAR's declaration-mirror Postgres tier (Docker
+## required; the suite spins up its own postgres container via testcontainers).
+##
+## Separate from the usage-collector-pg lane above, which names only the
+## *TimescaleDB plugin* package. `tests/postgres_declaration_mirror.rs` lives in
+## `cf-gears-usage-collector` itself and no lane or CI step ever named that
+## package with `--run-ignored`, so from the day it was written the file
+## compiled on every run and executed on none — the third instance of this exact
+## failure recorded in this file, after the pricing-pg lane (2026-08-11) and the
+## products-pg lane (2026-08-30). Same `--run-ignored ignored-only` shape as
+## those two, and the same reason: the gate is `#[ignore = "requires Docker
+## (testcontainers)"]` rather than a feature, so `--features` cannot reach it.
+##
+## What lives here and nowhere else: the declaration mirror's DDL and its one
+## `ON CONFLICT DO UPDATE` on the engine a production deployment actually binds.
+## The adapter's in-crate tests run `sqlite::memory:` and the e2e suite binds
+## `engine: "sqlite"`, so without this lane a Postgres deployment is the first
+## execution of that migration and that upsert anywhere — and the `ON CONFLICT`
+## branch itself is unreachable on a fresh in-memory database used once per
+## test. The suite also reads `first_seen_at` / `last_seen_at` by raw SQL,
+## because `DeclarationMirror::read` returns the document alone and cannot
+## reach the set-once/move-on-write contract that is the table's whole design
+## claim.
+##
+## `--no-fail-fast` for the donors' reason: a lane whose purpose is to be the
+## one place a Postgres-only defect surfaces must report every failure it
+## found, not the first.
+lane_args_usage-collector-mirror-pg = -p cf-gears-usage-collector --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
 
 ## ClickHouse usage-collector plugin integration tests (Docker required;
 ## every test gets its own database on one shared, named clickhouse container,
@@ -1031,6 +1060,12 @@ UC_E2E_FEATURES = usage-collector,static-tenants,static-authn,static-authz
 
 UC_E2E_BACKENDS := timescaledb clickhouse
 
+# The suite each backend runs. The TimescaleDB plugin is version-2-only, so it
+# runs the generation 2 suite; ClickHouse still speaks version 1 and runs the
+# generation 1 suite, which is ClickHouse-only.
+UC_E2E_SUITE_timescaledb := usage_collector_v2
+UC_E2E_SUITE_clickhouse := usage_collector
+
 HELP_PARAMS += SUITE E2E_TARGET BACKEND
 help.SUITE.usage := SUITE=<suite>
 help.SUITE.targets := e2e-local e2e-local-smoke
@@ -1053,7 +1088,7 @@ help.BACKEND.values = $(UC_E2E_BACKENDS)
 e2e-usage-collector: py-env
 	$(call print_target_banner)
 	$(if $(filter-out $(UC_E2E_BACKENDS),$(BACKEND)),$(error Unknown BACKEND '$(BACKEND)'. Use one of: $(UC_E2E_BACKENDS)))
-	$(foreach b,$(or $(BACKEND),$(UC_E2E_BACKENDS)),cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),$(b)-usage-collector$(newline)E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=$(b) $(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)$(newline))
+	$(foreach b,$(or $(BACKEND),$(UC_E2E_BACKENDS)),cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),$(b)-usage-collector$(newline)E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=$(b) $(PYTHON) -m pytest testing/e2e/suites/$(UC_E2E_SUITE_$(b))/ -vv $(E2E_TARGET)$(newline))
 
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
@@ -1430,7 +1465,7 @@ all: check test-integration e2e-local openapi
 
 # Integration lanes that `make all` and `make ci` run (target-specific LANE, see tests.mk).
 all: LANE = toolkit-db-sqlite
-ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db \
+ci: LANE = users-info-pg usage-collector-pg usage-collector-mirror-pg usage-collector-ch types-registry-db oagw-db \
 	oagw-cluster
 
 # Re-run setup when a make file changes.
