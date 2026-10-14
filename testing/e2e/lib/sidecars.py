@@ -51,7 +51,7 @@ REQUIRED_CONSECUTIVE_OK = 3
 # `e2e_sidecar_pins_the_same_timescaledb_image` fails the build if any of the three
 # drifts from its constant.
 TIMESCALEDB_IMAGE = "timescale/timescaledb"
-TIMESCALEDB_TAG = "2.29.2-pg18"
+TIMESCALEDB_TAG = "2.25.2-pg17"
 ENV_TIMESCALEDB_TAG = "GEARS_TEST_TIMESCALEDB_TAG"
 
 

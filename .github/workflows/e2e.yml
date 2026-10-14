@@ -292,13 +292,13 @@ jobs:
       # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.
       # Two steps, in the order `make e2e-usage-collector` runs them, because
       # that target runs pytest twice and each run needs its own JUnit file.
-      - name: Run usage-collector E2E tests (TimescaleDB container)
+      - name: Run usage-collector E2E tests (generation 2, TimescaleDB container)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-timescaledb.xml -o junit_suite_name=e2e-usage-collector-timescaledb"
         run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-timescaledb
 
-      - name: Run usage-collector E2E tests (ClickHouse container)
+      - name: Run usage-collector E2E tests (generation 1, ClickHouse container)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-clickhouse.xml -o junit_suite_name=e2e-usage-collector-clickhouse"

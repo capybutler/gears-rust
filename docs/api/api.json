@@ -247,8 +247,73 @@
         },
         "type": "object"
       },
+      "AggregationBucketV2Dto": {
+        "description": "Wire projection of [`usage_collector_sdk::v2::AggregationBucket`]. `value`\nis an arbitrary-precision `bigdecimal::BigDecimal` carried as a JSON\nstring via `usage_collector_sdk::serde_helpers::bigdecimal_str_option`\n(the same string-on-the-wire discipline as `UsageRecordDto.quantity`, but\nwithout `Decimal`'s magnitude ceiling); `None` materializes as `null`\nper the SDK contract for empty-set buckets.",
+        "properties": {
+          "key": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "value": {
+            "example": "79228162514264337593543950400",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AggregationDimensionDto": {
         "description": "Wire projection of [`usage_collector_sdk::AggregationDimension`]. The\nclosed dimensions are encoded as snake-case bare strings; the\n`metadata` form carries the declared key inline as\n`{\"metadata\": \"<key>\"}` to mirror the SDK's `Metadata(MetadataKey)`\nvariant under the same lowercased external tag. (The macro-applied\n`rename_all = \"snake_case\"` matches the SDK encoding here.)",
+        "oneOf": [
+          {
+            "enum": [
+              "tenant_id"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "resource_id"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "resource_type"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "subject_id"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "subject_type"
+            ],
+            "type": "string"
+          },
+          {
+            "properties": {
+              "metadata": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "metadata"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AggregationDimensionV2Dto": {
+        "description": "Wire projection of [`usage_collector_sdk::v2::AggregationDimension`]. The\nclosed dimensions are encoded as snake-case bare strings; the\n`metadata` form carries the declared key inline as\n`{\"metadata\": \"<key>\"}` to mirror the SDK's `Metadata(MetadataKey)`\nvariant under the same lowercased external tag. (The macro-applied\n`rename_all = \"snake_case\"` matches the SDK encoding here.)",
         "oneOf": [
           {
             "enum": [
@@ -304,12 +369,46 @@
         ],
         "type": "string"
       },
+      "AggregationRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /usage-collector/v2/records/aggregate`.\n\nNamed for the `AggregationRequest` component in\n`docs/usage-collector-v2.yaml`. It carries no `Dto` suffix: that suffix\nelsewhere in this module disambiguates a DTO from an SDK type of the same\nbare name, and there is no `AggregationRequest` in `usage_collector_sdk` to\ncollide with. It mirrors the component's field set exactly, with\n`additionalProperties: false` and `required: [time_range]`.\n\nThe typed `gts_type_id`, the `OData` `$filter`, and the `metadata.<key>`\nside-channel are query parameters instead (mirroring\n`GET /usage-collector/v2/records`), declared on the operation rather than\non this schema. There is no aggregation parameter: the fold is resolved\nfrom the queried type's declaration, so no request is well-formed and\nsemantically wrong.\n\nTraceability: the REST half of\n`cpt-cf-usage-collector-dod-no-aggregation-parameter` —\n`#[serde(deny_unknown_fields)]` below refuses a body naming a\nfold-selecting field as an unknown field.",
+        "properties": {
+          "group_by": {
+            "items": {
+              "$ref": "#/components/schemas/AggregationDimensionV2Dto"
+            },
+            "type": "array"
+          },
+          "time_range": {
+            "$ref": "#/components/schemas/TimeRangeDto"
+          }
+        },
+        "required": [
+          "time_range"
+        ],
+        "type": "object"
+      },
       "AggregationResultDto": {
         "description": "Aggregated-query response body. Mirrors\n[`usage_collector_sdk::AggregationResult`] — buckets are emitted in\nplugin-defined order and a no-grouping query yields a single bucket\nwith an empty `key`.",
         "properties": {
           "buckets": {
             "items": {
               "$ref": "#/components/schemas/AggregationBucketDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "buckets"
+        ],
+        "type": "object"
+      },
+      "AggregationResultV2Dto": {
+        "description": "Aggregated-query response body. Mirrors\n[`usage_collector_sdk::v2::AggregationResult`] — buckets are emitted in\nplugin-defined order and a no-grouping query yields a single bucket\nwith an empty `key`.",
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/AggregationBucketV2Dto"
             },
             "type": "array"
           }
@@ -3251,6 +3350,81 @@
         ],
         "type": "object"
       },
+      "CreateUsageRecordRequestV2": {
+        "additionalProperties": false,
+        "description": "Per-record create payload. Carries `gts_type_id` and `entry_type` as\npermissive `String`s so that a bad value is **attributed to the property\nit came from**: `decode_record_entry` reads the offending property out of\nserde's message, and `serde_field_name` recognises only ``unknown field\n`…` `` and ``missing field `…` ``. A typed field's own refusal says\n``unknown variant `correction` ``, which matches neither, so the violation\nwould land on `records` and leave the caller diffing a whole entry. Parsed\nat the fold point instead, the rejection names the offending property.\n\nIntentionally has no identity field: `id` is gateway-derived via\n`usage_collector_sdk::v2::derive_usage_record_id`.\n\n`deny_unknown_fields` is the schema's `additionalProperties: false`\n(`usage-collector-v2.yaml` `CreateUsageRecordRequestV2`): every\nserver-owned field — `id`, `accepted_at`, `origin` and `invalidates` —\nis rejected here as an unknown field rather than read and overridden.\n\n**Traceability.** The `invalidates` half of that sentence is step 1 of\n`cpt-cf-usage-collector-algo-withdrawal-linkage-stamping` (\"Reject the\nsubmission where the caller supplied a target linkage on the wire\"); the\nin-process surface refuses the same property through\n`usage_collector_sdk`'s own `deny_unknown_fields` codec, so neither admits\none. [`Self::entry_type`] is the caller-supplied, defaultless discriminator\n`cpt-cf-usage-collector-dod-explicit-entry-type` requires, shared by both\ningestion routes — the backfill route registers this same request shape.",
+        "properties": {
+          "entry_type": {
+            "description": "The kind this submission declares — `record` or `invalidation`.\nCaller-supplied, required, and with no default\n(`usage-collector-v2.yaml` `EntryType`; DESIGN §3.1, \"Entry type and\nreason code\").\n\n**Never inferred.** An invalidation is a faithful copy of its target\nand repeats its target's idempotency key, so a withdrawal stripped of\nits discriminator would derive its target's own identity and be\nabsorbed as a retry of it, withdrawing nothing. It is also an input to\nthe derived `id`, which is what keeps a withdrawal's identity apart\nfrom the identity of the entry it withdraws.\n\nCarried as a permissive `String` for the reason the struct doc gives.",
+            "type": "string"
+          },
+          "gts_type_id": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "The caller's key. Not an `Option`, because the schema lists it in\n`required` on **both** branches: a withdrawal repeats its target's key\nrather than deriving one of its own, and that repetition is what lets\nthe gateway find the target from the submission alone (DESIGN §3.1,\n\"Target resolution\"). No prefix is reserved.\n\nTyped rather than defaulted so the served schema says so too: omitting\nthe property decodes as ``missing field `idempotency_key` ``, which\n`serde_field_name` recognises. An explicit `null` decodes to a *type*\nerror naming no property at all, which is why\n`explicit_null_idempotency_key` runs ahead of the decode.",
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "quantity": {
+            "description": "The measured quantity as its wire text (a JSON string). Parsed into\n[`usage_collector_sdk::v2::UsageQuantity`] where the DTO is folded into the\ndomain type, so an out-of-range value rejects its own entry rather\nthan the whole batch.",
+            "type": "string"
+          },
+          "reason_code": {
+            "description": "Why the withdrawal was issued. Required when [`Self::entry_type`] is\n`invalidation` and MUST NOT appear on a `record` (DESIGN §3.1,\n\"Entry type and reason code\"). The two are caller-supplied halves of\none statement, and the SDK projection checks them against each other\nbefore anything else, reporting a disagreement as an\n`InvalidArgument` naming `reason_code`.\n\nIt carries no target: `invalidates` is server-assigned (DESIGN §3.1,\n\"Field ownership\") and a submitted one is refused as an unknown field,\nso an emitter cannot name a record it never measured.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_ref": {
+            "$ref": "#/components/schemas/ResourceRefV2Dto"
+          },
+          "subject_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubjectRefV2Dto"
+              }
+            ]
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "window_end": {
+            "description": "Exclusive end of the covered period (RFC 3339, offset mandatory).\nEqual bounds submit a point event.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_start": {
+            "description": "Inclusive start of the covered period this submission measures (RFC\n3339, offset mandatory).",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_type",
+          "gts_type_id",
+          "tenant_id",
+          "resource_ref",
+          "quantity",
+          "idempotency_key",
+          "window_start",
+          "window_end"
+        ],
+        "type": "object"
+      },
       "CreateUsageRecordResultDto": {
         "description": "Per-record outcome inside [`CreateUsageRecordsResponse`]. Externally\ntagged on `outcome` (snake-case via the `api_dto`-applied `rename_all`)\nso accepted and rejected records share a uniform envelope keyed by\ninput order. An accepted entry carries the persisted record body; a\nrejected entry carries the per-record canonical `Problem` body\nverbatim — the same envelope a single-record failure would surface,\nfolded into the batch response.",
         "oneOf": [
@@ -3302,6 +3476,57 @@
           }
         ]
       },
+      "CreateUsageRecordResultV2Dto": {
+        "description": "Per-record outcome inside [`CreateUsageRecordsResponse`]. Externally\ntagged on `outcome` (snake-case via the `api_dto`-applied `rename_all`)\nso accepted and rejected records share a uniform envelope keyed by\ninput order. An accepted entry carries the persisted record body; a\nrejected entry carries the per-record canonical `Problem` body\nverbatim — the same envelope a single-record failure would surface,\nfolded into the batch response.",
+        "oneOf": [
+          {
+            "properties": {
+              "index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "outcome": {
+                "enum": [
+                  "accepted"
+                ],
+                "type": "string"
+              },
+              "record": {
+                "$ref": "#/components/schemas/UsageRecordV2Dto"
+              }
+            },
+            "required": [
+              "index",
+              "record",
+              "outcome"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "error": {
+                "$ref": "#/components/schemas/Problem"
+              },
+              "index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "outcome": {
+                "enum": [
+                  "rejected"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "error",
+              "outcome"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CreateUsageRecordsRequest": {
         "additionalProperties": false,
         "description": "Batch create request body for `POST /usage-collector/v1/records`.",
@@ -3318,12 +3543,43 @@
         ],
         "type": "object"
       },
+      "CreateUsageRecordsRequestV2": {
+        "additionalProperties": false,
+        "description": "Batch create request body for `POST /usage-collector/v2/records`.\n\n`records` is decoded one entry at a time by the handler\n(`decode_record_entry`), after the batch-cap check, so one malformed\nentry rejects only its own index rather than the whole request. The\nschema still publishes the entry shape via `#[schema(value_type = ...)]`.",
+        "properties": {
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/CreateUsageRecordRequestV2"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "records"
+        ],
+        "type": "object"
+      },
       "CreateUsageRecordsResponse": {
         "description": "Batch create response body. `results` preserves input order; a partial\nfailure surfaces as HTTP `207 Multi-Status` with per-record `Rejected`\nentries (callers must inspect each `outcome`).",
         "properties": {
           "results": {
             "items": {
               "$ref": "#/components/schemas/CreateUsageRecordResultDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "type": "object"
+      },
+      "CreateUsageRecordsResponseV2": {
+        "description": "Batch create response body. `results` preserves input order; a partial\nfailure surfaces as HTTP `207 Multi-Status` with per-record `Rejected`\nentries (callers must inspect each `outcome`).",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/CreateUsageRecordResultV2Dto"
             },
             "type": "array"
           }
@@ -5293,6 +5549,25 @@
         "required": [
           "change",
           "effective"
+        ],
+        "type": "object"
+      },
+      "FeedPageDto": {
+        "description": "Wire-projection of [`usage_collector_sdk::v2::FeedPage<CursorV1>`]\n(`usage-collector-v2.yaml` `FeedPage`).\n\nNot [`toolkit_odata::Page`]: that type's array field is `items`, while the\npublished `FeedPage` schema names its array `entries` — a page of the usage\nfeed is a different resource from a raw-query result page (DESIGN §3.1).\n[`PageInfo`] is reused verbatim for `page_info`, so the only thing this\nprojection adds over the domain [`FeedPage`] is `limit`, which that type\ncarries nowhere. The contract fixes `prev_cursor` at `null` always — the\nfeed reads forward only (DESIGN §3.2) — which `try_from_feed_page`\nsatisfies by construction. (A plain code span rather than an intra-doc\nlink: that constructor is crate-private and this type is public.)",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRecordV2Dto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "entries",
+          "page_info"
         ],
         "type": "object"
       },
@@ -9644,6 +9919,24 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/UsageRecordDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_UsageRecordV2Dto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRecordV2Dto"
             },
             "type": "array"
           },
@@ -16419,6 +16712,88 @@
         ],
         "type": "object"
       },
+      "ReconciliationMetadataDto": {
+        "description": "`usage-collector-v2.yaml`'s `ReconciliationMetadata`.\n\nNot a page. `cpt-cf-usage-collector-dod-canonical-page-envelope` binds the\nlist-shaped read paths and deliberately does not reach this one, so there\nis no `PageInfo`, no cursor and no page size — the gear serves one scope\nper call and enumerates nothing.\n\nThe field is named `scope` because the yaml names it that. It is the\ntenant-and-GTS-type target these figures cover, unrelated to the\nreporting *granularity* the wire query parameter also spells `scope`, and\nunrelated again to the compiled PDP scope the gear calls `scope`\neverywhere else; `domain::reconciliation`'s module doc carries the\nwarning in full.",
+        "properties": {
+          "accepted_at_watermark": {
+            "description": "`null` when the scope holds no entries — **not omitted**: the yaml\nlists this property `required` on `ReconciliationMetadata`, so it\ncarries no `skip_serializing_if`, unlike every optional field\nelsewhere in this module. Rendered as RFC 3339 text rather than a\ntyped `OffsetDateTime` field, so the absent case is a plain\n`Option<String>` rather than needing `time::serde::rfc3339`'s\nseparate `Option`-flavoured module.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "accepted_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "quantity_summary": {
+            "description": "The branches of `quantity_summary`, as the yaml's `oneOf` declares them:\nexactly one is present, and which one is decided by the queried meter's\ndeclared fold rather than by anything the caller sent.\n\n`accrued_sum` and `latest_observation` are JSON **strings**, never numbers,\nso neither round-trips through a float on a billing surface.\n`latest_observation` carries no `skip_serializing_if`: the yaml requires\nthe property on every `Observations`-branch body and fixes it at `null`\nwhen the range selected nothing, so an absent field would be a different,\nundocumented shape.\n\n`utoipa::ToSchema`'s derive reads the `#[serde(untagged)]` representation\nattribute and emits the matching `oneOf` with no discriminant property. The\nyaml declares no standalone `QuantitySummary` component, so every field\nusing this type also carries `#[schema(inline)]`.",
+            "oneOf": [
+              {
+                "properties": {
+                  "accrued_sum": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "accrued_sum"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "latest_observation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "observation_count": {
+                    "format": "int64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "observation_count"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "scope": {
+            "description": "Wire-projection of the scope object `usage-collector-v2.yaml`'s\n`ReconciliationMetadata.scope` declares **inline** — tenant and GTS type,\nthe pair `domain::reconciliation::build_scope` derives from the request's\nown parameters. Built at the handler, not derived from the service's\nanswer: [`usage_collector_sdk::v2::ReconciliationMetadata`] carries no scope.\n\nThe yaml declares no standalone `ReconciliationScope` component, so every\nfield using this type carries `#[schema(inline)]`, which keeps `utoipa`\nfrom registering a document-level component with nothing on the contract\nside to match it.",
+            "properties": {
+              "gts_type_id": {
+                "type": "string"
+              },
+              "tenant_id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tenant_id",
+              "gts_type_id"
+            ],
+            "type": "object"
+          },
+          "window_end_watermark": {
+            "description": "`null` when the scope holds no entries — see\n[`Self::accepted_at_watermark`] for why this carries no\n`skip_serializing_if` either.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "scope",
+          "accepted_count",
+          "quantity_summary"
+        ],
+        "type": "object"
+      },
       "ReconciliationRunView": {
         "description": "One reconciliation-run row, projected for the read. PII-free (ids + variance).",
         "properties": {
@@ -17683,6 +18058,22 @@
       },
       "ResourceRefDto": {
         "description": "Wire-projection of [`usage_collector_sdk::ResourceRef`]. Mirrors the SDK\nshape verbatim; the SDK struct stays `utoipa`-free.",
+        "properties": {
+          "resource_id": {
+            "type": "string"
+          },
+          "resource_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_id",
+          "resource_type"
+        ],
+        "type": "object"
+      },
+      "ResourceRefV2Dto": {
+        "description": "Wire-projection of [`usage_collector_sdk::v2::ResourceRef`]. Mirrors the SDK\nshape verbatim; the SDK struct stays `utoipa`-free.",
         "properties": {
           "resource_id": {
             "type": "string"
@@ -19942,6 +20333,24 @@
         ],
         "type": "object"
       },
+      "SubjectRefV2Dto": {
+        "description": "Wire-projection of [`usage_collector_sdk::v2::SubjectRef`].",
+        "properties": {
+          "subject_id": {
+            "type": "string"
+          },
+          "subject_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "subject_id"
+        ],
+        "type": "object"
+      },
       "SubmitEntitiesRequest": {
         "additionalProperties": false,
         "description": "Entity submission envelope; `items` matches operation and page envelopes.",
@@ -20790,6 +21199,27 @@
         },
         "required": [
           "token_estimate"
+        ],
+        "type": "object"
+      },
+      "TimeRangeDto": {
+        "additionalProperties": false,
+        "description": "Wire projection of [`usage_collector_sdk::v2::TimeRange`] — the mandatory\nbounded range on the aggregate path (`AggregationRequest.time_range` in\n`docs/usage-collector-v2.yaml`). The raw path carries the same range as\nthe `from` / `to` query parameters instead, because a `GET` has no body.\n\nBoth bounds deserialize through `time::serde::rfc3339`, which rejects an\noffset-less timestamp: a bare local time would attribute usage to\nwhatever offset the server happened to assume.\n\n`Copy`, like the SDK [`TimeRange`] it projects onto — two plain\ntimestamps — so reading it out of a request body does not partially\nmove the body away from the group-by projection that follows.",
+        "properties": {
+          "from": {
+            "description": "Inclusive lower bound (RFC 3339, offset mandatory).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "to": {
+            "description": "Exclusive upper bound (RFC 3339, offset mandatory).",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
         ],
         "type": "object"
       },
@@ -21917,6 +22347,105 @@
           "idempotency_key",
           "status",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "UsageRecordV2Dto": {
+        "description": "Wire-projection of [`usage_collector_sdk::v2::UsageRecord`]. `gts_type_id`,\n`entry_type` and `origin` are flattened to `String` so the type can derive\n`utoipa::ToSchema` without pulling `utoipa` into the SDK crate — each is a\nclosed SDK enum whose wire form is already the lowercased variant name, so\nthe `String`s mirror an encoding that does exist. Both covered-period\nbounds are emitted as RFC 3339 to match the SDK wire shape.\n\n[`usage_collector_sdk::v2::UsageRecord`] stores `origin` as a field and carries\nno discriminator beside it, so this projection reads `entry_type` back\nthrough `UsageRecord::entry_type()`. That is a read-path projection and\nnothing more: on the ingestion shape the discriminator is caller-supplied\nand required ([`CreateUsageRecordRequest::entry_type`]), never inferred\n(DESIGN §3.1, \"Entry type and reason code\").\n\n**Traceability: the read-path half of\n`cpt-cf-usage-collector-dod-withdrawal-linkage` and the whole of\n`cpt-cf-usage-collector-flow-inspect-withdrawal-linkage`.** One shape\nserves every ledger read path the gear publishes, so [`Self::invalidates`],\n[`Self::reason_code`] and [`Self::entry_type`] reach a consumer on all of\nthem. The projection below copies `invalidation.target` through unchanged\nand derives nothing, so the linkage a consumer reads is the identifier the\ngateway stamped. The flow's error scenarios are properties of this shape\nrather than of any code: there is **no** reverse pointer from a withdrawn\nentry to its invalidation — a consumer holding the withdrawn entry derives\nthe invalidation's identifier from that entry's own fields\n(`cpt-cf-usage-collector-flow-reproduce-identity-offline`); there is **no**\nstatus field or lifecycle flag for a withdrawn entry to acquire, so it\nreads back exactly as accepted; and no route reverses an accepted\ninvalidation.",
+        "properties": {
+          "accepted_at": {
+            "description": "Gear-assigned instant of acceptance (RFC 3339). On an absorbed retry,\nthe stored entry's instant.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "entry_type": {
+            "description": "`record` or `invalidation`, **derived** from [`Self::invalidates`]\nrather than stored\n(`cpt-cf-usage-collector-adr-append-only-invalidation`): the SDK record\ncarries the withdrawal and its reason as one field and no discriminator\nbeside them. `required` on the OAS `UsageRecord`, so never omitted, and\n**not** `readOnly` — the ingestion shape declares an `entry_type` of its\nown, caller-supplied and required with no default\n([`CreateUsageRecordRequest::entry_type`]). Derived here, supplied\nthere.",
+            "type": "string"
+          },
+          "gts_type_id": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Mandatory caller-supplied idempotency key per\n`cpt-cf-usage-collector-dod-usage-emission-fr-idempotency`. Every\npersisted record carries a non-empty key.",
+            "type": "string"
+          },
+          "invalidates": {
+            "description": "The entry this one withdraws, absent on an ordinary measurement.\nBoth-or-neither with [`Self::reason_code`] — the SDK carries the\npair as one field, so a response can never show half of it.\n\n`readOnly` on the wire, and the one property on these two shapes that\ngenuinely is: the gateway derives it and stamps it (DESIGN §3.1,\n\"Field ownership\"), so it appears here and nowhere on the ingestion\nshape, which refuses a submitted one as an unknown field.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Closed-shape key/value map per the OAS `RecordMetadata` schema.\nOmitted from the wire when empty.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "origin": {
+            "description": "Which ingestion path admitted the entry — `live` or `backfill`.\nServer-assigned, `required` on the OAS `UsageRecord`, so it is never\nomitted. Flattened to `String` for the same reason as\n[`Self::gts_type_id`]: to keep `utoipa` out of the SDK crate.",
+            "type": "string"
+          },
+          "quantity": {
+            "description": "The persisted quantity as a JSON string, digit for digit as stored.",
+            "type": "string"
+          },
+          "reason_code": {
+            "description": "Why the withdrawal was issued. Absent on an ordinary measurement.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource_ref": {
+            "$ref": "#/components/schemas/ResourceRefV2Dto"
+          },
+          "subject_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubjectRefV2Dto"
+              }
+            ]
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "window_end": {
+            "description": "Exclusive end of the covered period — the bound the read paths\nselect on, via the mandatory `from` / `to` range\n(`cpt-cf-usage-collector-adr-window-end-selection`), and a key\nevery raw-path page order names.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_start": {
+            "description": "Inclusive start of the covered period the entry measures.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "gts_type_id",
+          "tenant_id",
+          "resource_ref",
+          "quantity",
+          "idempotency_key",
+          "accepted_at",
+          "origin",
+          "entry_type",
+          "window_start",
+          "window_end"
         ],
         "type": "object"
       },
@@ -68592,6 +69121,1215 @@
         "summary": "Get a usage type",
         "tags": [
           "Usage Types"
+        ]
+      }
+    },
+    "/usage-collector/v2/feed": {
+      "get": {
+        "description": "Replay-safe, snapshot-consistent, pull-based read path for charging consumers. A request carrying no `cursor` begins at the oldest position this subscription still serves, and no start begins at the head. The snapshot guarantee bounds what one scan observes once an entry is visible; it does not bound when that entry becomes visible. Consistency floor (DESIGN.md Section 3.10): after an ingestion call returns the persisted entry, that entry is durable. Under eventual dedup level, an acknowledged entry can still lose a race before convergence (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. A consumer depending on a tighter bound than this floor must record that dependency in its own design document, naming the plugin, the dimension, and the value; weakening a published bound is a breaking change for every coupled consumer, and the Plugin SPI publishes no runtime method for discovering a plugin's ceiling in v1.",
+        "operationId": "usage_collector.read_usage_feed",
+        "parameters": [
+          {
+            "description": "Subscription: the GTS types this consumer reads. Repeat for each type (1..100).",
+            "explode": true,
+            "in": "query",
+            "name": "gts_type_id",
+            "required": true,
+            "schema": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "style": "form"
+          },
+          {
+            "description": "Entries per page (1..1000, default 100); refused as `400` if repeated",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque continuation token this feed issued; refused as `400` if repeated",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A later feed cursor bounding a replay; refused as `400` if repeated",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedPageDto"
+                }
+              }
+            },
+            "description": "A page of feed entries with its cursor"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a page of the usage feed",
+        "tags": [
+          "Usage Feed"
+        ]
+      }
+    },
+    "/usage-collector/v2/reconciliation": {
+      "get": {
+        "description": "Sufficient for an external reconciliation job to compare gear-side accepted totals against a consumer's processed totals for a range without a full raw scan. Stall detection is consumer-side: the gear exposes the watermarks and computes no stall verdict of its own. Consistency floor (DESIGN.md Section 3.10): after an ingestion call returns the persisted entry, that entry is durable. Under eventual dedup level, an acknowledged entry can still lose a race before convergence (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. A consumer depending on a tighter bound than this floor must record that dependency in its own design document, naming the plugin, the dimension, and the value; weakening a published bound is a breaking change for every coupled consumer, and the Plugin SPI publishes no runtime method for discovering a plugin's ceiling in v1.",
+        "operationId": "usage_collector.get_reconciliation_metadata",
+        "parameters": [
+          {
+            "description": "Granularity at which to report. `caller` and `caller_tenant` are reserved and not served in v1.",
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The GTS type to report on.",
+            "in": "query",
+            "name": "gts_type_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The tenant to report on. One scope per call.",
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive lower bound of the requested range (UTC, RFC 3339).",
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive upper bound of the requested range (UTC, RFC 3339).",
+            "in": "query",
+            "name": "to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconciliationMetadataDto"
+                }
+              }
+            },
+            "description": "Reconciliation metadata for the requested scope"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Per-scope ingestion counters and watermarks",
+        "tags": [
+          "Reconciliation"
+        ]
+      }
+    },
+    "/usage-collector/v2/records": {
+      "get": {
+        "description": "Keyset-paginated raw read over the persisted usage records. Consistency floor (DESIGN.md Section 3.10): after an ingestion call returns the persisted entry, that entry is durable. Under eventual dedup level, an acknowledged entry can still lose a race before convergence (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. A consumer depending on a tighter bound than this floor must record that dependency in its own design document, naming the plugin, the dimension, and the value; weakening a published bound is a breaking change for every coupled consumer, and the Plugin SPI publishes no runtime method for discovering a plugin's ceiling in v1. Read-after-write flows (admission control, post-emit summary, immediate-readback dashboards) must consume the ingestion acknowledgement, never a query surface. Raw tailing is best-effort, not a change feed; a consumer that must not miss entries reads GET /usage-collector/v2/feed instead.",
+        "operationId": "usage_collector.v2.list_usage_records",
+        "parameters": [
+          {
+            "description": "Usage-type GTS instance id (mandatory)",
+            "in": "query",
+            "name": "gts_type_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive lower bound of the covered-period range (mandatory; RFC 3339 with an offset, normalized to UTC)",
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive upper bound of the covered-period range (mandatory; RFC 3339 with an offset, normalized to UTC)",
+            "in": "query",
+            "name": "to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeated metadata-filter entries; OR within a key, AND across keys",
+            "in": "query",
+            "name": "metadata.<key>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, canonical OData spelling (rejected with 400 if above 1000)",
+            "in": "query",
+            "name": "$top",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size hint, alias of `$top` (rejected with 400 if above 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque CursorV1 continuation token",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- id: eq|ne|in\n- window_start: eq|ne|gt|ge|lt|le|in\n- window_end: eq|ne|gt|ge|lt|le|in\n- tenant_id: eq|ne|in\n- resource_id: eq|ne|contains|startswith|endswith|in\n- resource_type: eq|ne|contains|startswith|endswith|in\n- subject_id: eq|ne|contains|startswith|endswith|in\n- subject_type: eq|ne|contains|startswith|endswith|in\n- invalidates: eq|ne|in\n- entry_type: eq|ne|contains|startswith|endswith|in\n- origin: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- id asc\n- id desc\n- window_start asc\n- window_start desc\n- window_end asc\n- window_end desc\n- tenant_id asc\n- tenant_id desc\n- resource_id asc\n- resource_id desc\n- resource_type asc\n- resource_type desc\n- subject_id asc\n- subject_id desc\n- subject_type asc\n- subject_type desc\n- invalidates asc\n- invalidates desc\n- entry_type asc\n- entry_type desc\n- origin asc\n- origin desc",
+            "in": "query",
+            "name": "$orderby",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_UsageRecordV2Dto"
+                }
+              }
+            },
+            "description": "Usage records page"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List usage records",
+        "tags": [
+          "Usage Records"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "entry_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "invalidates": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "origin": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "resource_id": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "resource_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "subject_id": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "subject_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "window_end": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "window_start": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "id asc",
+            "id desc",
+            "window_start asc",
+            "window_start desc",
+            "window_end asc",
+            "window_end desc",
+            "tenant_id asc",
+            "tenant_id desc",
+            "resource_id asc",
+            "resource_id desc",
+            "resource_type asc",
+            "resource_type desc",
+            "subject_id asc",
+            "subject_id desc",
+            "subject_type asc",
+            "subject_type desc",
+            "invalidates asc",
+            "invalidates desc",
+            "entry_type asc",
+            "entry_type desc",
+            "origin asc",
+            "origin desc"
+          ]
+        }
+      },
+      "post": {
+        "description": "Submit a batch of usage records for persistence. Read-after-write flows (admission control, post-emit summary, immediate-readback dashboards) must consume the ingestion acknowledgement, never a query surface. An accepted entry's dedup identity stays visible to subsequent ingestion attempts for as long as the referenced type's retention policy keeps it (a per-meter floor, not a gear-wide window); a retry arriving after the entry has aged out of retention draws no guaranteed outcome.",
+        "operationId": "usage_collector.v2.create_usage_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUsageRecordsRequestV2"
+              }
+            }
+          },
+          "description": "Usage-record create payload",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUsageRecordsResponseV2"
+                }
+              }
+            },
+            "description": "All records accepted"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUsageRecordsResponseV2"
+                }
+              }
+            },
+            "description": "At least one record was rejected; inspect each per-record outcome"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create usage records",
+        "tags": [
+          "Usage Records"
+        ]
+      }
+    },
+    "/usage-collector/v2/records/aggregate": {
+      "post": {
+        "description": "Server-side aggregation over the persisted usage records. Carries no aggregation parameter: the fold (`SUM` / `COUNT` / `MAX` / `MIN` / `LATEST`) is resolved from the queried type's declaration. Consistency floor (DESIGN.md Section 3.10): after an ingestion call returns the persisted entry, that entry is durable. Under eventual dedup level, an acknowledged entry can still lose a race before convergence (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. A consumer depending on a tighter bound than this floor must record that dependency in its own design document, naming the plugin, the dimension, and the value; weakening a published bound is a breaking change for every coupled consumer, and the Plugin SPI publishes no runtime method for discovering a plugin's ceiling in v1. Read-after-write flows (admission control, post-emit summary, immediate-readback dashboards) must consume the ingestion acknowledgement, never a query surface.",
+        "operationId": "usage_collector.v2.query_aggregated_usage_records",
+        "parameters": [
+          {
+            "description": "Usage-type GTS instance id (mandatory)",
+            "in": "query",
+            "name": "gts_type_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repeated metadata-filter entries; OR within a key, AND across keys",
+            "in": "query",
+            "name": "metadata.<key>",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- id: eq|ne|in\n- window_start: eq|ne|gt|ge|lt|le|in\n- window_end: eq|ne|gt|ge|lt|le|in\n- tenant_id: eq|ne|in\n- resource_id: eq|ne|contains|startswith|endswith|in\n- resource_type: eq|ne|contains|startswith|endswith|in\n- subject_id: eq|ne|contains|startswith|endswith|in\n- subject_type: eq|ne|contains|startswith|endswith|in\n- invalidates: eq|ne|in\n- entry_type: eq|ne|contains|startswith|endswith|in\n- origin: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AggregationRequest"
+              }
+            }
+          },
+          "description": "Mandatory time range plus optional group-by dimensions",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregationResultV2Dto"
+                }
+              }
+            },
+            "description": "Aggregation result"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Query server-side aggregated usage",
+        "tags": [
+          "Usage Records"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "entry_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "invalidates": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "origin": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "resource_id": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "resource_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "subject_id": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "subject_type": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "window_end": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "window_start": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ]
+          }
+        }
+      }
+    },
+    "/usage-collector/v2/records/backfill": {
+      "post": {
+        "description": "Identical validation and request shape to POST /records, differing as follows: every accepted entry is stamped `origin: backfill`, the live path's past bound on the covered period does not apply because this route exists for exactly the periods that bound rejects, and submissions whose covered period ends further back than the configured backfill window require elevated authorization. The route takes measurements and invalidation entries alike, mixed in one batch.",
+        "operationId": "usage_collector.backfill_usage_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUsageRecordsRequestV2"
+              }
+            }
+          },
+          "description": "Usage-record import payload",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUsageRecordsResponseV2"
+                }
+              }
+            },
+            "description": "Every entry accepted or deduplicated"
+          },
+          "207": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUsageRecordsResponseV2"
+                }
+              }
+            },
+            "description": "At least one entry rejected; inspect each per-entry outcome"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Bulk historical import of periods the live path rejects",
+        "tags": [
+          "Backfill"
+        ]
+      }
+    },
+    "/usage-collector/v2/records/{id}": {
+      "get": {
+        "description": "Read a single usage record by `id`. Consistency floor (DESIGN.md Section 3.10): after an ingestion call returns the persisted entry, that entry is durable. Under eventual dedup level, an acknowledged entry can still lose a race before convergence (DESIGN.md Section 3.1, Dedup level). This read surface is eventually consistent with no upper bound relative to a same-tenant ingestion ack. No monotonic-reads guarantee at the floor. The floor is per (tenant_id, gts_type_id). The floor claims no ordering of entries. A consumer depending on a tighter bound than this floor must record that dependency in its own design document, naming the plugin, the dimension, and the value; weakening a published bound is a breaking change for every coupled consumer, and the Plugin SPI publishes no runtime method for discovering a plugin's ceiling in v1. Read-after-write flows (admission control, post-emit summary, immediate-readback dashboards) must consume the ingestion acknowledgement, never a query surface.",
+        "operationId": "usage_collector.v2.get_usage_record",
+        "parameters": [
+          {
+            "description": "Usage-record UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageRecordV2Dto"
+                }
+              }
+            },
+            "description": "The persisted usage record"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a usage record",
+        "tags": [
+          "Usage Records"
         ]
       }
     },

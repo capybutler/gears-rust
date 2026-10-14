@@ -104,7 +104,7 @@ pub(crate) mod ch_decimal128_9 {
     ///
     /// **Accepted decision.** The gear contract publishes quantities with up
     /// to 28 significant digits and up to 28 fractional digits
-    /// (`docs/usage-collector-v1.yaml`, `UsageQuantity`), which no
+    /// (`docs/usage-collector-v2.yaml`, `UsageQuantity`), which no
     /// `Decimal128` scale can hold losslessly: 28 fractional plus 28 integer
     /// digits needs `Decimal256(28)`, and with it 256-bit mantissa arithmetic
     /// on both the write and read paths. Nine fractional digits are accepted

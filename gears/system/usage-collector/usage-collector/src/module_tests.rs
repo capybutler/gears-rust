@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
+use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use uuid::Uuid;
 
 use super::UsageCollectorModule;
@@ -45,6 +46,25 @@ fn make_ctx(hub: Arc<ClientHub>) -> GearCtx {
         hub,
         CancellationToken::new(),
     )
+}
+
+/// `make_ctx`, plus an in-memory `SQLite` database. Generation 2's bootstrap
+/// calls `ctx.db_required()` for the declaration mirror, so any test driving a
+/// full, successful `init` needs one attached under `--features v2` or it fails
+/// closed before reaching its assertions. No migration is applied: `init` only
+/// stores the `DBProvider`, it never queries it.
+async fn make_ctx_with_db(hub: Arc<ClientHub>) -> GearCtx {
+    let db = connect_db(
+        "sqlite::memory:",
+        ConnectOpts {
+            max_conns: Some(1),
+            min_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect in-memory SQLite");
+    make_ctx(hub).with_db(DBProvider::new(db))
 }
 
 #[tokio::test]
@@ -86,7 +106,7 @@ async fn init_fails_when_already_initialized() {
     let resolver: Arc<dyn AuthZResolverApi> = CountingAllowAllResolver::new();
     hub.register::<dyn AuthZResolverApi>(resolver);
 
-    let ctx = make_ctx(hub);
+    let ctx = make_ctx_with_db(hub).await;
     let module = UsageCollectorModule::default();
 
     module.init(&ctx).await.expect("first init must succeed");
@@ -127,7 +147,7 @@ async fn serve_returns_when_cancelled() {
     let resolver: Arc<dyn AuthZResolverApi> = CountingAllowAllResolver::new();
     hub.register::<dyn AuthZResolverApi>(resolver);
 
-    let ctx = make_ctx(hub);
+    let ctx = make_ctx_with_db(hub).await;
     let module = UsageCollectorModule::default();
     module.init(&ctx).await.expect("init must succeed");
 

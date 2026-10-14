@@ -1,7 +1,31 @@
 //! Postgres-backed [`RecordStore`] over the `usage_records` hypertable.
 //!
-//! All operations — `create` / `create_batch` / `get` / `list` / `aggregate` /
-//! `deactivate` — are real `sqlx`.
+//! All operations — `create_batch` / `get` / `feed_page` / `list` /
+//! `aggregate` / `reconciliation` — are real `sqlx`.
+//!
+//! **This module is the orchestration and nothing else.** Each SPI method here
+//! does the same four things and no more: build the statement, acquire a
+//! connection, run it, decode what comes back — with the metrics and the error
+//! classification that belong to a method boundary. Every statement it sends is
+//! built by a module that cannot reach a connection:
+//!
+//! - the guarded insert and its conflict read-back — [`super::query::write`]
+//! - the point lookup and the keyset page — [`super::query::list`]
+//! - the feed page and the retention-mark probe — [`super::query::feed`]
+//! - the exact-scan fold — [`super::query::aggregate`]
+//! - the rollup fold — [`super::query::rollup`]
+//! - reconciliation's S1∧S2 and S3 — [`super::query::reconciliation`]
+//!
+//! That split is what lets every statement be unit-tested without a database,
+//! and it is why a statement is always built **before** a connection is
+//! acquired: a query that cannot be rendered never reaches the pool and never
+//! reads a row. Several of the tests below exist only to pin that ordering.
+//!
+//! The two orchestrations long enough to read on their own are children rather
+//! than inlined here — [`write`] for the batch transaction and [`feed`] for the
+//! six-step page protocol. Both are `impl PgRecordStore` blocks, so they reach
+//! this type's private fields and the shared helpers below without widening
+//! anything.
 
 // Vendored TimescaleDB raw-SQL backend: `sqlx` is required infra (hypertable
 // time-series, `time_bucket` aggregation, keyset pagination — see DESIGN.md). Tenant
@@ -10,74 +34,82 @@
 // not SecureConn/AccessScope.
 #![allow(unknown_lints, de0706_no_direct_sqlx)]
 
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+mod feed;
+mod write;
+
+use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
-use rand::RngExt as _;
 use rust_decimal::Decimal;
-use sqlx::AssertSqlSafe;
 use sqlx::pool::PoolConnection;
-use sqlx::{Connection, PgPool, Postgres, Row};
+use sqlx::postgres::PgRow;
+use sqlx::{AssertSqlSafe, Connection as _, PgPool, Postgres, Row};
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tokio_util::sync::CancellationToken;
-use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
-use toolkit_odata::{ODataQuery, Page as ODataPage, PageInfo, SortDir};
+use toolkit_odata::{ODataQuery, ast};
 use uuid::Uuid;
 
-use usage_collector_sdk::{
-    AggregationBucket, AggregationDimension, AggregationResult, AggregationSpec, MetadataFilter,
-    UsageCollectorPluginError, UsageRecord, UsageRecordFilterField, UsageTypeGtsId,
-    is_keyset_safe_record_field,
+use usage_collector_sdk::v2::{
+    AggregationBucket, AggregationDimension, AggregationFold, AggregationResult, Keyset,
+    MetadataFilter, MeterRef, MeteredRecord, ObservedQuantity, QuantitySummary,
+    ReconciliationMetadata, RecordPage, StoredUsageRecord, TimeRange, UsageCollectorPluginError,
+    UsageQuantity,
 };
 
-use crate::domain::ports::RecordStore;
-use crate::infra::metrics::{ErrorClass, InsertMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
+use crate::domain::ports::{FeedPageRows, RecordStore};
+use crate::infra::metrics::{ErrorClass, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::entity::UsageRecordRow;
 use crate::infra::storage::error::{
-    DbErrorClass, acquire_error_clears_readiness, classify_db, db_code_and_constraint, map_sqlx_err,
+    acquire_error_clears_readiness, is_ledger_pk_violation, map_sqlx_err,
 };
-use crate::infra::storage::mapper::{
-    gts_id_str, metadata_jsonb_to_map, metadata_map_to_jsonb, record_row_to_model,
-};
-use crate::infra::storage::query::aggregate::{
-    agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
-};
+use crate::infra::storage::mapper::record_row_to_model;
+use crate::infra::storage::query::aggregate::build_aggregate_sql;
 use crate::infra::storage::query::effective_page_size;
-use crate::infra::storage::query::keyset::{
-    encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
+use crate::infra::storage::query::feed::build_feed_page_sql;
+use crate::infra::storage::query::list::{
+    DEFAULT_PAGE_SIZE, build_get_sql, build_list_page, build_list_sql,
 };
-use crate::infra::storage::query::translate::{
-    SqlBind, SqlCtx, bind_one, bind_one_query, record_column, translate_record_filter,
+use crate::infra::storage::query::reconciliation::{
+    build_reconciliation_summary_sql, build_reconciliation_watermarks_sql,
 };
+use crate::infra::storage::query::rollup::{build_rollup_aggregate_sql, rollup_eligible};
+use crate::infra::storage::query::translate::{bind_one, bind_one_query};
+use crate::infra::storage::retry::{
+    MAX_BATCH_ATTEMPTS, batch_retry_backoff, is_retryable_batch_error, with_retry,
+};
+use crate::infra::storage::type_key::TypeKeyCache;
 
-/// Default page size when the caller omits `$top` (`query.limit`).
-const DEFAULT_PAGE_SIZE: u64 = 100;
-
-/// Column list for every `usage_records` SELECT / RETURNING, in
-/// [`UsageRecordRow`] field order. A static const (never caller input), so
-/// `sqlx::query_as::<_, UsageRecordRow>` decodes positionally without risk of
-/// SQL injection.
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_id, value, created_at, resource_id, \
-     resource_type, subject_id, subject_type, idempotency_key, corrects_id, status, metadata, \
-     ingested_at";
+use feed::dedup_subscription_types;
 
 /// `sqlx`-backed implementation of [`RecordStore`] over the `usage_records`
 /// hypertable.
 ///
-/// Every operation acquires its connection through [`Self::timed_acquire`], so
-/// `pool.acquire.duration` is recorded per acquire and `tls.handshake.failure.count`
-/// is incremented when a fresh physical connection fails its TLS handshake (via
-/// [`Self::record_backend_error`]).
+/// Every operation acquires its connection through `Self::timed_acquire`, so
+/// `uc_timescaledb_pool_acquire_duration_seconds` is recorded per acquire and
+/// `uc_timescaledb_tls_handshake_failures_total` is incremented when a fresh
+/// physical connection fails its TLS handshake (via
+/// `Self::record_backend_error`). Both are named in plain backticks rather than
+/// linked: they are private, so an intra-doc link from this public item would
+/// resolve only under `--document-private-items`.
 #[derive(Debug, Clone)]
 pub struct PgRecordStore {
     pool: PgPool,
     metrics: Arc<Metrics>,
     cancel: CancellationToken,
+    type_keys: Arc<TypeKeyCache>,
+    /// Whether `aggregate` may serve an eligible query from `usage_rollup_1h`.
+    /// Always `true` outside tests; [`Self::without_rollup`] turns it off so
+    /// the integration suite can compare both reads over one database.
+    rollup_enabled: bool,
+    /// `feed_acceptance_slack_secs`, bound into every write statement's
+    /// admission guard (see
+    /// [`admitted_expr`](crate::infra::storage::query::write::admitted_expr)).
+    /// Held as the `i64` it binds as. Config validation caps it far below
+    /// `i64::MAX`, so [`Self::new`]'s saturation is unreachable.
+    acceptance_slack_secs: i64,
 }
 
 impl PgRecordStore {
@@ -85,13 +117,41 @@ impl PgRecordStore {
     /// cancellation token; the request path stops re-arming the `ready` gauge
     /// once it fires so a drain-time acquire cannot flip readiness back on after
     /// the shutdown watcher has cleared it.
+    ///
+    /// `acceptance_slack_secs` is the deployment's `feed_acceptance_slack_secs`
+    /// (`crate::config`), and it reaches the database as a bind on every write
+    /// rather than as anything this type decides.
     #[must_use]
-    pub fn new(pool: PgPool, metrics: Arc<Metrics>, cancel: CancellationToken) -> Self {
+    pub fn new(
+        pool: PgPool,
+        metrics: Arc<Metrics>,
+        cancel: CancellationToken,
+        acceptance_slack_secs: u64,
+    ) -> Self {
         Self {
             pool,
             metrics,
             cancel,
+            type_keys: Arc::new(TypeKeyCache::default()),
+            rollup_enabled: true,
+            acceptance_slack_secs: i64::try_from(acceptance_slack_secs).unwrap_or(i64::MAX),
         }
+    }
+
+    /// The same store with the rollup read switched off, so every aggregate
+    /// takes the exact scan. Test-only: the equivalence suite compares the two.
+    ///
+    /// Compiled unconditionally rather than behind
+    /// `#[cfg(any(test, feature = "postgres"))]`: the unit tests in
+    /// `record_store_tests.rs` and the Docker-gated `tests/*.rs` crates both
+    /// call it, and a test-gated item inline in a file that has a companion
+    /// `*_tests.rs` is what the tests-in-separate-files rule (DE1101) rejects.
+    /// Nothing outside tests calls it, and it can only turn the rollup read
+    /// off, never on.
+    #[must_use]
+    pub fn without_rollup(mut self) -> Self {
+        self.rollup_enabled = false;
+        self
     }
 
     /// Map a `sqlx` error via [`map_sqlx_err`] and, as a side effect, increment
@@ -101,7 +161,8 @@ impl PgRecordStore {
     /// it slots into the existing `.map_err(...)` call sites unchanged.
     fn record_backend_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
         // A TLS handshake failure is the plugin's one metered transport-security
-        // signal (DESIGN §Observability); count it before the generic mapping.
+        // signal (`uc_timescaledb_tls_handshake_failures_total`); count it
+        // before the generic mapping.
         if matches!(err, sqlx::Error::Tls(_)) {
             self.metrics.inc_tls_handshake_failure();
         }
@@ -115,48 +176,59 @@ impl PgRecordStore {
         mapped
     }
 
-    /// Single-row insert error mapping. A foreign-key violation on
-    /// `usage_records.gts_id` means the referenced usage type is absent from the
-    /// catalog — the narrow TOCTOU race where it is deleted between the core's
-    /// pre-insert catalog existence check and this insert. Surface it as the
-    /// typed [`UsageCollectorPluginError::UsageTypeNotFound`] (the core lifts it
-    /// to a 404) instead of a generic Internal (500); every other error falls
-    /// through to [`Self::record_backend_error`] (which also meters it). Mirrors
-    /// the catalog-store FK → `UsageTypeReferenced` mapping. The batch path is
-    /// intentionally excluded: a multi-`gts_id` UNNEST insert cannot attribute a
-    /// single FK violation to one `gts_id`, so a typed mapping there would lie.
-    fn map_insert_error(
-        &self,
-        err: &sqlx::Error,
-        gts_id: &UsageTypeGtsId,
-    ) -> UsageCollectorPluginError {
-        if let Some((code, constraint)) = db_code_and_constraint(err)
-            && classify_db(&code, constraint.as_deref()) == DbErrorClass::ForeignKeyViolation
-        {
-            return UsageCollectorPluginError::UsageTypeNotFound {
-                gts_id: gts_id.clone(),
-            };
+    /// [`Self::record_backend_error`], plus the one insert-path error that is
+    /// retryable without being a connectivity or serialization fault: a PRIMARY
+    /// KEY collision on one of this write's own dedup identities
+    /// ([`is_ledger_pk_violation`]). The case it is **sized for** is a
+    /// concurrent writer of that identity;
+    /// [`entry_identity`](write::entry_identity) sets out a second route to the
+    /// same raise, which a mis-derived `id` reaches with no concurrency at all.
+    ///
+    /// **It is lifted here rather than in
+    /// [`crate::infra::storage::error::classify_db`]**, which still maps a
+    /// primary-key `23505` to a non-retryable `Internal` — right for a collision
+    /// nothing intercepted. Only a write path knows it is in the race, so only a
+    /// write path may reclassify it.
+    ///
+    /// **Re-running resolves the race, and it must be a fresh transaction**: the
+    /// winner is committed by the time this error is raised, so the re-run's
+    /// `ON CONFLICT` pre-check sees its row and the batch resolves it as an
+    /// ordinary dedup hit. `create_batch`'s bounded jittered retry
+    /// ([`with_retry`]) is exactly that.
+    ///
+    /// **It does not resolve the other route**: on a mis-derived `id` the re-run
+    /// finds nothing, meets the same primary-key entry again, and
+    /// [`MAX_BATCH_ATTEMPTS`] is spent before the host is told. The detail string
+    /// names the race deliberately — re-wording it would buy a caller nothing it
+    /// can act on differently.
+    fn record_insert_error(&self, err: &sqlx::Error) -> UsageCollectorPluginError {
+        if is_ledger_pk_violation(err) {
+            self.metrics.inc_backend_error(ErrorClass::Transient);
+            return UsageCollectorPluginError::transient(
+                "a concurrent write of the same usage-entry identity committed first",
+            );
         }
         self.record_backend_error(err)
     }
 
-    /// Acquire a pooled connection, recording `pool.acquire.duration`. Errors map
+    /// Acquire a pooled connection, recording
+    /// `uc_timescaledb_pool_acquire_duration_seconds`. Errors map
     /// through [`Self::record_backend_error`] (which also catches a TLS-handshake
     /// failure on a fresh physical connection). Every operation acquires through
     /// this path so the acquire-latency histogram is representative.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-backend-readiness-gauge:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-readiness-gauge-semantics:p2
+    // @cpt-state:cpt-cf-uc-plugin-state-backend-readiness:p2
     async fn timed_acquire(&self) -> Result<PoolConnection<Postgres>, UsageCollectorPluginError> {
         let t = Instant::now();
         match self.pool.acquire().await {
             Ok(conn) => {
                 self.metrics.record_pool_acquire(t.elapsed().as_secs_f64());
-                // A successful acquire re-arms readiness (DESIGN §Observability:
-                // `ready` recovers once the pool serves a connection again), but
-                // only while not shutting down: once `cancel` fires the shutdown
-                // watcher owns the gauge, so a drain-time acquire must not flip it
-                // back to 1. This gate narrows — it does not fully close — the
-                // check-then-set window against the watcher; that residual race
-                // is a sub-tick blip on a best-effort gauge during one-way
-                // shutdown, so it is left as-is rather than serialized.
+                // A successful acquire re-arms `uc_timescaledb_ready`, but only
+                // while not shutting down: once `cancel` fires the shutdown
+                // watcher owns the gauge. This gate narrows but does not close
+                // the check-then-set race against the watcher; the residual is a
+                // sub-tick blip on a best-effort gauge during one-way shutdown.
                 if !self.cancel.is_cancelled() {
                     self.metrics.set_ready(true);
                 }
@@ -175,750 +247,72 @@ impl PgRecordStore {
             }
         }
     }
-
-    /// Core single-row insert path: dedup on the `usage_records`
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE
-    /// (`usage_records_dedup_uniq`) via `INSERT … ON CONFLICT … DO NOTHING`, then
-    /// lost-the-race absorb-vs-conflict resolution.
-    ///
-    /// `ON CONFLICT DO NOTHING` is the serialization authority: a concurrent
-    /// same-key insert blocks on the in-progress speculative tuple until the
-    /// winner commits, then its `DO NOTHING` returns no row and it resolves
-    /// absorb-vs-conflict against the now-visible committed row. The operation is
-    /// one `INSERT` plus at most one `SELECT` (both read-committed), so no
-    /// explicit transaction is needed.
-    ///
-    /// This carries the per-row counters (dedup absorbed / idempotency conflict
-    /// / compensation / backend error) so they are recorded exactly once per
-    /// row whether the caller is [`RecordStore::create`] (single) or
-    /// [`RecordStore::create_batch`] (per-row loop). The `insert.duration`
-    /// histogram is deliberately NOT recorded here — the public methods time
-    /// the whole call and tag it with the correct `mode`.
-    async fn create_inner(
-        &self,
-        record: UsageRecord,
-    ) -> Result<UsageRecord, UsageCollectorPluginError> {
-        let mut conn = self.timed_acquire().await?;
-
-        // 1. Insert, deduplicated on the 4-tuple UNIQUE. `RETURNING` yields the
-        //    row only when we won the slot — `DO NOTHING` suppresses it on a
-        //    conflict — so `Some` = fresh insert, `None` = a row with this
-        //    4-tuple already exists.
-        let insert_sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
-        let subject_id = record
-            .subject_ref
-            .as_ref()
-            .map(usage_collector_sdk::SubjectRef::subject_id);
-        let subject_type = record.subject_ref.as_ref().and_then(|s| s.subject_type());
-        let metadata = metadata_map_to_jsonb(&record.metadata);
-        let is_compensation = record.corrects_id.is_some();
-
-        let inserted = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(insert_sql))
-            .bind(record.id)
-            .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
-            .bind(record.value)
-            .bind(record.created_at)
-            .bind(record.resource_ref.resource_id())
-            .bind(record.resource_ref.resource_type())
-            .bind(subject_id)
-            .bind(subject_type)
-            .bind(record.idempotency_key.as_str())
-            .bind(record.corrects_id)
-            .bind(metadata)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| self.map_insert_error(&e, &record.gts_id))?;
-
-        if let Some(row) = inserted {
-            // 2a. Won the slot — fresh insert.
-            if is_compensation {
-                self.metrics.inc_compensation();
-            }
-            return record_row_to_model(row);
-        }
-
-        // 2b. Lost the slot — a row with this 4-tuple already exists. Read it and
-        //     resolve absorb-vs-conflict. The read mutates nothing.
-        let select_sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE tenant_id = $1 AND gts_id = $2 AND idempotency_key = $3 AND created_at = $4"
-        );
-        let stored = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
-            .bind(record.tenant_id)
-            .bind(gts_id_str(&record.gts_id))
-            .bind(record.idempotency_key.as_str())
-            .bind(record.created_at)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-
-        if let Some(row) = stored {
-            self.resolve_dedup_hit(row, &record)
-        } else {
-            // Stale: the conflicting row's chunk was dropped by retention between
-            // the conflicting insert and this read — a near-impossible race
-            // against the retention boundary (the unique entry is dropped with
-            // the chunk, so a retry now wins the freed slot as a fresh insert).
-            // Return retryable Transient.
-            self.metrics.inc_dedup_stale();
-            Err(dedup_transient(
-                &record,
-                "conflicting record aged out during dedup resolution; retry",
-            ))
-        }
-    }
-
-    /// Resolve a dedup-key hit into absorb (stored row) vs `IdempotencyConflict`
-    /// via [`canonical_equal`]. Called from the conflict branch of
-    /// `create_inner` when an existing dedup slot's stored record is found.
-    /// Increments the matching per-row counter: `dedup.absorbed` on an
-    /// exact-equality absorb, `idempotency.conflict` on a canonical-field
-    /// mismatch. A stored-metadata decode failure propagates as `Internal`
-    /// rather than masquerading as a conflict.
-    fn resolve_dedup_hit(
-        &self,
-        row: UsageRecordRow,
-        record: &UsageRecord,
-    ) -> Result<UsageRecord, UsageCollectorPluginError> {
-        if canonical_equal(&row, record)? {
-            // Exact-equality retry — silently absorb, returning the stored row.
-            self.metrics.inc_dedup_absorbed();
-            record_row_to_model(row)
-        } else {
-            self.metrics.inc_idempotency_conflict();
-            Err(UsageCollectorPluginError::IdempotencyConflict {
-                idempotency_key: record.idempotency_key.as_str().to_owned(),
-                existing_id: row.id,
-            })
-        }
-    }
-
-    /// Insert all distinct-key representatives in one multi-row
-    /// `INSERT … ON CONFLICT (4-tuple) DO NOTHING RETURNING`. The returned rows
-    /// are exactly the slots we won — `DO NOTHING` suppresses any row whose
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` already exists — so the
-    /// result maps each won [`DedupKey`] to its stored row. `reps` must be sorted
-    /// by [`DedupKey`] so concurrent batches insert in one global order
-    /// (deadlock-free). `metadata` is bound as `text[]` of JSON strings and cast
-    /// `::jsonb` per-row to sidestep `jsonb[]` array encoding.
-    async fn insert_records_on_conflict(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        reps: &[&UsageRecord],
-    ) -> Result<HashMap<DedupKey, UsageRecordRow>, UsageCollectorPluginError> {
-        if reps.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let ids: Vec<Uuid> = reps.iter().map(|r| r.id).collect();
-        let tenants: Vec<Uuid> = reps.iter().map(|r| r.tenant_id).collect();
-        let gtss: Vec<String> = reps
-            .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
-            .collect();
-        let values: Vec<Decimal> = reps.iter().map(|r| r.value).collect();
-        let cats: Vec<OffsetDateTime> = reps.iter().map(|r| r.created_at).collect();
-        let resource_ids: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_id().to_owned())
-            .collect();
-        let resource_types: Vec<String> = reps
-            .iter()
-            .map(|r| r.resource_ref.resource_type().to_owned())
-            .collect();
-        let subject_ids: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .map(|s| usage_collector_sdk::SubjectRef::subject_id(s).to_owned())
-            })
-            .collect();
-        let subject_types: Vec<Option<String>> = reps
-            .iter()
-            .map(|r| {
-                r.subject_ref
-                    .as_ref()
-                    .and_then(|s| s.subject_type())
-                    .map(str::to_owned)
-            })
-            .collect();
-        let idem_keys: Vec<String> = reps
-            .iter()
-            .map(|r| r.idempotency_key.as_str().to_owned())
-            .collect();
-        let corrects: Vec<Option<Uuid>> = reps.iter().map(|r| r.corrects_id).collect();
-        let metadata: Vec<String> = reps
-            .iter()
-            .map(|r| metadata_map_to_jsonb(&r.metadata).to_string())
-            .collect();
-
-        let sql = format!(
-            "INSERT INTO usage_records \
-             (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             SELECT id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-              subject_id, subject_type, idempotency_key, corrects_id, metadata::jsonb \
-             FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::numeric[], $5::timestamptz[], \
-              $6::text[], $7::text[], $8::text[], $9::text[], $10::text[], $11::uuid[], $12::text[]) \
-              AS t(id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
-                   subject_id, subject_type, idempotency_key, corrects_id, metadata) \
-             ON CONFLICT (tenant_id, gts_id, idempotency_key, created_at) DO NOTHING \
-             RETURNING {RECORD_COLUMNS}"
-        );
-
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(&ids)
-            .bind(&tenants)
-            .bind(&gtss)
-            .bind(&values)
-            .bind(&cats)
-            .bind(&resource_ids)
-            .bind(&resource_types)
-            .bind(&subject_ids)
-            .bind(&subject_types)
-            .bind(&idem_keys)
-            .bind(&corrects)
-            .bind(&metadata)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| (row_dedup_key(&row), row))
-            .collect())
-    }
-
-    /// For the not-won keys, read the existing `usage_records` row by its 4-tuple
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` — the batch analogue of
-    /// the single path's conflict branch. Maps each key to `Stored` (row found →
-    /// resolve absorb/conflict) or `Stale` (the conflicting row's chunk was
-    /// dropped by retention between the conflicting insert and this read).
-    async fn read_conflict_records(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        not_won: &[&UsageRecord],
-    ) -> Result<HashMap<DedupKey, ConflictRead>, UsageCollectorPluginError> {
-        let mut out: HashMap<DedupKey, ConflictRead> = HashMap::new();
-        if not_won.is_empty() {
-            return Ok(out);
-        }
-
-        let tenants: Vec<Uuid> = not_won.iter().map(|r| r.tenant_id).collect();
-        let gtss: Vec<String> = not_won
-            .iter()
-            .map(|r| gts_id_str(&r.gts_id).to_owned())
-            .collect();
-        let keys: Vec<String> = not_won
-            .iter()
-            .map(|r| r.idempotency_key.as_str().to_owned())
-            .collect();
-        let cats: Vec<OffsetDateTime> = not_won.iter().map(|r| r.created_at).collect();
-
-        let select_sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records \
-             WHERE (tenant_id, gts_id, idempotency_key, created_at) IN \
-               (SELECT t1, t2, t3, t4 \
-                FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::timestamptz[]) \
-                  AS t(t1, t2, t3, t4))"
-        );
-        let rows = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(select_sql))
-            .bind(&tenants)
-            .bind(&gtss)
-            .bind(&keys)
-            .bind(&cats)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
-
-        let mut found: HashMap<DedupKey, UsageRecordRow> = HashMap::new();
-        for row in rows {
-            found.insert(row_dedup_key(&row), row);
-        }
-
-        // Every not-won key resolves to Stored (its conflicting row was read) or
-        // Stale (the row's chunk was dropped by retention between the conflicting
-        // insert and this read — the near-impossible retention-boundary race).
-        // `reps` are distinct keys, so each `remove` is unambiguous.
-        for r in not_won {
-            let key = dedup_key(r);
-            match found.remove(&key) {
-                Some(row) => {
-                    out.insert(key, ConflictRead::Stored(Box::new(row)));
-                }
-                None => {
-                    out.insert(key, ConflictRead::Stale);
-                }
-            }
-        }
-
-        Ok(out)
-    }
-
-    /// Resolve every input row in original order against its authoritative
-    /// record, recording the per-row counters exactly as the single path does.
-    fn resolve_batch(
-        &self,
-        records: &[UsageRecord],
-        plan: &BatchPlan<'_>,
-        won: &HashSet<DedupKey>,
-        inserted: &HashMap<DedupKey, UsageRecordRow>,
-        conflict: &HashMap<DedupKey, ConflictRead>,
-    ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
-        let mut results = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            let key = dedup_key(record);
-            let is_winner = won.contains(&key) && plan.first_index.get(&key) == Some(&i);
-            let outcome = if is_winner {
-                match inserted.get(&key) {
-                    Some(row) => {
-                        if record.corrects_id.is_some() {
-                            self.metrics.inc_compensation();
-                        }
-                        record_row_to_model(row.clone())
-                    }
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "won dedup slot but no inserted record was returned \
-                         (concurrent-insert invariant break)",
-                    )),
-                }
-            } else if won.contains(&key) {
-                match inserted.get(&key) {
-                    Some(row) => self.resolve_dedup_hit(row.clone(), record),
-                    None => Err(dedup_invariant_break(
-                        record,
-                        "intra-batch duplicate of a won key with no inserted record",
-                    )),
-                }
-            } else {
-                match conflict.get(&key) {
-                    Some(ConflictRead::Stored(row)) => {
-                        // Clone the inner row directly; `*row.clone()` would
-                        // round-trip through a throwaway `Box` allocation. The
-                        // clone itself is required — a not-won key may be
-                        // resolved by several input rows against the borrowed map.
-                        self.resolve_dedup_hit((**row).clone(), record)
-                    }
-                    Some(ConflictRead::Stale) => {
-                        self.metrics.inc_dedup_stale();
-                        Err(dedup_transient(
-                            record,
-                            "conflicting record aged out during dedup resolution; retry",
-                        ))
-                    }
-                    // Defensive: read_conflict_records populates every not-won key
-                    // as Stored or Stale, so a missing entry is unreachable —
-                    // surface it as retryable rather than as a silent success.
-                    None => Err(dedup_transient(
-                        record,
-                        "conflicting record not found during dedup resolution; retry",
-                    )),
-                }
-            };
-            results.push(outcome);
-        }
-        results
-    }
-
-    /// Orchestrate one batch on a single connection: insert (dedup on the
-    /// 4-tuple UNIQUE) → read conflicts for the not-won keys → resolve per row in
-    /// input order. The multi-row `INSERT … ON CONFLICT DO NOTHING` is itself
-    /// atomic, so no explicit transaction is required; `won` is the set of keys
-    /// the insert actually claimed (its `RETURNING` rows).
-    async fn create_batch_inner(
-        &self,
-        records: &[UsageRecord],
-    ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>
-    {
-        let plan = plan_batch(records);
-
-        let mut conn = self.timed_acquire().await?;
-
-        let inserted = self
-            .insert_records_on_conflict(&mut conn, &plan.reps)
-            .await?;
-        let won: HashSet<DedupKey> = inserted.keys().cloned().collect();
-        let not_won: Vec<&UsageRecord> = plan
-            .reps
-            .iter()
-            .copied()
-            .filter(|r| !won.contains(&dedup_key(r)))
-            .collect();
-        let conflict = self.read_conflict_records(&mut conn, &not_won).await?;
-
-        Ok(self.resolve_batch(records, &plan, &won, &inserted, &conflict))
-    }
 }
 
-/// Append the metadata side-channel filters as parameterized `WHERE` clauses.
+/// Read one aggregate result row into a bucket: `dim_count` dimension columns
+/// as the key, then the folded value.
 ///
-/// Shared by [`PgRecordStore::list`] and [`PgRecordStore::aggregate`] so both
-/// expand the side channel identically: AND across filters, OR within one
-/// filter's values (`metadata ->> $key IN ($v1, $v2, …)`). The key and every
-/// value are bound via `ctx` (`$N`); only the `metadata ->> $N` shape is
-/// interpolated, so this is injection-safe. An empty value set matches nothing
-/// (the gateway rejects it, but be defensive): a `FALSE` clause is emitted so
-/// the result is empty rather than unfiltered.
-fn push_metadata_filter_clauses(
-    metadata_filter: &[MetadataFilter],
-    ctx: &mut SqlCtx,
-    clauses: &mut Vec<String>,
-) {
-    for mf in metadata_filter {
-        if mf.values().is_empty() {
-            clauses.push("FALSE".to_owned());
-            continue;
-        }
-        let key_n = ctx.push(SqlBind::Str(mf.key().as_str().to_owned()));
-        let placeholders = mf
-            .values()
-            .iter()
-            .map(|v| format!("${}", ctx.push(SqlBind::Str(v.clone()))))
-            .collect::<Vec<_>>();
-        clauses.push(format!(
-            "metadata ->> ${key_n} IN ({})",
-            placeholders.join(", ")
-        ));
-    }
-}
-
-/// Extract a single order-field value from a row as its cursor-key string.
+/// `dim_count` is
+/// [`AggregateStatement`](crate::infra::storage::query::aggregate::AggregateStatement)'s, so it is the count the builder
+/// numbered its own `GROUP BY` ordinals with rather than a second reading of
+/// `group_by` here — the two could otherwise drift with nothing to notice, no
+/// unit test executing a statement.
 ///
-/// Inverse of [`cursor_key_to_bind`](crate::infra::storage::query::keyset::cursor_key_to_bind):
-/// `id` / `corrects_id` render via [`Uuid::to_string`], `created_at` as
-/// RFC 3339, `tenant_id` via its `Uuid` string, and the text columns
-/// (`resource_id` / `resource_type` / `subject_id` / `subject_type` / `status`)
-/// as-is. Returns `None` for an unknown field or a `NULL` optional column (a
-/// `NULL` value can't seed a stable keyset boundary).
-fn record_row_key(row: &UsageRecordRow, field: &str) -> Option<String> {
-    match field {
-        "id" => Some(row.id.to_string()),
-        "corrects_id" => row.corrects_id.map(|id| id.to_string()),
-        "created_at" => row.created_at.format(&Rfc3339).ok(),
-        "tenant_id" => Some(row.tenant_id.to_string()),
-        "resource_id" => Some(row.resource_id.clone()),
-        "resource_type" => Some(row.resource_type.clone()),
-        "subject_id" => row.subject_id.clone(),
-        "subject_type" => row.subject_type.clone(),
-        "status" => Some(row.status.clone()),
-        _ => None,
-    }
-}
-
-/// The dedup identity, mirroring the `usage_records_dedup_uniq` UNIQUE
-/// `(tenant_id, gts_id, idempotency_key, created_at)`. The `created_at` component
-/// is the microsecond count (see [`to_micros`]) so an in-memory key built from a
-/// caller's `OffsetDateTime` matches the µs-truncated `created_at` Postgres
-/// returns via `RETURNING` (timestamptz stores microseconds; sub-µs nanos do not
-/// survive the round-trip).
-type DedupKey = (Uuid, String, String, i128);
-
-/// Build the [`DedupKey`] for an incoming record.
-fn dedup_key(record: &UsageRecord) -> DedupKey {
-    (
-        record.tenant_id,
-        gts_id_str(&record.gts_id).to_owned(),
-        record.idempotency_key.as_str().to_owned(),
-        to_micros(record.created_at),
-    )
-}
-
-/// Build the [`DedupKey`] for a stored row, so an `INSERT … RETURNING` result
-/// and an incoming record map to the same key (µs-normalized `created_at`).
-fn row_dedup_key(row: &UsageRecordRow) -> DedupKey {
-    (
-        row.tenant_id,
-        row.gts_id.clone(),
-        row.idempotency_key.clone(),
-        to_micros(row.created_at),
-    )
-}
-
-/// Log a dedup-path invariant break (an `Internal`, "this should never happen"
-/// condition) at `error` with the record's identifiers, then return the matching
-/// [`UsageCollectorPluginError::Internal`]. Centralizing the log + build keeps
-/// each silent break observable (DESIGN §Observability puts unbounded
-/// identifiers in logs, not metric labels) without inflating the hot ingest
-/// path's control flow.
-fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
-    tracing::error!(
-        tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
-        idempotency_key = %record.idempotency_key.as_str(),
-        "{msg}"
-    );
-    UsageCollectorPluginError::internal(msg)
-}
-
-/// Log a retryable dedup-path transient at `warn` with the record's identifiers,
-/// then return the matching [`UsageCollectorPluginError::Transient`]. The
-/// degraded path is self-healing on retry but must still surface at `warn` so an
-/// operator can see it (DESIGN §Observability).
-fn dedup_transient(record: &UsageRecord, msg: &'static str) -> UsageCollectorPluginError {
-    tracing::warn!(
-        tenant_id = %record.tenant_id,
-        gts_id = %gts_id_str(&record.gts_id),
-        idempotency_key = %record.idempotency_key.as_str(),
-        "{msg}"
-    );
-    UsageCollectorPluginError::transient(msg)
-}
-
-/// Deterministic plan for a batch insert.
+/// Split out so the caller is a 1:1 `map` over the fetched rows — the shape the
+/// no-grouping case needs: with no `GROUP BY` the statement is a bare aggregate
+/// and `PostgreSQL` answers exactly one row, which becomes one bucket with an
+/// empty key. That, not an empty bucket list, is what a conforming plugin owes.
 ///
-/// `reps` are the first-occurrence representative records, one per distinct
-/// dedup key, **sorted** by [`DedupKey`] so concurrent batches take the
-/// 4-tuple-UNIQUE conflict locks in one global order (deadlock-free).
-/// `first_index` maps each key to the input index of its first occurrence — the
-/// only row that can win the slot; later same-key rows resolve against the
-/// winner's record, exactly as the single-row path resolves a same-key hit.
-struct BatchPlan<'a> {
-    reps: Vec<&'a UsageRecord>,
-    first_index: HashMap<DedupKey, usize>,
-}
-
-/// Collapse a batch to its distinct dedup keys (first occurrence wins),
-/// sorted for a stable lock order. Pure — no DB. `reps` borrow from `records`,
-/// which outlives the plan, so no record is cloned onto the plan.
-fn plan_batch(records: &[UsageRecord]) -> BatchPlan<'_> {
-    let mut first_index: HashMap<DedupKey, usize> = HashMap::new();
-    let mut reps: Vec<(DedupKey, &UsageRecord)> = Vec::new();
-    for (i, record) in records.iter().enumerate() {
-        let key = dedup_key(record);
-        if let std::collections::hash_map::Entry::Vacant(slot) = first_index.entry(key.clone()) {
-            slot.insert(i);
-            reps.push((key, record));
-        }
-    }
-    reps.sort_by(|a, b| a.0.cmp(&b.0));
-    BatchPlan {
-        reps: reps.into_iter().map(|(_, r)| r).collect(),
-        first_index,
-    }
-}
-
-/// Total `create_batch` attempts: one initial try plus two retries. A bounded
-/// in-process retry so a rare deadlock victim self-heals transparently instead
-/// of bubbling an `Err(Transient)` to the host (see [`with_retry`]).
-const MAX_BATCH_ATTEMPTS: u32 = 3;
-
-/// Deterministic pre-jitter backoff base for the `attempt`-th retry (1-based).
-/// A short exponential — 5 ms, 10 ms, … — because a deadlock victim can retry
-/// almost immediately: the surviving transaction has already committed or
-/// aborted by the time Postgres aborts the victim, so the contended dedup locks
-/// are free. The shift is saturated so the schedule can never overflow
-/// regardless of how `MAX_BATCH_ATTEMPTS` grows.
-fn batch_retry_backoff_base(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(6);
-    Duration::from_millis(5u64 << shift)
-}
-
-/// Full jitter: a uniformly random duration in `[0, upper]`. Decorrelates the
-/// retry instants of batches that deadlocked on the same dedup locks, so they
-/// do not all wake and re-contend at the same moment. An `upper` of at most
-/// 1 ms is returned unchanged (nothing meaningful to spread).
-fn full_jitter(upper: Duration) -> Duration {
-    let upper_ms = u64::try_from(upper.as_millis()).unwrap_or(u64::MAX);
-    if upper_ms <= 1 {
-        return upper;
-    }
-    let jitter_ms = rand::rng().random_range(0..=upper_ms);
-    Duration::from_millis(jitter_ms)
-}
-
-/// Backoff before the `attempt`-th retry (1-based: `batch_retry_backoff(1)`
-/// precedes the first retry): the exponential [`batch_retry_backoff_base`] with
-/// **full jitter** applied so concurrent deadlock victims spread across the
-/// window instead of retrying in lockstep (thundering herd).
-fn batch_retry_backoff(attempt: u32) -> Duration {
-    full_jitter(batch_retry_backoff_base(attempt))
-}
-
-/// Retry predicate for [`with_retry`] around `create_batch`: retry **only** an
-/// outer [`UsageCollectorPluginError::Transient`].
-///
-/// The deadlock victim surfaces as an outer `Transient` (the whole transaction
-/// rolled back); serialization failures (`40001`) and connection blips collapse
-/// to the same bucket inside the storage helpers, and all are safe to re-run
-/// for this idempotent batch. `Internal`, `IdempotencyConflict`, and the typed
-/// domain errors are non-retryable and returned unchanged. Per-row `Transient`
-/// outcomes carried inside an `Ok(vec)` are deliberately not seen here — the
-/// batch as a whole succeeded, so the loop never inspects them.
-fn is_retryable_batch_error(err: &UsageCollectorPluginError) -> bool {
-    matches!(err, UsageCollectorPluginError::Transient { .. })
-}
-
-/// Run `operation`, retrying while `should_retry` accepts its error, for up to
-/// `max_attempts` total invocations; sleep `backoff(attempt)` before the
-/// `attempt`-th retry. Returns the first `Ok`, or — once retries are exhausted
-/// or the error is non-retryable — the last `Err` unchanged.
-///
-/// `on_retry(attempt, &err)` is invoked exactly once before each retry — after a
-/// retryable failure and before the backoff sleep — with the failed 1-based
-/// `attempt` number and the error it failed with. It is the observability seam
-/// (log + retry counter): the combinator stays generic and DB-free, so the
-/// caller supplies the tracing/metrics side effects. It never fires on a
-/// first-attempt success or on a returned (non-retried) error, so a retry can be
-/// told apart from a bubbled transient failure.
-///
-/// Generic and DB-free so the retry mechanics are unit-tested without a
-/// transaction. `operation` is an `Fn` invoked fresh each attempt (it borrows
-/// the caller's input, so re-invocation is allocation-free), which is exactly
-/// the right unit of retry for `create_batch_inner`: every attempt acquires a
-/// fresh connection and opens a fresh transaction. There is zero happy-path
-/// cost — on success the loop runs the operation once and neither sleeps,
-/// allocates a backoff, nor calls `on_retry`.
-async fn with_retry<T, E, Op, Fut>(
-    max_attempts: u32,
-    backoff: impl Fn(u32) -> Duration,
-    should_retry: impl Fn(&E) -> bool,
-    on_retry: impl Fn(u32, &E),
-    operation: Op,
-) -> Result<T, E>
-where
-    Op: Fn() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    let mut attempt: u32 = 1;
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                if attempt >= max_attempts || !should_retry(&err) {
-                    return Err(err);
-                }
-                on_retry(attempt, &err);
-                // `toolkit::tokio` is the crate's tokio re-export (matching
-                // `toolkit::tokio::spawn` / `select!` elsewhere in this gear);
-                // `tokio` itself is only a dev-dependency.
-                toolkit::tokio::time::sleep(backoff(attempt)).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-/// Outcome of reading the existing `usage_records` row for a not-won key.
-enum ConflictRead {
-    /// The conflicting row exists — resolve absorb vs conflict against it.
-    Stored(Box<UsageRecordRow>),
-    /// The conflicting row's chunk was dropped by retention between the
-    /// conflicting insert and the read → retryable `Transient`.
-    Stale,
-}
-
-/// `OffsetDateTime` at microsecond precision, as the unix-epoch microsecond
-/// count.
-///
-/// Postgres `timestamptz` stores microseconds; an incoming `OffsetDateTime`
-/// may carry sub-microsecond nanos that never survive the round-trip. Comparing
-/// the microsecond counts makes the canonical-equality check agree with what
-/// the DB actually persisted.
-///
-/// Delegates to the SDK's [`usage_collector_sdk::created_at_micros`] so this
-/// dedup-equality projection and the identity derivation in
-/// [`usage_collector_sdk::derive_usage_record_id`] share one canonical µs
-/// primitive — a precision change in one crate cannot silently diverge them.
-fn to_micros(dt: OffsetDateTime) -> i128 {
-    usage_collector_sdk::created_at_micros(dt)
-}
-
-/// Compare the caller-supplied canonical fields of a stored row against an
-/// incoming record (§3.6: absorb vs conflict).
-///
-/// The canonical set compared here is `id`, `value`, `resource_ref`,
-/// `subject_ref`, `corrects_id`, and `metadata`. Excluded are the dedup-key
-/// fields (`tenant_id` / `gts_id` / `idempotency_key` / `created_at`) — the
-/// lookup key, already matched — and server-managed `status` / `ingested_at`.
-/// `metadata` is compared after decoding the stored `jsonb` back to the typed
-/// map.
-///
-/// NOTE — `created_at` is excluded because it is part of the dedup key (the
-/// `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple UNIQUE): this
-/// function only runs once that key has already matched, so the timestamps are
-/// equal by construction. A same-`idempotency_key` request carrying a
-/// *different* `created_at` is a distinct 4-tuple — a distinct record with a
-/// distinct `id` (ADR-0014 makes `created_at` part of the record identity), not
-/// a conflict; see DESIGN.md §2.2.
-///
-/// NOTE — the record `id` is compared here (stored `id` column vs the
-/// incoming record's `id`). Since `id` is a deterministic projection of the
-/// 4-tuple dedup key `(tenant_id, gts_id, idempotency_key, created_at)`
-/// (ADR-0014) and this function only runs once that full key has matched, the
-/// two ids are equal by construction, so this comparison is a defensive
-/// tautology rather than a fail-closed guard against a mismatched
-/// caller-supplied identity. It is kept so a future non-deterministic-id path
-/// (or a corrupted stored row) still surfaces as an `IdempotencyConflict`
-/// rather than a silent absorb.
-///
-/// Comparing `id` here is explicitly sanctioned by the SPI contract:
-/// plugin-spi.md §"Plugin-specific outputs" (Create single record output) and
-/// domain-model.md §2.5 `IdempotencyKey` exclude only the server-managed
-/// `status` from the caller-canonical comparison, and both note that a plugin
-/// MAY defensively verify the deterministic `id` against the derived value —
-/// surfacing a corrupted stored row as `IdempotencyConflict` rather than a
-/// silent absorb — without changing the outcome for well-formed data. That is
-/// exactly the guard described above.
-///
-/// The one edge the tautology relies on: a pre-`id`-determinism row would break
-/// it — its stored `id` is the old *caller-supplied* `uuid`, not the derived
-/// value — surfacing an exact retry as a false `IdempotencyConflict`.
-/// Deployments are greenfield, so no such row exists; see migration
-/// `0002_rename_uuid_to_id.sql`.
+/// A `NULL` dimension reads as the empty string. With the presence guards
+/// [`dimension_presence_guard`](crate::infra::storage::query::aggregate::dimension_presence_guard)
+/// emits, the nullable dimensions cannot produce one; the fallback stands for
+/// the columns that never can.
 ///
 /// # Errors
 ///
-/// Returns [`UsageCollectorPluginError::Internal`] when the stored `metadata`
-/// `jsonb` cannot be decoded back to the typed map — a stored-data invariant
-/// break, distinct from a canonical-field mismatch (which returns `Ok(false)`).
-fn canonical_equal(
-    row: &UsageRecordRow,
-    incoming: &UsageRecord,
-) -> Result<bool, UsageCollectorPluginError> {
-    let stored_metadata = metadata_jsonb_to_map(row.metadata.clone())?;
-    Ok(row.id == incoming.id
-        && row.value == incoming.value
-        && row.resource_id == incoming.resource_ref.resource_id()
-        && row.resource_type == incoming.resource_ref.resource_type()
-        && row.subject_id.as_deref()
-            == incoming
-                .subject_ref
-                .as_ref()
-                .map(usage_collector_sdk::SubjectRef::subject_id)
-        && row.subject_type.as_deref()
-            == incoming.subject_ref.as_ref().and_then(|s| s.subject_type())
-        && row.corrects_id == incoming.corrects_id
-        && stored_metadata == incoming.metadata)
+/// Returns [`UsageCollectorPluginError::Internal`] when a column cannot be
+/// decoded at its expected type — `TEXT` for a dimension, `numeric` for the
+/// fold.
+// @cpt-algo:cpt-cf-uc-plugin-algo-bucket-key-rendering:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-bucket-key-rendering:p1
+// @cpt-dod:cpt-cf-uc-plugin-dod-empty-selection-values:p1
+fn aggregate_bucket(
+    row: &PgRow,
+    dim_count: usize,
+) -> Result<AggregationBucket, UsageCollectorPluginError> {
+    let mut key = Vec::with_capacity(dim_count);
+    for i in 0..dim_count {
+        let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate dimension column {i} read failed: {e}"
+            ))
+        })?;
+        key.push(dim.unwrap_or_default());
+    }
+    let value = row
+        .try_get::<Option<BigDecimal>, _>(dim_count)
+        .map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "aggregate value column {dim_count} read failed: {e}"
+            ))
+        })?;
+    Ok(AggregationBucket { key, value })
 }
 
 #[async_trait]
 impl RecordStore for PgRecordStore {
-    // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-dedup:p2
-    async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
-        // Time the whole single-row call; the per-row counters live in
-        // `create_inner` so they count once regardless of single-vs-batch.
-        let t = Instant::now();
-        let result = self.create_inner(record).await;
-        self.metrics
-            .record_insert(InsertMode::Single, t.elapsed().as_secs_f64());
-        result
-    }
-
     // @cpt-flow:cpt-cf-uc-plugin-seq-ingest-batch:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-persist-entry-batch:p1
+    // @cpt-flow:cpt-cf-uc-plugin-flow-persist-withdrawal:p1
+    // @cpt-state:cpt-cf-uc-plugin-state-entry-withdrawal:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-record-and-withdrawal-coexist:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-withdrawal-as-appended-entry:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-no-mutation-of-target:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-linearizable-dedup-level:p1
     async fn create_batch(
         &self,
-        records: Vec<UsageRecord>,
-    ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>
+        records: Vec<MeteredRecord>,
+    ) -> Result<Vec<Result<StoredUsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>
     {
         if records.is_empty() {
             tracing::warn!(
@@ -929,34 +323,25 @@ impl RecordStore for PgRecordStore {
             ));
         }
 
-        // Per-row dedup semantics, input order, and per-row metrics are
-        // preserved by `create_batch_inner`; the multi-row write replaces the
-        // former N+1 per-row loop (DESIGN cpt-cf-uc-plugin-seq-ingest-batch).
-        //
-        // Wrap the whole call in a bounded retry: on an outer `Transient` (the
-        // classic ABBA deadlock victim aborted as `40P01`, a serialization
-        // failure `40001`, or a connection blip) re-run the operation up to
-        // `MAX_BATCH_ATTEMPTS` times. Each attempt acquires a fresh connection
-        // and opens a fresh transaction (`create_batch_inner` does both), so a
-        // rolled-back attempt leaves no state behind. Re-running is safe: the
-        // transaction is atomic and the dedup keys make it idempotent, so a
-        // re-run either re-claims the same slots or absorbs/conflicts against
-        // the now-committed survivor. `Ok(vec)` is never retried — per-row
-        // `Transient` outcomes inside it are the host's to handle (the batch as
-        // a whole succeeded), and retrying them would be a correctness bug.
+        // Bounded retry around the whole call: on an outer `Transient`, re-run
+        // up to `MAX_BATCH_ATTEMPTS` times. `is_retryable_batch_error` lists the
+        // causes that reach here. Each attempt acquires a fresh connection and
+        // opens a fresh transaction, so a rolled-back attempt leaves no state
+        // behind; the transaction is atomic and the identities make it
+        // idempotent, so a re-run cannot double-write. `Ok(vec)` is never
+        // retried — per-row `Transient` outcomes inside it are the host's to
+        // handle, and retrying them would be a correctness bug.
         let n = records.len();
-        // Time the whole operation including any retries, recorded once
-        // regardless of outcome (matches the single-call behaviour). On the
-        // happy path the loop runs `create_batch_inner` exactly once.
+        // Timed once including any retries, regardless of outcome.
         let t = Instant::now();
         let result = with_retry(
             MAX_BATCH_ATTEMPTS,
             batch_retry_backoff,
             is_retryable_batch_error,
             |attempt, err| {
-                // Make the retry observable: a distinct warn + counter so a
-                // self-healed deadlock victim can be told apart from a returned
-                // transient error (which only moves the backend-error counter).
+                // A distinct warn + counter, so a self-healed transient can be
+                // told apart from a returned one (which never moves this
+                // counter).
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_BATCH_ATTEMPTS,
@@ -968,8 +353,7 @@ impl RecordStore for PgRecordStore {
             || self.create_batch_inner(&records),
         )
         .await;
-        self.metrics
-            .record_insert(InsertMode::Batch, t.elapsed().as_secs_f64());
+        self.metrics.record_insert(t.elapsed().as_secs_f64());
         if result.is_ok() {
             // `n` is a row count: convert via `try_from` (no `as` cast),
             // saturating an implausibly huge batch to `u32::MAX` before f64.
@@ -979,315 +363,388 @@ impl RecordStore for PgRecordStore {
         result
     }
 
-    async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+    /// Point lookup by `id`, intersected with the caller's compiled PDP scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorPluginError::UsageRecordNotFound`] when no row
+    /// satisfies both the `id` and the scope — the two cases are one answer, on
+    /// purpose — [`UsageCollectorPluginError::Internal`] when the scope cannot
+    /// be translated or a stored row cannot be mapped, and the mapped backend
+    /// error when the query itself fails.
+    // @cpt-algo:cpt-cf-uc-plugin-algo-scoped-point-lookup:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-scoped-point-lookup:p1
+    // @cpt-algo:cpt-cf-uc-plugin-algo-consistency-profile-publication:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-consistency-profile-publication:p1
+    async fn get(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<StoredUsageRecord, UsageCollectorPluginError> {
         // Lookup by the public `id`. This relies on a one-record-per-`id`
         // contract, which the hypertable schema cannot enforce on its own — a
-        // `UNIQUE` there must include the `created_at` partition key, so only the
-        // composite PK `(id, created_at)` is enforced. `fetch_optional` therefore
-        // returns the first matching row.
+        // `UNIQUE` there must include every partition column, so only the
+        // composite PK `(id, window_end, type_key)` is enforced.
+        // `fetch_optional` therefore returns the first matching row.
         //
-        // `id` is a `UUIDv5` of the full 4-tuple dedup key
-        // `(tenant_id, gts_id, idempotency_key, created_at)` (ADR-0014), which is
-        // exactly this plugin's dedup identity, so each stored row carries a
-        // distinct `id`: `WHERE id = $1` matches at most one row. (Before
-        // ADR-0014 `id` excluded `created_at`, so the same 3-tuple at two
-        // `created_at` values shared one `id`; folding `created_at` into the
-        // derivation closed that collision — see DESIGN.md §2.2.)
-        let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = $1");
+        // `id` is the derived dedup identity (`entry_identity`), so each stored
+        // row carries a distinct `id` and `WHERE id = $1` matches at most one
+        // row. A withdrawn record and the withdrawal naming it are two `id`s,
+        // differing in the entry-kind input. The derivation keys on the
+        // *identifier* while `usage_records_dedup_uniq` spans `gts_type_uuid`;
+        // the two partition rows into identical identity classes under the
+        // managed identifier profile types-registry ADR-0001 admits, and into
+        // coarser ones where an external source serves two identifiers embedding
+        // one explicit UUID tail — never finer.
+        //
+        // **No `invalidates` predicate belongs in this query, and none ever
+        // will.** The asymmetry with the fold is deliberate: `aggregate`
+        // excludes a withdrawn pair because a total that counts one is wrong,
+        // and that is a derived view; this is the ledger itself. The SPI states
+        // it outright — a withdrawn pair MUST be returned as persisted here and
+        // from `list_usage_records` — because hiding either half destroys the
+        // audit trail the append-only model exists to keep. A consumer wanting
+        // the netted view has what it needs: an invalidation names its target
+        // (`UsageRecord::invalidation`), so the fold happens on the reader's
+        // side.
+        //
+        // The scope is translated before a connection is acquired, so a scope
+        // that cannot be rendered never reaches the pool and never reads a row.
+        let (sql, binds) = build_get_sql(scope).map_err(UsageCollectorPluginError::internal)?;
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(id);
+        for b in &binds {
+            q = bind_one(q, b);
+        }
         let mut conn = self.timed_acquire().await?;
-        let row = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql))
-            .bind(id)
+        let row = q
             .fetch_optional(&mut *conn)
             .await
             .map_err(|err| self.record_backend_error(&err))?;
 
         match row {
             Some(row) => record_row_to_model(row),
+            // One arm for both "no such entry" and "exists, but outside your
+            // scope": the scope is part of the `WHERE`, so a withheld row is
+            // already indistinguishable from an absent one by the time we get
+            // here. Nothing may be logged, counted or timed that would tell
+            // them apart — that distinction *is* the existence oracle.
             None => Err(UsageCollectorPluginError::UsageRecordNotFound { id }),
         }
     }
 
-    /// Keyset-paginated `usage_records` list, scoped to `gts_id` (bound at
-    /// `$1`), with optional `$filter`, metadata side-channel filters, and a
-    /// cursor.
+    /// One feed page, run as the six-step protocol this plugin's
+    /// `docs/DESIGN.md` §3.6 `cpt-cf-uc-plugin-seq-feed-page` sets out.
     ///
-    /// Builds `SELECT {RECORD_COLUMNS} FROM usage_records WHERE gts_id = $1
-    /// [AND <filter>] [AND <metadata>] [AND <keyset>] ORDER BY <order> LIMIT
-    /// <n+1>`. The extra `+1` row is the look-ahead that detects a following
-    /// page; it is truncated before mapping. All identifiers come from the
-    /// [`record_column`] allowlist and the static [`RECORD_COLUMNS`]; every
-    /// value is bound (`$N`).
+    /// Steps 1-5 run on one connection, inside a real [`sqlx::Transaction`]
+    /// opened with [`sqlx::Connection::begin_with`] rather than a raw `BEGIN`.
+    /// That is not cosmetic: `sqlx` tracks an open `Transaction`, so if this
+    /// future is dropped before [`sqlx::Transaction::commit`] runs (a host-side
+    /// timeout or a client disconnect) the drop queues a `ROLLBACK`. Without
+    /// that tracking the connection would return to the pool still holding an
+    /// open `REPEATABLE READ READ ONLY` transaction, and the next caller to
+    /// acquire it would run inside an abandoned snapshot.
+    ///
+    /// The transaction borrows `conn` only until [`sqlx::Transaction::commit`]
+    /// consumes it, so step 6 — the authoritative autocommit mark re-check —
+    /// runs on the same pooled connection afterward, and both it and step 3's
+    /// fast-path check reach one [`Self::mark_stands_above`].
+    ///
+    /// Steps 2 to 4 are [`Self::feed_page_in_transaction`], in [`feed`].
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field, the cursor's filter hash disagrees with
-    /// `query.filter_hash`, an order/keyset field is off the allowlist, a stored
-    /// row cannot be mapped, or the DB query fails.
+    /// See [`RecordStore::feed_page`].
+    // @cpt-flow:cpt-cf-uc-plugin-seq-feed-page:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-read-feed-page:p1
+    // @cpt-algo:cpt-cf-uc-plugin-algo-feed-page-protocol:p1
+    // @cpt-state:cpt-cf-uc-plugin-state-feed-position:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-settled-page-protocol:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-feed-completeness:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-named-start:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-gateway-owned-position:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-feed-freshness-bound:p1
+    async fn feed_page(
+        &self,
+        subscription: &[Uuid],
+        scope: &ast::Expr,
+        after: Option<(u64, Uuid)>,
+        until: Option<(u64, Uuid)>,
+        limit: u64,
+    ) -> Result<FeedPageRows, UsageCollectorPluginError> {
+        // The drop-timer records `uc_timescaledb_feed_page_duration_seconds` on
+        // every return, including the validation and refusal error arms below.
+        let _timer = OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::FeedPage);
+
+        // Translated before a connection is acquired, so a scope that cannot
+        // be rendered never opens a transaction — the discipline `get`
+        // already keeps.
+        let (sql, binds) = build_feed_page_sql(after, until, scope, limit)
+            .map_err(UsageCollectorPluginError::internal)?;
+        // Deduplicated, order-preserving: `unnest($1::uuid[])` iterates per
+        // array *element*, so a repeated type would deliver its rows twice.
+        // `FeedSubscription::new` already sorts and dedups, but that invariant
+        // lives two crates away, so this statement keeps its own correctness
+        // local. `sort_unstable` + `dedup` would also dedup but erase the
+        // caller's order, which `unnest` walks the array in.
+        let types = dedup_subscription_types(subscription);
+
+        let mut conn = self.timed_acquire().await?;
+
+        // Step 1. READ ONLY because nothing here writes, and REPEATABLE READ
+        // because the horizon read must fix the snapshot the page statement
+        // then runs under. See this method's own doc for why `begin_with`
+        // rather than a raw `BEGIN` statement.
+        let mut tx = conn
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
+        let page = self
+            .feed_page_in_transaction(&mut tx, &sql, &binds, &types, after, until, limit)
+            .await;
+
+        // Step 5, on the success path only. `?` propagates a steps-2-4 error
+        // before `tx` is committed; dropping an uncommitted `Transaction` queues
+        // its `ROLLBACK`, so an error is rolled back rather than left for an
+        // unconditional `COMMIT` to paper over.
+        let page = page?;
+        tx.commit()
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+
+        // Step 6. Authoritative, in autocommit, after the COMMIT: step 3 runs
+        // under the page's snapshot and can miss a drop that commits after
+        // it. Short-circuiting on `page.marked` is what keeps this the
+        // "opt page_after present, not marked" branch of DESIGN §3.6's
+        // diagram: a mark the fast path already found is not re-read here.
+        //
+        // One shared return for both refusal reasons (step 3's fast-path find
+        // or step 6's live re-check), so one counter call here covers both:
+        // the counter counts refusals, not re-checks, and this method never
+        // returns `CursorBeyondRetention` from anywhere else.
+        if let Some(position) = after
+            && (page.marked || self.mark_stands_above(&mut conn, &types, position).await?)
+        {
+            self.metrics.inc_feed_cursor_refusal();
+            return Err(UsageCollectorPluginError::CursorBeyondRetention);
+        }
+
+        Ok(FeedPageRows {
+            entries: page.entries,
+            next: page.next,
+        })
+    }
+
+    /// Keyset-paginated ledger read over one meter and one covered-period
+    /// range, with the caller's composed `$filter`, the metadata side channel
+    /// and an optional keyset.
+    ///
+    /// The statement is
+    /// [`build_list_sql`](crate::infra::storage::query::list::build_list_sql)'s
+    /// and the page is
+    /// [`build_list_page`](crate::infra::storage::query::list::build_list_page)'s;
+    /// what is left here is the round trip between them. Both halves are pure,
+    /// so both are tested without a database.
+    ///
+    /// Selection reads the covered-period end alone, `from <= window_end <
+    /// to`, and entries are returned as persisted, withdrawn pairs included.
+    /// Each of the two is stated where it is enforced rather than only here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorPluginError::Internal`] when the statement
+    /// cannot be built (an untranslatable `$filter`, an order or keyset field
+    /// off the allowlist) or the page cannot be assembled (an order field
+    /// that is not a keyset key, a keyset that is empty or too large, a
+    /// stored row that cannot be mapped), and the mapped backend error when
+    /// the query itself fails.
     // @cpt-flow:cpt-cf-uc-plugin-seq-list-keyset:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-read-raw-page:p1
+    // @cpt-algo:cpt-cf-uc-plugin-algo-consistency-profile-publication:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-consistency-profile-publication:p1
     async fn list(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_uuid: Uuid,
+        time_range: TimeRange,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-    ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError> {
-        // Time the full raw-list call and count the request. The drop-timer
-        // records the histogram on every return — including the validation
-        // error arms below — not just on success.
+        keyset: Option<&Keyset>,
+    ) -> Result<RecordPage, UsageCollectorPluginError> {
+        // The drop-timer records the histogram on every return, including the
+        // validation error arms below, not just on success.
         let _timer =
             OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Query(QueryKind::Raw));
         self.metrics.inc_query_request(QueryKind::Raw);
+
         // Defense-in-depth: clamp the caller's `$top` to `MAX_PAGE_SIZE` so a
         // value that slipped past the core gateway's `$top` cap can never drive
         // an unbounded `LIMIT n+1 ... fetch_all`.
         let limit = effective_page_size(query.limit, DEFAULT_PAGE_SIZE);
 
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> = vec!["gts_id = $1".to_owned()];
+        // Built before a connection is acquired, so a query that cannot be
+        // rendered never reaches the pool and never reads a row.
+        let (sql, binds) = build_list_sql(
+            gts_type_uuid,
+            time_range,
+            query,
+            metadata_filter,
+            keyset,
+            limit,
+        )
+        .map_err(UsageCollectorPluginError::internal)?;
 
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel: AND across filters, OR within one filter's
-        // values (see [`push_metadata_filter_clauses`]).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Keyset continuation (forward only). The cursor's filter hash must
-        // match the live query's so a cursor is never replayed against a
-        // different filter.
-        if let Some(cursor) = query.cursor.as_ref() {
-            // Forward-only: the keyset operator is derived from the sort
-            // direction, not from `cursor.d`, so a backward cursor would
-            // silently page forward. Reject it fail-closed.
-            ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
-            if cursor.f.as_deref() != query.filter_hash.as_deref() {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor filter hash mismatch",
-                ));
-            }
-            // The cursor's keys (`cursor.k`) are positional, bound against the
-            // live `query.order` columns below. If the order changed between
-            // pages at the same arity, old keys would bind to new columns —
-            // silently wrong pagination. The cursor carries the signed sort
-            // tokens (`cursor.s`) precisely to detect this, mirroring the
-            // filter-hash guard above.
-            if !query.order.equals_signed_tokens(&cursor.s) {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor sort order mismatch",
-                ));
-            }
-            let order_pairs: Vec<(&str, bool)> = query
-                .order
-                .0
-                .iter()
-                .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
-                .collect();
-            let predicate = keyset_predicate(
-                &order_pairs,
-                &cursor.k,
-                record_column,
-                |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
-                is_keyset_safe_record_field,
-                &mut ctx,
-            )
-            .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(predicate);
-        }
-
-        let order_sql = render_order_by(&query.order, record_column)
-            .map_err(UsageCollectorPluginError::internal)?;
-
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {} ORDER BY {order_sql} LIMIT {}",
-            clauses.join(" AND "),
-            limit.saturating_add(1),
-        );
-
-        let mut q =
-            sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query_as::<_, UsageRecordRow>(AssertSqlSafe(sql));
+        for b in &binds {
             q = bind_one(q, b);
         }
         let mut conn = self.timed_acquire().await?;
-        let mut rows = q
+        let rows = q
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        // Look-ahead row present -> a next page exists; drop it before mapping.
-        let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
-        if has_next {
-            rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        }
-
-        let next_cursor = if has_next {
-            let last = rows.last().ok_or_else(|| {
-                UsageCollectorPluginError::internal("non-empty page lost its tail")
-            })?;
-            let keys = query
-                .order
-                .0
-                .iter()
-                .map(|key| {
-                    record_row_key(last, &key.field).ok_or_else(|| {
-                        UsageCollectorPluginError::internal(format!(
-                            "order field `{}` has no cursor key on the row",
-                            key.field
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let token = encode_next_cursor(&query.order, &keys, query.filter_hash.as_deref())
-                .map_err(UsageCollectorPluginError::internal)?;
-            Some(token)
-        } else {
-            None
-        };
-
-        let items = rows
-            .into_iter()
-            .map(record_row_to_model)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // `_timer` records `query.duration` on drop (success and error alike).
-        Ok(ODataPage::new(
-            items,
-            PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        build_list_page(rows, query, limit)
     }
 
-    /// Pushed-down aggregation over `usage_records`, scoped to `gts_id` (bound
-    /// at `$1`) and to `status = 'active'`, with optional `$filter`, metadata
-    /// side-channel filters, and a `GROUP BY` over the spec's dimensions
-    /// (§3.6 aggregated query).
+    /// Pushed-down fold over one meter's entries in one covered-period range,
+    /// optionally grouped.
     ///
-    /// Builds `SELECT <dim exprs…>, <AGG> FROM usage_records WHERE gts_id = $1
-    /// AND status = 'active' [AND corrects_id IS NULL] [AND <filter>] [AND
-    /// <metadata>] [AND <subject-not-null guards>] [GROUP BY 1, 2, …]`. The
-    /// aggregate ([`agg_select_expr`]) and each dimension
-    /// ([`dimension_select_expr`]) come from closed enum allowlists; the only
-    /// caller-derived values (a grouped metadata key, `$filter` operands,
-    /// metadata side-channel values) are bound (`$N`). `status = 'active'` is
-    /// always applied. The `corrects_id IS NULL` partition is op-dependent
-    /// ([`corrects_id_partition_clause`]): `SUM` nets across all active rows —
-    /// compensations carry a signed `value` — so it omits the partition; every
-    /// other op (`COUNT`/`MIN`/`MAX`/`AVG`) restricts to `corrects_id IS NULL`
-    /// rows, since compensations adjust `SUM` and are not events (plugin-spi.md
-    /// §Method 3). With an empty `group_by` there is no `GROUP BY` clause, so
-    /// the query yields exactly one bucket with `key = []`.
+    /// The statement is
+    /// [`build_aggregate_sql`](crate::infra::storage::query::aggregate::build_aggregate_sql)'s;
+    /// the rules it encodes are documented there. Two properties are this
+    /// method's rather than the builder's:
     ///
-    /// Each returned row maps to one [`AggregationBucket`]: the `k` dimension
-    /// columns read positionally as `Option<String>` (a `NULL` dimension
-    /// becomes the empty string — relevant only when a grouped metadata key is
-    /// absent on some active rows), and the aggregate at index `k` reads as
-    /// `Option<BigDecimal>` (arbitrary precision, carried through as-is;
-    /// `NULL` -> `None`).
+    /// - **The statement is built before a connection is acquired**, so a query
+    ///   that cannot be rendered never reaches the pool and never reads a row.
+    /// - **Each fetched row becomes exactly one bucket**
+    ///   ([`aggregate_bucket`]), so an empty `group_by` — a bare aggregate with
+    ///   no `GROUP BY`, which `PostgreSQL` answers with exactly one row — yields
+    ///   the single empty-keyed bucket the SPI asks for rather than an empty
+    ///   bucket list. That bucket carries `Some(0)` under `COUNT` **and** under
+    ///   `SUM`, both of which DESIGN §3.3 defines over an empty selection;
+    ///   `MAX`, `MIN` and `LATEST` are not defined over one and keep the `None`
+    ///   ([`usage_collector_sdk::v2::AggregationBucket::value`]). The two zeroes
+    ///   arrive differently: `COUNT` is `SELECT COUNT(*)`'s own answer, while
+    ///   `SUM` over zero rows is `NULL` in `PostgreSQL` and is made `0` by a
+    ///   `COALESCE` in the statement —
+    ///   [`fold_select_expr`](crate::infra::storage::query::aggregate::fold_select_expr)
+    ///   on the scan path, [`build_rollup_aggregate_sql`] on the rollup one.
+    ///
+    /// Both are held by a pair of tests against a lazy pool at a dead DSN, where
+    /// reaching the pool answers `Transient` and stopping before it answers
+    /// `Internal`: `a_fold_that_cannot_be_built_never_reaches_the_pool` requires
+    /// the `Internal`, `the_ungrouped_fold_still_reaches_the_pool` the
+    /// `Transient`. Either alone would leave the ordering unpinned.
+    ///
+    /// The dimension columns read positionally as `Option<String>` and the fold
+    /// at index `k` as `Option<BigDecimal>` — arbitrary precision, so a wide
+    /// `SUM` cannot overflow on decode.
+    ///
+    /// **`LATEST` materializes before it picks, so its peak memory is O(largest
+    /// group).** The expression is `(ARRAY_AGG(r.quantity ORDER BY …))[1]`, so
+    /// `PostgreSQL` builds a group's values into an array before taking the
+    /// head. An aggregate carrying its own `ORDER BY` takes the grouped node off
+    /// the hash path, so the plan is `Sort → GroupAggregate` and exactly one
+    /// array is live at a time. Peak memory therefore grows with the row count
+    /// of the largest group, not with the number of groups, and the array does
+    /// not spill. (The `Sort` beneath is `work_mem`-bounded and needed by every
+    /// candidate formulation, so it is not a cost of this one.)
+    ///
+    /// **Nothing bounds the rows within one group except the caller's covered
+    /// period, which is a request parameter.**
+    /// [`aggregate_limit_clause`](crate::infra::storage::query::aggregate::aggregate_limit_clause)
+    /// bounds the number of groups and never the rows inside one, so a `LATEST`
+    /// read with a wide largest group is a server-side allocation sized by
+    /// caller input. `SUM`, `COUNT`, `MAX` and `MIN` accumulate fixed state per
+    /// group.
+    ///
+    /// **Two alternatives are O(1) per group and both are kept out.**
+    /// `DISTINCT ON` and `ROW_NUMBER() OVER (PARTITION BY …) = 1` avoid the
+    /// array, but neither is a `SELECT`-list expression a caller can drop in
+    /// beside `SUM`, and neither expresses the ungrouped fold — `DISTINCT ON ()`
+    /// is a syntax error, and `PARTITION BY` nothing answers **zero** rows over
+    /// an empty selection where this method owes exactly one empty-keyed bucket.
+    ///
+    /// An eligible `SUM` or `COUNT` is served from `usage_rollup_1h` (see
+    /// [`crate::infra::storage::query::rollup`]); the result is numerically
+    /// identical to the scan's, up to the rollup's refresh watermark (spec §8.1)
+    /// and given spec §5.2's invariants. Both routes return one
+    /// [`AggregateStatement`](crate::infra::storage::query::aggregate::AggregateStatement),
+    /// so the choice of route is the only thing this
+    /// method branches on — the running and decoding below is shared.
     ///
     /// # Errors
     ///
-    /// Returns [`UsageCollectorPluginError::Internal`] when the filter AST
-    /// references an unknown field or is otherwise invalid, the DB query fails,
-    /// or a result column cannot be read at its expected type.
+    /// Returns [`UsageCollectorPluginError::Internal`] when the composed filter
+    /// cannot be translated, the query fails, or a result column cannot be
+    /// decoded at its expected type; a pool-acquisition failure surfaces as
+    /// whatever `timed_acquire` classifies it as.
     // @cpt-flow:cpt-cf-uc-plugin-seq-query-aggregated:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-run-aggregated-query:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-rollup-eligibility-and-path-reporting:p1
+    // @cpt-dod:cpt-cf-uc-plugin-dod-latest-memory-bound-publication:p1
     async fn aggregate(
         &self,
-        gts_id: UsageTypeGtsId,
+        gts_type_uuid: Uuid,
+        time_range: TimeRange,
+        fold: AggregationFold,
         query: &ODataQuery,
         metadata_filter: &[MetadataFilter],
-        spec: AggregationSpec,
+        group_by: &[AggregationDimension],
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
-        // Time the full aggregated-query call and count the request. The
-        // drop-timer records the histogram on every return, not just success.
+        // The drop-timer records the histogram on every return, not just
+        // success.
         let _timer = OpDurationGuard::start(
             Arc::clone(&self.metrics),
             TimedOp::Query(QueryKind::Aggregated),
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
-        // `$1` is reserved for the `gts_id` scope bind; every translated bind
-        // therefore starts at `$2`.
-        let mut ctx = SqlCtx::new(2);
-        let mut clauses: Vec<String> =
-            vec!["gts_id = $1".to_owned(), "status = 'active'".to_owned()];
 
-        // `corrects_id` partition (plugin-spi.md §Method 3): `SUM` nets across
-        // all active rows (compensations carry a signed `value`); every other op
-        // operates over `corrects_id IS NULL` rows only, since compensations
-        // adjust `SUM` and are not events. Load-bearing for `COUNT`-on-counter.
-        if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            clauses.push(clause.to_owned());
-        }
-
-        // `$filter` (validated AST -> typed node -> parameterized fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_record_filter(&node, &mut ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel (same expansion as `list`).
-        push_metadata_filter_clauses(metadata_filter, &mut ctx, &mut clauses);
-
-        // Build dimension SELECT exprs in GROUP-BY order, binding any metadata
-        // keys, and emit subject-not-null guards so subject-less rows are
-        // excluded from subject grouping (per the SDK dimension docs).
-        let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
-        for dim in &spec.group_by {
-            match dim {
-                AggregationDimension::SubjectId => {
-                    clauses.push("subject_id IS NOT NULL".to_owned());
-                }
-                AggregationDimension::SubjectType => {
-                    clauses.push("subject_type IS NOT NULL".to_owned());
-                }
-                _ => {}
-            }
-            select_dims.push(dimension_select_expr(dim, &mut ctx));
-        }
-
-        // SELECT list = dimension exprs ++ the aggregate. With no dimensions
-        // the SELECT is just the aggregate (single-bucket / no-grouping case).
-        let dim_count = select_dims.len();
-        let mut select_parts = select_dims;
-        select_parts.push(agg_select_expr(spec.op).to_owned());
-        let select_list = select_parts.join(", ");
-
-        // GROUP BY by ordinal (1..=k) so the bound metadata expr is not
-        // repeated; omitted entirely when there are no dimensions.
-        let group_by = if dim_count == 0 {
-            String::new()
+        // The rollup answers an eligible SUM/COUNT exactly (spec §6); every
+        // other query takes the scan it always has. The eligibility test reads
+        // the same composed filter the scan would translate.
+        let routed = if self.rollup_enabled {
+            Some(rollup_eligible(
+                fold,
+                query.filter(),
+                metadata_filter,
+                group_by,
+                time_range,
+            ))
         } else {
-            let ordinals = (1..=dim_count)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" GROUP BY {ordinals}")
+            None
+        };
+        let statement = match routed {
+            Some(Ok(split)) => {
+                let st = build_rollup_aggregate_sql(
+                    gts_type_uuid,
+                    split,
+                    fold,
+                    query.filter(),
+                    group_by,
+                )
+                .map_err(UsageCollectorPluginError::internal)?;
+                self.metrics.record_aggregate_path(None);
+                st
+            }
+            other => {
+                if let Some(Err(reason)) = other {
+                    self.metrics.record_aggregate_path(Some(reason));
+                }
+                build_aggregate_sql(
+                    gts_type_uuid,
+                    time_range,
+                    fold,
+                    query,
+                    metadata_filter,
+                    group_by,
+                )
+                .map_err(UsageCollectorPluginError::internal)?
+            }
         };
 
-        // Bound the distinct-group cardinality so a high-cardinality `group_by`
-        // cannot materialize an unbounded bucket set into memory; the gateway
-        // rejects an over-cap result (plugin-spi.md §Method 3).
-        let limit_clause = aggregate_limit_clause(dim_count);
-        let sql = format!(
-            "SELECT {select_list} FROM usage_records WHERE {}{group_by}{limit_clause}",
-            clauses.join(" AND "),
-        );
-
-        let mut q = sqlx::query(AssertSqlSafe(sql)).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
+        let mut q = sqlx::query(AssertSqlSafe(statement.sql));
+        for b in &statement.binds {
             q = bind_one_query(q, b);
         }
         let mut conn = self.timed_acquire().await?;
@@ -1296,106 +753,178 @@ impl RecordStore for PgRecordStore {
             .await
             .map_err(|e| self.record_backend_error(&e))?;
 
-        let mut buckets = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut key = Vec::with_capacity(dim_count);
-            for i in 0..dim_count {
-                let dim = row.try_get::<Option<String>, _>(i).map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate dimension column {i} read failed: {e}"
-                    ))
-                })?;
-                // A NULL dimension (e.g. a grouped metadata key absent on some
-                // active rows) becomes the empty string in the bucket key.
-                key.push(dim.unwrap_or_default());
-            }
-            let value = row
-                .try_get::<Option<BigDecimal>, _>(dim_count)
-                .map_err(|e| {
-                    UsageCollectorPluginError::internal(format!(
-                        "aggregate value column {dim_count} read failed: {e}"
-                    ))
-                })?;
-            buckets.push(AggregationBucket { key, value });
-        }
+        // One bucket per row, in the order `PostgreSQL` emitted them. The `map`
+        // keeps the no-grouping case honest: no branch on `group_by.is_empty()`
+        // exists to answer an empty bucket list with. The count comes from the
+        // statement that was built, not a second reading of `group_by`, so the
+        // decoder cannot read a different number of key columns than the SELECT
+        // list emits.
+        let buckets = rows
+            .iter()
+            .map(|row| aggregate_bucket(row, statement.dim_count))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        // `_timer` records `query.duration` on drop (success and error alike).
         Ok(AggregationResult { buckets })
     }
 
-    /// Deactivate a record and its depth-1 active compensations in one
-    /// transaction (§3.6 deactivate-cascade).
+    /// Spec §9.3's three selections, run as
+    /// [`build_reconciliation_summary_sql`]'s S1∧S2 statement followed by
+    /// [`build_reconciliation_watermarks_sql`]'s S3, on the same pooled
+    /// connection.
     ///
-    /// Locks the target row `FOR UPDATE` and reads its `status`: a missing row
-    /// is `UsageRecordNotFound`, an already-`inactive` row is
-    /// `UsageRecordAlreadyInactive`. An `active` target and every `active` row
-    /// whose `corrects_id` points at it (depth-1 only) flip to `inactive` in a
-    /// single `UPDATE`. The transition is one-way and mutates no other column;
-    /// rows already `inactive` and unrelated rows are untouched.
+    /// **[`OpDurationGuard`] with [`TimedOp::Reconciliation`], not a third
+    /// [`QueryKind`] variant.** This plugin's `QueryKind` is fixed at
+    /// `{Aggregated, Raw}` by `docs/DESIGN.md`, so a third value would emit a
+    /// label that document does not declare.
+    /// `uc_timescaledb_reconciliation_duration_seconds` (§4.3) is unlabelled, as
+    /// `uc_timescaledb_feed_page_duration_seconds` is, so a dedicated label-free
+    /// `TimedOp` variant records it.
     ///
-    /// `WHERE id = $1` addresses one logical record. The schema does not carry a
-    /// plain `UNIQUE (id)` (a hypertable UNIQUE must include the `created_at`
-    /// partition key, so only the composite PK `(id, created_at)` and the dedup
-    /// `(tenant_id, gts_id, idempotency_key, created_at)` UNIQUE exist), but `id`
-    /// is a `UUIDv5` of that full 4-tuple (ADR-0014), so each stored row carries
-    /// a distinct `id` and this `UPDATE` flips at most one row.
-    // @cpt-flow:cpt-cf-uc-plugin-seq-deactivate-cascade:p2
-    async fn deactivate(&self, id: Uuid) -> Result<(), UsageCollectorPluginError> {
-        // Time the full deactivation cascade; the drop-timer records the
-        // duration on every return — including the not-found / already-inactive
-        // and error arms — not just on a successful commit.
-        let _timer = OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Deactivate);
+    /// Two statements rather than one: see
+    /// [`build_reconciliation_watermarks_sql`] for why S3 cannot join S1∧S2's
+    /// ranged scan without forfeiting the leading-edge index read. Both run
+    /// against the one connection [`Self::timed_acquire`] returns, but are not
+    /// wrapped in one transaction: `READ COMMITTED` still lets a commit land
+    /// between them, which the DESIGN sequence does not rule out either.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UsageCollectorPluginError::Internal`] when `scope` cannot be
+    /// translated, when either statement fails, or when a result column
+    /// cannot be decoded at its expected type; a pool-acquisition failure
+    /// surfaces as whatever [`Self::timed_acquire`] classifies it as.
+    // @cpt-flow:cpt-cf-uc-plugin-seq-reconciliation:p2
+    // @cpt-flow:cpt-cf-uc-plugin-flow-read-reconciliation-figures:p2
+    // @cpt-algo:cpt-cf-uc-plugin-algo-accepted-count:p2
+    // @cpt-algo:cpt-cf-uc-plugin-algo-fold-appropriate-summary:p2
+    // @cpt-algo:cpt-cf-uc-plugin-algo-watermark-reads:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-accepted-count-includes-withdrawals:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-unbounded-watermarks:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-scope-applied-first:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-empty-selection-figures:p2
+    // @cpt-dod:cpt-cf-uc-plugin-dod-no-paging-no-rollup:p2
+    async fn reconciliation(
+        &self,
+        tenant_id: Uuid,
+        meter: &MeterRef,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        scope: &ast::Expr,
+    ) -> Result<ReconciliationMetadata, UsageCollectorPluginError> {
+        let gts_type_uuid = meter.uuid;
+
+        // The drop-timer records
+        // `uc_timescaledb_reconciliation_duration_seconds` on every return,
+        // including the validation and decode error arms below.
+        let _timer = OpDurationGuard::start(Arc::clone(&self.metrics), TimedOp::Reconciliation);
+
+        // Both statements are built before a connection is acquired, so a
+        // scope that cannot be rendered never reaches the pool and never
+        // reads a row.
+        let summary_stmt =
+            build_reconciliation_summary_sql(gts_type_uuid, time_range, tenant_id, fold, scope)
+                .map_err(UsageCollectorPluginError::internal)?;
+        let watermarks_stmt = build_reconciliation_watermarks_sql(gts_type_uuid, tenant_id, scope)
+            .map_err(UsageCollectorPluginError::internal)?;
+
         let mut conn = self.timed_acquire().await?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| self.record_backend_error(&e))?;
 
-        // Lock + read the target's status. Since `id` is a `UUIDv5` of the full
-        // 4-tuple dedup key including `created_at` (ADR-0014), each stored row
-        // carries a distinct `id`, so this locks the single addressed row and
-        // the `WHERE id = $1` UPDATE below flips exactly that row.
-        let status = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM usage_records WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        match status {
-            None => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordNotFound { id });
-            }
-            Some(s) if s == "inactive" => {
-                tx.rollback().await.ok();
-                return Err(UsageCollectorPluginError::UsageRecordAlreadyInactive { id });
-            }
-            Some(_) => {}
+        let mut q = sqlx::query(AssertSqlSafe(summary_stmt.sql));
+        for b in &summary_stmt.binds {
+            q = bind_one_query(q, b);
         }
-
-        // Flip the target and its depth-1 active compensations. One-way; the
-        // `status = 'active'` guard on the compensations keeps already-inactive
-        // children untouched and bounds the cascade to a single level.
-        sqlx::query(
-            "UPDATE usage_records SET status = 'inactive' \
-             WHERE id = $1 OR (corrects_id = $1 AND status = 'active')",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| self.record_backend_error(&e))?;
-
-        tx.commit()
+        let summary_row = q
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| self.record_backend_error(&e))?;
-        // `_timer` records `deactivate.duration` on drop.
-        Ok(())
+
+        // Column 0 is always `accepted_count`, the bare unfiltered `COUNT(*)`
+        // — never absent, never negative.
+        let accepted_count: i64 = summary_row.try_get(0).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "reconciliation accepted_count column read failed: {e}"
+            ))
+        })?;
+
+        // Columns 1.. are `build_reconciliation_summary_sql`'s two shapes, read
+        // by the same `QuantitySummary::accrues` branch that chose which one the
+        // statement built, so the decoder cannot read a shape the SELECT list
+        // disagrees with.
+        let quantity_summary = if QuantitySummary::accrues(fold) {
+            let total: BigDecimal = summary_row.try_get(1).map_err(|e| {
+                UsageCollectorPluginError::internal(format!(
+                    "reconciliation accrued summary column read failed: {e}"
+                ))
+            })?;
+            QuantitySummary::Accrued(total)
+        } else {
+            let count: i64 = summary_row.try_get(1).map_err(|e| {
+                UsageCollectorPluginError::internal(format!(
+                    "reconciliation observation count column read failed: {e}"
+                ))
+            })?;
+            let latest: Option<Decimal> = summary_row.try_get(2).map_err(|e| {
+                UsageCollectorPluginError::internal(format!(
+                    "reconciliation latest observation column read failed: {e}"
+                ))
+            })?;
+            let latest = latest
+                .map(UsageQuantity::try_from)
+                .transpose()
+                .map_err(|e| {
+                    UsageCollectorPluginError::internal(format!(
+                        "reconciliation latest observation quantity invalid: {e}"
+                    ))
+                })?;
+            // `count` (column 1, `COUNT(*)`) and `latest` (column 2, a separate
+            // "pick the latest row" subquery) are two independently computed SQL
+            // projections; nothing but the query text keeps them in agreement. A
+            // disagreement here means those two projections drifted apart, which
+            // `ObservedQuantity` cannot represent, so it is reported rather than
+            // silently reshaped into one branch or the other.
+            let count = NonZeroU64::new(u64::try_from(count).unwrap_or(u64::MAX));
+            let observed = match (count, latest) {
+                (None, None) => None,
+                (Some(count), Some(latest)) => Some(ObservedQuantity { count, latest }),
+                (count, latest) => {
+                    return Err(UsageCollectorPluginError::internal(format!(
+                        "reconciliation observation count ({count:?}) and latest observation \
+                         ({latest:?}) disagree on whether the range selected anything"
+                    )));
+                }
+            };
+            QuantitySummary::Observations(observed)
+        };
+
+        let mut q = sqlx::query(AssertSqlSafe(watermarks_stmt.sql));
+        for b in &watermarks_stmt.binds {
+            q = bind_one_query(q, b);
+        }
+        let watermarks_row = q
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| self.record_backend_error(&e))?;
+        let max_accepted_at: Option<OffsetDateTime> = watermarks_row.try_get(0).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "reconciliation max_accepted_at column read failed: {e}"
+            ))
+        })?;
+        let max_window_end: Option<OffsetDateTime> = watermarks_row.try_get(1).map_err(|e| {
+            UsageCollectorPluginError::internal(format!(
+                "reconciliation max_window_end column read failed: {e}"
+            ))
+        })?;
+
+        Ok(ReconciliationMetadata {
+            accepted_count: u64::try_from(accepted_count).unwrap_or(u64::MAX),
+            quantity_summary,
+            max_accepted_at,
+            max_window_end,
+        })
     }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "record_store_tests.rs"]
-mod record_store_tests;
+mod mod_tests;

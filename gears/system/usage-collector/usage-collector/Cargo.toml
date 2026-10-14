@@ -17,6 +17,15 @@ name = "usage_collector"
 [lints]
 workspace = true
 
+[features]
+# Serve generation 2 alongside generation 1. Non-default: it gates the
+# link-time GTS content (the cf.core.uc.usage_record.v2~ base type and six
+# permissions) and the bootstrap that joins the surface to the gear, so a
+# generation-1 deployment publishes nothing it does not serve. Every other
+# line of src/v2 compiles unconditionally, so a default-feature test run
+# covers the domain, infra and API layers.
+v2 = []
+
 [dependencies]
 usage-collector-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
@@ -62,6 +71,24 @@ toolkit-gts = { workspace = true }
 gts = { workspace = true }
 inventory = { workspace = true }
 
+# The Feed Gateway's own position encoding inside `toolkit_odata::CursorV1`'s
+# `k` field.
+base64 = { workspace = true }
+# FNV-1a 64-bit for the gear's cursor fingerprint (`v2::domain::fingerprint`).
+fnv = { workspace = true }
+# Compiles a meter's declared `metadata` subschema once per declaration
+# (`v2::domain::type_resolver::metadata`).
+jsonschema = { workspace = true }
+# Non-poisoning locks for in-memory state. See guidelines/DEPENDENCIES.md.
+parking_lot = { workspace = true }
+# GTS schema and permission registration.
+schemars = { workspace = true }
+# The declaration mirror's table. See ADR-0015.
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+
 [dev-dependencies]
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the bounded
@@ -72,10 +99,23 @@ tokio = { workspace = true, features = ["test-util"] }
 # the gear never constructs an exporter at runtime (ToolKit owns it).
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 toolkit-gts = { workspace = true }
-# Test-only: parses `docs/usage-collector-v1.yaml` for the OpenAPI contract
-# conformance test.
+# Test-only: parses `docs/usage-collector-v2.yaml` for the OpenAPI
+# contract conformance test.
 serde-saphyr = { workspace = true }
 # Test-only: `ServiceExt::oneshot` drives one request through the assembled
 # `Router` so `register_routes`' `Extension<Arc<Service>>` layer — invisible
 # to the OpenAPI registry — is pinned by dispatch.
 tower = { workspace = true }
+# Test-only: capturing tracing subscriber for the v2 observability and
+# service-metrics span/log assertions.
+tracing-subscriber = { workspace = true }
+# Test-only: trace-context propagation helper
+# (`toolkit_http::otel::set_parent_from_headers`) exercised by the v2
+# observability tests.
+toolkit-http = { workspace = true }
+# Real-Postgres coverage for the declaration mirror
+# (tests/postgres_declaration_mirror.rs).
+testcontainers-modules = { workspace = true }
+# Pinned Postgres test image (`test_containers::postgres()`); `xtask pins`
+# refuses a raw image string here.
+test-containers = { workspace = true }

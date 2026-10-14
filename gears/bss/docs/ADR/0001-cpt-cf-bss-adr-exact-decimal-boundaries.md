@@ -525,7 +525,7 @@ See the [Stripe price contract][stripe-prices].
 - **Platform:** [portable storage][database-adr] and [error categories][errors-adr].
 
 [stripe-prices]: https://github.com/stripe/stripe-go/blob/master/price.go
-[usage-api]: ../../../system/usage-collector/docs/usage-collector-v1.yaml
+[usage-api]: ../../../system/usage-collector/docs/usage-collector-v2.yaml
 [usage-prd]: ../../../system/usage-collector/docs/PRD.md
 [usage-sdk]: ../../../system/usage-collector/usage-collector-sdk/src/models.rs
 [products-sdk]: ../../products/products-sdk/src/derived.rs

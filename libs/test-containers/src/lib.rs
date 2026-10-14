@@ -95,7 +95,7 @@ pub const TIMESCALEDB_IMAGE: &str = "timescale/timescaledb";
 /// Keep in sync with `TimescaleDbSidecar.IMAGE` in
 /// `testing/e2e/lib/sidecars.py`: a skew means the plugin's migrations are
 /// validated against a different `PostgreSQL` major than E2E runs.
-pub const TIMESCALEDB_TAG: &str = "2.29.2-pg18";
+pub const TIMESCALEDB_TAG: &str = "2.25.2-pg17";
 
 /// Repository of the `MariaDB` image.
 pub const MARIADB_IMAGE: &str = "mariadb";
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(POSTGRES_GRAPH_TAG, "19beta3-alpine");
         assert_eq!(MYSQL_TAG, "9.7");
         assert_eq!(TIMESCALEDB_IMAGE, "timescale/timescaledb");
-        assert_eq!(TIMESCALEDB_TAG, "2.29.2-pg18");
+        assert_eq!(TIMESCALEDB_TAG, "2.25.2-pg17");
         assert_eq!(MARIADB_IMAGE, "mariadb");
         assert_eq!(MARIADB_TAG, "11.8");
         assert_eq!(CLICKHOUSE_IMAGE, "clickhouse/clickhouse-server");
